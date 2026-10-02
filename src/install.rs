@@ -294,7 +294,12 @@ mod tests {
         let claude = hook_snippet(&hook(), Agent::Claude);
         assert_eq!(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook");
         let spaced = hook_snippet(Path::new("/my bin/sushi-hook"), Agent::Codex);
-        assert_eq!(spaced["hooks"]["Stop"][0]["hooks"][0]["command"], "'/my bin/sushi-hook' --agent codex");
+        let expected = if cfg!(windows) {
+            "\"/my bin/sushi-hook\" --agent codex"
+        } else {
+            "'/my bin/sushi-hook' --agent codex"
+        };
+        assert_eq!(spaced["hooks"]["Stop"][0]["hooks"][0]["command"], expected);
     }
 
     #[test]
