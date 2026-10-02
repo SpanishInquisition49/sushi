@@ -1,0 +1,30 @@
+[package]
+name = "Sushi"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [".", "app/src-tauri"]
+
+[lib]
+name = "sushi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sushi"
+path = "src/main.rs"
+
+[[bin]]
+name = "sushi-hook"
+path = "src/bin/sushi-hook.rs"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

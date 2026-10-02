@@ -1,0 +1,13 @@
+[package]
+name = "sushi-app"
+version = "0.1.0"
+edition = "2024"
+description = "Sushi desktop app: the pet and the panel for macOS, Linux and Windows"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+Sushi = { path = "../.." }
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico", "macos-private-api"] }
+serde_json = "1"

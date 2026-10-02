@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Install: cp contrib/io.sushi.daemon.plist ~/Library/LaunchAgents/
+     then:    launchctl load ~/Library/LaunchAgents/io.sushi.daemon.plist
+     Adjust the path below if `sushi` is not in ~/.cargo/bin. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>io.sushi.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec "$HOME/.cargo/bin/sushi" daemon</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>

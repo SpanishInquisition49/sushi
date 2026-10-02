@@ -1,0 +1,147 @@
+# Sushi — a pet on the notch that shows your coding agents' sessions (Claude Code, Codex, GitHub Copilot, opencode, pi).
+# Clicking the pet opens a window attached to the notch.
+# Data comes from the `sushi daemon` (see the repo README / src/main.rs).
+
+id           = "scanna/sushi"
+name         = "Sushi"
+version      = "0.11.0"
+plugin_api   = 21
+author       = "scanna"
+license      = "MIT"
+tags         = ["bar", "panel", "service", "claude", "codex", "copilot", "opencode", "pi"]
+icon         = "robot"
+description  = "A pet on the notch that tracks your coding agents (Claude Code, Codex, GitHub Copilot, opencode, pi)."
+dependencies = []
+
+# ── Plugin-level settings ─────────────────────────────────────────────────────
+
+[[setting]]
+key             = "binPath"
+type            = "string"
+label_key       = "settings.bin_path.label"
+description_key = "settings.bin_path.description"
+default         = "~/.cargo/bin/sushi"
+
+[[setting]]
+key             = "autoOpen"
+type            = "bool"
+label_key       = "settings.auto_open.label"
+description_key = "settings.auto_open.description"
+default         = true
+
+[[setting]]
+key             = "character"
+type            = "select"
+label_key       = "settings.character.label"
+description_key = "settings.character.description"
+default         = "nigiri_salmon"
+options = [
+  { value = "nigiri_salmon", label_key = "settings.character.options.nigiri_salmon" },
+  { value = "nigiri_tuna",   label_key = "settings.character.options.nigiri_tuna" },
+  { value = "nigiri_tamago", label_key = "settings.character.options.nigiri_tamago" },
+  { value = "unagi_nigiri",  label_key = "settings.character.options.unagi_nigiri" },
+  { value = "ebi_nigiri",    label_key = "settings.character.options.ebi_nigiri" },
+  { value = "ebi_tempura",   label_key = "settings.character.options.ebi_tempura" },
+  { value = "ikura",         label_key = "settings.character.options.ikura" },
+  { value = "maki",          label_key = "settings.character.options.maki" },
+  { value = "uramaki",       label_key = "settings.character.options.uramaki" },
+  { value = "inari",         label_key = "settings.character.options.inari" },
+  { value = "ravioli",       label_key = "settings.character.options.ravioli" },
+  { value = "bao",           label_key = "settings.character.options.bao" },
+  { value = "takoyaki",      label_key = "settings.character.options.takoyaki" },
+  { value = "ramen",         label_key = "settings.character.options.ramen" },
+  { value = "miso_soup",     label_key = "settings.character.options.miso_soup" },
+  { value = "edamame",       label_key = "settings.character.options.edamame" },
+  { value = "onigiri",       label_key = "settings.character.options.onigiri" },
+  { value = "dorayaki",      label_key = "settings.character.options.dorayaki" },
+  { value = "mochi",         label_key = "settings.character.options.mochi" },
+  { value = "dango",         label_key = "settings.character.options.dango" },
+  { value = "bubble_tea",    label_key = "settings.character.options.bubble_tea" },
+  { value = "sake",          label_key = "settings.character.options.sake" },
+  { value = "tofu",          label_key = "settings.character.options.tofu" },
+]
+
+[[setting]]
+key             = "chatAgent"
+type            = "select"
+label_key       = "settings.chat_agent.label"
+description_key = "settings.chat_agent.description"
+default         = "claude"
+options = [
+  { value = "claude",  label_key = "settings.chat_agent.options.claude" },
+  { value = "copilot", label_key = "settings.chat_agent.options.copilot" },
+  { value = "pi",      label_key = "settings.chat_agent.options.pi" },
+  { value = "codex",   label_key = "settings.chat_agent.options.codex" },
+]
+
+[[setting]]
+key             = "chatModel"
+type            = "string"
+label_key       = "settings.chat_model.label"
+description_key = "settings.chat_model.description"
+default         = ""
+
+[[setting]]
+key             = "sounds"
+type            = "bool"
+label_key       = "settings.sounds.label"
+description_key = "settings.sounds.description"
+default         = true
+
+[[setting]]
+key             = "closeAfterDecision"
+type            = "bool"
+label_key       = "settings.close_after.label"
+description_key = "settings.close_after.description"
+default         = true
+
+[[setting]]
+key             = "widgetInfo"
+type            = "select"
+label_key       = "settings.widget_info.label"
+description_key = "settings.widget_info.description"
+default         = "session"
+options = [
+  { value = "usage",    label_key = "settings.widget_info.options.usage" },
+  { value = "session",  label_key = "settings.widget_info.options.session" },
+  { value = "detailed", label_key = "settings.widget_info.options.detailed" },
+]
+
+[[setting]]
+key             = "fidgets"
+type            = "bool"
+label_key       = "settings.fidgets.label"
+description_key = "settings.fidgets.description"
+default         = true
+
+[[setting]]
+key             = "napAfterSec"
+type            = "int"
+label_key       = "settings.nap_after.label"
+description_key = "settings.nap_after.description"
+default         = 120
+min             = 0
+max             = 3600
+
+# ── Background service (reads the daemon's state.json) ───────────────────────
+
+[[service]]
+id    = "state"
+entry = "service.luau"
+
+# ── Panel (opens attached to the notch) ───────────────────────────────────────
+
+[[panel]]
+id              = "panel"
+entry           = "panel.luau"
+width           = 880
+height          = 560
+placement       = "attached"
+position        = "auto"
+open_near_click = true
+
+# ── Bar widget (the pet) ──────────────────────────────────────────────────────
+
+[[widget]]
+id    = "pet"
+entry = "bar_widget.luau"

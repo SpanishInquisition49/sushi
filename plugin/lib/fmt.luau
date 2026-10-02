@@ -1,0 +1,168 @@
+--!nonstrict
+-- lib/fmt.luau — formatting helpers shared by the bar widget and the panel.
+
+local F = {}
+
+function F.round(x) return math.floor((tonumber(x) or 0) + 0.5) end
+
+--- Compact token count: 950, 1.2k, 3.4M.
+function F.tokens(n)
+    n = tonumber(n) or 0
+    if n >= 1e9 then return string.format("%.1fG", n / 1e9) end
+    if n >= 1e6 then return string.format("%.1fM", n / 1e6) end
+    if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
+    return tostring(math.floor(n))
+end
+
+--- Palette role for a usage percentage: calm, warning, critical.
+function F.percentColor(p)
+    p = tonumber(p) or 0
+    if p >= 90 then return "error" end
+    if p >= 70 then return "tertiary" end
+    return "primary"
+end
+
+--- "2h 15m", "3d 4h", "now" — time left until `resetsAtMs`.
+function F.resetIn(resetsAtMs, nowMs)
+    if not resetsAtMs then return "?" end
+    local s = math.floor((resetsAtMs - nowMs) / 1000)
+    if s <= 0 then return "now" end
+    local d, h, m = math.floor(s / 86400), math.floor(s % 86400 / 3600), math.floor(s % 3600 / 60)
+    if d > 0 then return string.format("%dd %dh", d, h) end
+    if h > 0 then return string.format("%dh %dm", h, m) end
+    return string.format("%dm", math.max(1, m))
+end
+
+--- "2:13" or "1:02:03" for a duration in milliseconds.
+function F.duration(ms)
+    local total = math.max(0, math.floor((tonumber(ms) or 0) / 1000))
+    local h, m, sec = math.floor(total / 3600), math.floor(total % 3600 / 60), total % 60
+    if h > 0 then return string.format("%d:%02d:%02d", h, m, sec) end
+    return string.format("%d:%02d", m, sec)
+end
+
+--- Shorten `text` to at most `n` characters, adding an ellipsis.
+function F.clip(text, n)
+    text = tostring(text or "")
+    if utf8 and utf8.len then
+        local len = utf8.len(text)
+        if len and len > n then return text:sub(1, utf8.offset(text, n) - 1) .. "…" end
+        return text
+    end
+    if #text > n then return text:sub(1, n - 1) .. "…" end
+    return text
+end
+
+--- The session to describe: one that is working or waiting (most recent first),
+--- otherwise the one with the most recent turn.
+function F.activeSession(snap)
+    local best, bestScore, bestEvent = nil, -1, -1
+    for _, s in ipairs((snap and snap.sessions) or {}) do
+        local busy = (s.status == "working" or s.status == "waiting")
+        local score = busy and 2 or ((s.activity and s.activity.turn_started_ms) and 1 or 0)
+        local ev = s.last_event_ms or 0
+        if score > bestScore or (score == bestScore and ev > bestEvent) then
+            best, bestScore, bestEvent = s, score, ev
+        end
+    end
+    return best
+end
+
+--- Label of an agent ("Claude Code", "pi"...) from the snapshot's `agents`.
+function F.agentLabel(snap, id)
+    local a = snap and snap.agents and snap.agents[id]
+    return (a and a.label) or tostring(id or "agent")
+end
+
+--- Plan limits ({ data, error }) of the agent that has them, or nil.
+function F.limits(snap)
+    for _, a in pairs((snap and snap.agents) or {}) do
+        if a.limits then return a.limits end
+    end
+    return nil
+end
+
+--- Does any agent offer the built-in chat? (Assumed yes when the snapshot does not say.)
+function F.canChat(snap)
+    if not (snap and snap.agents) then return true end
+    for _, a in pairs(snap.agents) do
+        if a.capabilities and a.capabilities.chat then return true end
+    end
+    return false
+end
+
+--- More than one agent has a session right now.
+function F.multiAgent(snap)
+    local seen, n = {}, 0
+    for _, s in ipairs((snap and snap.sessions) or {}) do
+        if s.agent and not seen[s.agent] then seen[s.agent], n = true, n + 1 end
+    end
+    return n > 1
+end
+
+--- "Bash: cargo test": the last tool a session used, or nil.
+function F.lastToolText(s)
+    local t = s and s.last_tool
+    if type(t) == "table" then return t.text end
+    return nil
+end
+
+--- How long the current turn has been running (or took, once finished); nil if unknown.
+function F.turnElapsed(s, nowMs)
+    local a = s and s.activity
+    if not a then return nil end
+    if s.status ~= "idle" and a.turn_started_ms then return nowMs - a.turn_started_ms end
+    return a.turn_ms
+end
+
+--- "3 files · +45 −12", or nil when nothing was changed this turn.
+function F.changesText(a)
+    if not a or (a.files_changed or 0) == 0 then return nil end
+    local files = a.files_changed == 1 and "1 file" or (a.files_changed .. " files")
+    return string.format("%s · +%d -%d", files, a.lines_added or 0, a.lines_removed or 0)
+end
+
+--- "4 run · 1 failed", or nil when no command ran.
+function F.commandsText(a)
+    if not a or (a.commands or 0) == 0 then return nil end
+    local text = a.commands .. " run"
+    if (a.failures or 0) > 0 then text = text .. " · " .. a.failures .. " failed" end
+    return text
+end
+
+--- Tooltip rows describing the active session's progress.
+function F.sessionRows(s, nowMs)
+    if not s then return {} end
+    local a = s.activity or {}
+    local rows = {}
+    local head = (s.status == "working") and "working" or (s.status == "waiting" and "waiting for you" or "idle")
+    local elapsed = F.turnElapsed(s, nowMs)
+    if elapsed then head = head .. (s.status == "idle" and " · last turn " or " · ") .. F.duration(elapsed) end
+    if (a.tool_calls or 0) > 0 then head = head .. " · " .. a.tool_calls .. " tools" end
+    rows[#rows + 1] = { key = s.name or s.id, value = head }
+    local ch = F.changesText(a)
+    if ch then
+        local names = {}
+        for i, f in ipairs(a.files or {}) do
+            if i > 3 then break end
+            names[#names + 1] = (f:match("([^/]+)$") or f)
+        end
+        rows[#rows + 1] = { key = "Changes", value = F.clip(ch .. " (" .. table.concat(names, ", ") .. ((a.files_changed or 0) > 3 and ", …" or "") .. ")", 80) }
+    end
+    local cm = F.commandsText(a)
+    if cm then rows[#rows + 1] = { key = "Commands", value = cm } end
+    local recent = a.recent or {}
+    local last = recent[#recent]
+    if last and s.status ~= "idle" then
+        rows[#rows + 1] = { key = (last.ok == nil) and "Now" or "Last step", value = F.clip(last.tool .. " " .. (last.label or ""), 70) }
+    end
+    if s.context then
+        rows[#rows + 1] = { key = "Context", value = F.round(s.context.percent) .. "% of ~" .. F.tokens(s.context.window) }
+    end
+    if a.last_result and (s.status == "idle" or not elapsed) then
+        rows[#rows + 1] = { key = "Result", value = F.clip(a.last_result, 90) }
+    end
+    return rows
+end
+
+return F

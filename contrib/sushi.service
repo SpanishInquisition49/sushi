@@ -1,0 +1,13 @@
+# Copy to ~/.config/systemd/user/ and run:
+#   systemctl --user enable --now sushi.service
+# Requires `cargo install --path .` so the binary is in ~/.cargo/bin.
+
+[Unit]
+Description=Sushi daemon
+
+[Service]
+ExecStart=%h/.cargo/bin/sushi daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

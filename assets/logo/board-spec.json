@@ -1,0 +1,34 @@
+{
+  "brand": "Sushi",
+  "tagline": "A pet on your notch that watches your coding agents",
+  "brief": "An animated pet that lives on the notch of the Noctalia shell and keeps an eye on Claude Code, Codex, Copilot, opencode and pi. Friendly, playful and attentive, but made for developers.",
+  "adjectives": ["playful", "friendly", "attentive", "developer-grade"],
+  "criteria": "Success: instantly reads as sushi, has a face (the pet), holds up at 16 px, and works in one colour.",
+  "industry": "software",
+  "nav": ["Live", "Approve", "Ask", "Usage"],
+  "brand_color": "#FF7A59",
+  "greyscale": false,
+  "designer": "Sushi",
+  "round": 2,
+  "concepts": [
+    {
+      "name": "Maki",
+      "symbol": "symbol.svg",
+      "lockup": "horizontal.svg",
+      "symbol_on_tile": "symbol.svg",
+      "lockup_on_dark": "horizontal-reversed.svg",
+      "tile_color": "#FFF3E6",
+      "idea": "A maki piece standing up, with a pair of eyes on the nori: the pet.",
+      "rationale": [
+        "Reads as sushi at first glance: nori, rice and salmon",
+        "The eyes turn the food into a character that watches",
+        "Round, solid silhouette that holds up as a favicon"
+      ]
+    }
+  ],
+  "recommendation": "Maki: the most recognisable as sushi, with a face that matches the pet.",
+  "next_steps": [
+    "Use the files in this folder",
+    "Review the guidelines in GUIDELINES.md"
+  ]
+}

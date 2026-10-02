@@ -1,0 +1,123 @@
+// fmt.js — formatting helpers shared by the pet window and the panel (port of lib/fmt.luau).
+
+export const round = (x) => Math.floor((Number(x) || 0) + 0.5);
+
+/** Compact token count: 950, 1.2k, 3.4M. */
+export function tokens(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "G";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.floor(n));
+}
+
+/** Palette role for a usage percentage: calm, warning, critical. */
+export function percentColor(p) {
+  p = Number(p) || 0;
+  if (p >= 90) return "error";
+  if (p >= 70) return "tertiary";
+  return "primary";
+}
+
+/** "2h 15m", "3d 4h", "now": time left until `resetsAtMs`. */
+export function resetIn(resetsAtMs, nowMs) {
+  if (!resetsAtMs) return "?";
+  const s = Math.floor((resetsAtMs - nowMs) / 1000);
+  if (s <= 0) return "now";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${Math.max(1, m)}m`;
+}
+
+/** "2:13" or "1:02:03" for a duration in milliseconds. */
+export function duration(ms) {
+  const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+
+/** Shorten `text` to at most `n` characters, adding an ellipsis. */
+export function clip(text, n) {
+  const chars = Array.from(String(text ?? ""));
+  return chars.length > n ? chars.slice(0, n - 1).join("") + "…" : chars.join("");
+}
+
+/** The session to describe: one working or waiting (most recent first), else the latest turn. */
+export function activeSession(snap) {
+  let best = null, bestScore = -1, bestEvent = -1;
+  for (const s of snap?.sessions || []) {
+    const busy = s.status === "working" || s.status === "waiting";
+    const score = busy ? 2 : s.activity?.turn_started_ms ? 1 : 0;
+    const ev = s.last_event_ms || 0;
+    if (score > bestScore || (score === bestScore && ev > bestEvent)) [best, bestScore, bestEvent] = [s, score, ev];
+  }
+  return best;
+}
+
+/** Label of an agent ("Claude Code", "pi"...) from the snapshot's `agents`. */
+export const agentLabel = (snap, id) => snap?.agents?.[id]?.label || String(id ?? "agent");
+
+/** Plan limits ({ data, error }) of the agent that has them, or null. */
+export function limits(snap) {
+  for (const a of Object.values(snap?.agents || {})) if (a.limits) return a.limits;
+  return null;
+}
+
+/** Does any agent offer the built-in chat? (Assumed yes when the snapshot does not say.) */
+export function canChat(snap) {
+  if (!snap?.agents) return true;
+  return Object.values(snap.agents).some((a) => a.capabilities?.chat);
+}
+
+/** More than one agent has a session right now. */
+export const multiAgent = (snap) => new Set((snap?.sessions || []).map((s) => s.agent).filter(Boolean)).size > 1;
+
+/** "Bash: cargo test": the last tool a session used, or null. */
+export const lastToolText = (s) => (s?.last_tool && typeof s.last_tool === "object" ? s.last_tool.text : null);
+
+/** How long the current turn has been running (or took, once finished); null if unknown. */
+export function turnElapsed(s, nowMs) {
+  const a = s?.activity;
+  if (!a) return null;
+  if (s.status !== "idle" && a.turn_started_ms) return nowMs - a.turn_started_ms;
+  return a.turn_ms ?? null;
+}
+
+/** "3 files · +45 -12", or null when nothing was changed this turn. */
+export function changesText(a) {
+  if (!a || !(a.files_changed > 0)) return null;
+  const files = a.files_changed === 1 ? "1 file" : `${a.files_changed} files`;
+  return `${files} · +${a.lines_added || 0} -${a.lines_removed || 0}`;
+}
+
+/** "4 run · 1 failed", or null when no command ran. */
+export function commandsText(a) {
+  if (!a || !(a.commands > 0)) return null;
+  return `${a.commands} run` + (a.failures > 0 ? ` · ${a.failures} failed` : "");
+}
+
+/** Tooltip rows describing the active session's progress: [{key, value}]. */
+export function sessionRows(s, nowMs) {
+  if (!s) return [];
+  const a = s.activity || {};
+  const rows = [];
+  let head = s.status === "working" ? "working" : s.status === "waiting" ? "waiting for you" : "idle";
+  const elapsed = turnElapsed(s, nowMs);
+  if (elapsed != null) head += (s.status === "idle" ? " · last turn " : " · ") + duration(elapsed);
+  if (a.tool_calls > 0) head += ` · ${a.tool_calls} tools`;
+  rows.push({ key: s.name || s.id, value: head });
+  const ch = changesText(a);
+  if (ch) {
+    const names = (a.files || []).slice(0, 3).map((f) => f.split("/").pop() || f);
+    rows.push({ key: "Changes", value: clip(`${ch} (${names.join(", ")}${a.files_changed > 3 ? ", …" : ""})`, 80) });
+  }
+  const cm = commandsText(a);
+  if (cm) rows.push({ key: "Commands", value: cm });
+  const last = (a.recent || []).at(-1);
+  if (last && s.status !== "idle") rows.push({ key: last.ok == null ? "Now" : "Last step", value: clip(`${last.tool} ${last.label || ""}`, 70) });
+  if (s.context) rows.push({ key: "Context", value: `${round(s.context.percent)}% of ~${tokens(s.context.window)}` });
+  if (a.last_result && (s.status === "idle" || elapsed == null)) rows.push({ key: "Result", value: clip(a.last_result, 90) });
+  return rows;
+}
