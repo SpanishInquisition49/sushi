@@ -6,6 +6,7 @@
 //! Allow / Deny back into what the agent expects. Everything after this module (sessions,
 //! activity, the live viewer) is agent-agnostic.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
@@ -25,6 +26,7 @@ pub enum Agent {
     Opencode,
     Pi,
     Copilot,
+    Antigravity,
 }
 
 /// What an agent lets Sushi do beyond showing its sessions.
@@ -45,7 +47,7 @@ pub struct Capabilities {
 }
 
 impl Agent {
-    pub const ALL: [Agent; 5] = [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot];
+    pub const ALL: [Agent; 6] = [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot, Agent::Antigravity];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -54,6 +56,7 @@ impl Agent {
             Agent::Opencode => "opencode",
             Agent::Pi => "pi",
             Agent::Copilot => "copilot",
+            Agent::Antigravity => "antigravity",
         }
     }
 
@@ -68,6 +71,7 @@ impl Agent {
             Agent::Opencode => "opencode",
             Agent::Pi => "pi",
             Agent::Copilot => "GitHub Copilot",
+            Agent::Antigravity => "Antigravity",
         }
     }
 
@@ -77,7 +81,10 @@ impl Agent {
             Agent::Claude => Capabilities { approve: true, questions: true, plans: true, context: true, limits: true, chat: true },
             // The chat needs a way to run the agent headless without tools (see `chat.rs`).
             Agent::Codex | Agent::Pi | Agent::Copilot => Capabilities { chat: true, ..basic },
+            // Antigravity is watched only: a hook cannot approve (see `antigravity.rs`), and its
+            // headless mode has no tool-free option for the chat.
             Agent::Opencode => basic,
+            Agent::Antigravity => Capabilities { approve: antigravity::ASK_FROM_NOTCH, ..basic },
         }
     }
 
@@ -94,6 +101,7 @@ impl Agent {
                 Agent::Opencode => opencode::tool(raw, &input, response),
                 Agent::Pi => pi::tool(raw, &input, response),
                 Agent::Copilot => copilot::tool(raw, &input, response),
+                Agent::Antigravity => antigravity::tool(raw, &input, response),
             };
             tool.id = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string();
             ev.tool = Some(tool);
@@ -101,24 +109,35 @@ impl Agent {
         Some(ev)
     }
 
-    /// Does this event wait for an answer from the notch? A plan is read in the notch but
-    /// approved in the terminal, so it never waits.
+    /// Does this event wait for an answer from the notch?
     pub fn wants_answer(self, payload: &Value) -> bool {
         let payload = &self.canonical(payload);
         let is_permission = payload.get("hook_event_name").and_then(Value::as_str) == Some("PermissionRequest");
-        let is_plan = self == Agent::Claude && payload.get("tool_name").and_then(Value::as_str) == Some("ExitPlanMode");
-        is_permission && !is_plan && self.capabilities().approve
+        is_permission && self.capabilities().approve
+    }
+
+    /// Is this Claude Code's "Ready to code?" dialog (`ExitPlanMode`)? A plan takes longer to read
+    /// than a permission, so the hook waits longer for it (the terminal shows the dialog meanwhile).
+    pub fn is_plan(self, payload: &Value) -> bool {
+        self == Agent::Claude && payload.get("tool_name").and_then(Value::as_str) == Some("ExitPlanMode")
     }
 
     /// What the hook prints on stdout for a decision. `updated_input` replaces the tool's input
-    /// (how the answers to a question reach the agent).
-    pub fn encode_decision(self, decision: Decision, updated_input: Option<&Value>) -> Value {
+    /// (how the answers to a question reach the agent, and how a plan is approved: Claude Code
+    /// ignores a bare `allow` for the tools that need the user, like `ExitPlanMode`). `mode` is the
+    /// permission mode to switch to (`acceptEdits`).
+    pub fn encode_decision(self, decision: Decision, updated_input: Option<&Value>, mode: Option<&str>) -> Value {
         match self {
-            Agent::Claude | Agent::Codex => hook_specific_output(decision, updated_input),
+            Agent::Claude | Agent::Codex => hook_specific_output(decision, updated_input, mode),
             // Copilot's `PermissionRequest` hook answers with a bare behavior.
             Agent::Copilot => match decision {
                 Decision::Allow => json!({ "behavior": "allow" }),
                 Decision::Deny => json!({ "behavior": "deny", "message": "Denied from Sushi" }),
+            },
+            // Antigravity's `PreToolUse` hook answers with a decision and a reason.
+            Agent::Antigravity => match decision {
+                Decision::Allow => json!({ "decision": "allow" }),
+                Decision::Deny => json!({ "decision": "deny", "reason": "Denied from Sushi" }),
             },
             // The opencode and pi plugins read this and map it onto their own API.
             Agent::Opencode | Agent::Pi => match decision {
@@ -130,22 +149,29 @@ impl Agent {
 }
 
 impl Agent {
-    /// The payload with the keys the neutral envelope reads (Copilot mixes naming styles).
+    /// The payload with the keys the neutral envelope reads (Copilot mixes naming styles, Antigravity has its own event names).
     fn canonical(self, payload: &Value) -> Value {
         match self {
             Agent::Copilot => copilot::canonical(payload),
+            Agent::Antigravity => antigravity::canonical(payload),
             _ => payload.clone(),
         }
     }
 }
 
 /// The `PermissionRequest` output of Claude Code and Codex.
-fn hook_specific_output(decision: Decision, updated_input: Option<&Value>) -> Value {
+fn hook_specific_output(decision: Decision, updated_input: Option<&Value>, mode: Option<&str>) -> Value {
     let decision = match decision {
-        Decision::Allow => match updated_input {
-            Some(input) => json!({ "behavior": "allow", "updatedInput": input }),
-            None => json!({ "behavior": "allow" }),
-        },
+        Decision::Allow => {
+            let mut d = json!({ "behavior": "allow" });
+            if let Some(input) = updated_input {
+                d["updatedInput"] = input.clone();
+            }
+            if let Some(mode) = mode {
+                d["updatedPermissions"] = json!([{ "type": "setMode", "mode": mode, "destination": "session" }]);
+            }
+            d
+        }
         Decision::Deny => json!({ "behavior": "deny", "message": "Denied from Sushi" }),
     };
     json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision } })
@@ -366,23 +392,28 @@ mod tests {
     #[test]
     fn only_claude_has_the_extras() {
         assert!(Agent::Claude.capabilities().chat && Agent::Claude.capabilities().limits);
+        assert!(!Agent::Antigravity.capabilities().approve, "watched only");
         for a in [Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot] {
             let c = a.capabilities();
             assert!(c.approve && !c.limits && !c.context && !c.questions && !c.plans);
         }
         assert!(!Agent::Opencode.capabilities().chat && Agent::Copilot.capabilities().chat);
+        assert!(!Agent::Antigravity.capabilities().chat);
     }
 
     #[test]
     fn decisions_are_encoded_per_agent() {
-        let v = Agent::Codex.encode_decision(Decision::Deny, None);
+        let v = Agent::Codex.encode_decision(Decision::Deny, None, None);
         assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
-        assert_eq!(Agent::Copilot.encode_decision(Decision::Allow, None), json!({"behavior": "allow"}));
-        let v = Agent::Copilot.encode_decision(Decision::Deny, None);
+        assert_eq!(Agent::Copilot.encode_decision(Decision::Allow, None, None), json!({"behavior": "allow"}));
+        let v = Agent::Copilot.encode_decision(Decision::Deny, None, None);
         assert_eq!((v["behavior"].as_str(), v["message"].is_string()), (Some("deny"), true));
-        let v = Agent::Pi.encode_decision(Decision::Allow, None);
+        let v = Agent::Antigravity.encode_decision(Decision::Deny, None, None);
+        assert_eq!((v["decision"].as_str(), v["reason"].is_string()), (Some("deny"), true));
+        assert_eq!(Agent::Antigravity.encode_decision(Decision::Allow, None, None), json!({"decision": "allow"}));
+        let v = Agent::Pi.encode_decision(Decision::Allow, None, None);
         assert_eq!(v, json!({"decision": "allow"}));
-        let v = Agent::Opencode.encode_decision(Decision::Deny, None);
+        let v = Agent::Opencode.encode_decision(Decision::Deny, None, None);
         assert_eq!(v["decision"], "deny");
         assert!(v["message"].is_string());
     }
@@ -390,21 +421,38 @@ mod tests {
     #[test]
     fn allow_can_carry_an_updated_input_but_deny_never_does() {
         let input = json!({"questions": [], "answers": {"Which colour?": "Blue"}});
-        let v = Agent::Claude.encode_decision(Decision::Allow, Some(&input));
+        let v = Agent::Claude.encode_decision(Decision::Allow, Some(&input), None);
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
         assert_eq!(v["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["Which colour?"], "Blue");
-        let v = Agent::Claude.encode_decision(Decision::Deny, Some(&input));
+        let v = Agent::Claude.encode_decision(Decision::Deny, Some(&input), None);
         assert!(v["hookSpecificOutput"]["decision"].get("updatedInput").is_none());
         assert!(v["hookSpecificOutput"]["decision"]["message"].is_string());
     }
 
     #[test]
-    fn only_permissions_wait_and_never_a_claude_plan() {
+    fn a_plan_is_approved_with_its_input_and_maybe_a_new_mode() {
+        // Recorded from Claude Code 2.1.287: a bare allow leaves the "Ready to code?" dialog open.
+        let input = json!({"plan": "# Plan", "planFilePath": "/home/u/.claude/plans/p.md"});
+        let v = Agent::Claude.encode_decision(Decision::Allow, Some(&input), Some("acceptEdits"));
+        let d = &v["hookSpecificOutput"]["decision"];
+        assert_eq!((d["behavior"].as_str(), &d["updatedInput"]), (Some("allow"), &input));
+        assert_eq!(d["updatedPermissions"], json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]));
+        let v = Agent::Claude.encode_decision(Decision::Allow, Some(&input), None);
+        assert!(v["hookSpecificOutput"]["decision"].get("updatedPermissions").is_none());
+        let v = Agent::Claude.encode_decision(Decision::Deny, Some(&input), Some("acceptEdits"));
+        assert!(v["hookSpecificOutput"]["decision"].get("updatedPermissions").is_none());
+    }
+
+    #[test]
+    fn only_permissions_wait() {
         let p = |tool: &str| json!({"hook_event_name": "PermissionRequest", "tool_name": tool});
         assert!(Agent::Claude.wants_answer(&p("Bash")));
-        assert!(!Agent::Claude.wants_answer(&p("ExitPlanMode")));
+        assert!(Agent::Claude.wants_answer(&p("ExitPlanMode")), "a plan can be approved from the notch");
+        assert!(Agent::Claude.is_plan(&p("ExitPlanMode")) && !Agent::Codex.is_plan(&p("ExitPlanMode")));
         assert!(Agent::Codex.wants_answer(&p("ExitPlanMode")));
         assert!(!Agent::Claude.wants_answer(&json!({"hook_event_name": "PreToolUse"})));
+        let g = |tool: &str| json!({"conversationId": "c", "stepIdx": 1, "toolCall": {"name": tool, "args": {}}});
+        assert!(!Agent::Antigravity.wants_answer(&g("run_command")), "nothing waits for Antigravity");
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! - Claude Code and Codex: add Sushi's hooks to their hooks file (existing hooks, other keys
 //!   and key order stay as they are).
 //! - opencode and pi: write the plugin from `integrations/` into the agent's plugin folder.
+//! - Antigravity CLI: add a `sushi` group to its user-wide `~/.gemini/config/hooks.json` (other
+//!   groups stay as they are).
 //! - GitHub Copilot CLI: write its own file, `~/.copilot/hooks/sushi.json` (nothing to merge).
 
 use crate::agent::Agent;
@@ -35,6 +37,9 @@ fn hook_command(hook: &Path, agent: Agent) -> String {
     }
 }
 
+/// Seconds Claude Code and Codex give the `PermissionRequest` hook.
+const PERMISSION_HOOK_TIMEOUT: u32 = 310;
+
 /// The hooks Sushi needs, all running `hook` (the `sushi-hook` binary).
 pub fn hook_snippet(hook: &Path, agent: Agent) -> Value {
     let command = hook_command(hook, agent);
@@ -46,12 +51,13 @@ pub fn hook_snippet(hook: &Path, agent: Agent) -> Value {
     ] {
         hooks.insert(ev.into(), entry(5));
     }
-    hooks.insert("PermissionRequest".into(), entry(40));
+    // Long enough for a Claude Code plan (the hook waits up to 300 s for one); a permission waits 30 s.
+    hooks.insert("PermissionRequest".into(), entry(PERMISSION_HOOK_TIMEOUT));
     json!({ "hooks": hooks })
 }
 
-/// Add each event's hook unless a hook with the same command is already there.
-/// Returns the events that were added.
+/// Add each event's hook unless a hook with the same command is already there (whose timeout is
+/// brought up to date). Returns the events that were added or changed.
 pub fn merge_hooks(settings: &mut Value, snippet: &Value) -> Vec<String> {
     let mut added = Vec::new();
     let Some(wanted) = snippet.get("hooks").and_then(Value::as_object) else { return added };
@@ -68,11 +74,23 @@ pub fn merge_hooks(settings: &mut Value, snippet: &Value) -> Vec<String> {
         let command = groups.pointer("/0/hooks/0/command").and_then(Value::as_str).unwrap_or("");
         let current = hooks.entry(event.clone()).or_insert_with(|| json!([]));
         let Some(list) = current.as_array_mut() else { continue };
-        let present = list.iter().any(|g| {
-            g.get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|hs| hs.iter().any(|h| h.get("command").and_then(Value::as_str) == Some(command)))
-        });
+        let timeout = groups.pointer("/0/hooks/0/timeout");
+        let mut present = false;
+        let mut changed = false;
+        for h in list.iter_mut().filter_map(|g| g.get_mut("hooks").and_then(Value::as_array_mut)).flatten() {
+            if h.get("command").and_then(Value::as_str) == Some(command) {
+                present = true;
+                if let (Some(t), Some(obj)) = (timeout, h.as_object_mut())
+                    && obj.get("timeout") != Some(t)
+                {
+                    obj.insert("timeout".into(), t.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            added.push(event.clone());
+        }
         if !present {
             list.extend(groups.as_array().cloned().unwrap_or_default());
             added.push(event.clone());
@@ -93,6 +111,7 @@ pub fn target_path(agent: Agent) -> PathBuf {
         Agent::Opencode => paths::opencode_dir().join("plugins").join("sushi.ts"),
         Agent::Pi => paths::pi_dir().join("extensions").join("sushi.ts"),
         Agent::Copilot => paths::copilot_dir().join("hooks").join("sushi.json"),
+        Agent::Antigravity => paths::antigravity_config_dir().join("hooks.json"),
     }
 }
 
@@ -117,6 +136,23 @@ fn copilot_hooks(hook: &Path) -> Value {
     json!({ "version": 1, "hooks": hooks })
 }
 
+/// Name of Sushi's group in Antigravity's `hooks.json`.
+const ANTIGRAVITY_GROUP: &str = "sushi";
+
+/// Sushi's group for Antigravity: named, with its own event names and timeouts in seconds. Nothing
+/// waits for the notch (a hook cannot approve there), so the timeouts are short. Events without a tool take handlers directly.
+fn antigravity_group(hook: &Path) -> Value {
+    let command = hook_command(hook, Agent::Antigravity);
+    let handler = |timeout: u32| json!({ "type": "command", "command": command, "timeout": timeout });
+    json!({ ANTIGRAVITY_GROUP: {
+        "enabled": true,
+        "PreToolUse": [{ "matcher": "*", "hooks": [handler(5)] }],
+        "PostToolUse": [{ "matcher": "*", "hooks": [handler(5)] }],
+        "PreInvocation": [handler(5)],
+        "Stop": [handler(5)],
+    } })
+}
+
 /// The file written for an agent that gets a file of its own (a plugin for opencode and pi, the
 /// hook file for Copilot), with the hook's path filled in.
 fn plugin_source(agent: Agent, hook: &Path) -> Option<String> {
@@ -124,13 +160,16 @@ fn plugin_source(agent: Agent, hook: &Path) -> Option<String> {
         Agent::Opencode => OPENCODE_PLUGIN,
         Agent::Pi => PI_EXTENSION,
         Agent::Copilot => return Some(serde_json::to_string_pretty(&copilot_hooks(hook)).unwrap_or_default() + "\n"),
-        Agent::Claude | Agent::Codex => return None,
+        Agent::Claude | Agent::Codex | Agent::Antigravity => return None,
     };
     Some(template.replace(HOOK_PLACEHOLDER, &hook.to_string_lossy()))
 }
 
 /// What `install` would write, for a dry run.
 pub fn preview(agent: Agent, hook: &Path) -> String {
+    if agent == Agent::Antigravity {
+        return serde_json::to_string_pretty(&antigravity_group(hook)).unwrap_or_default();
+    }
     match plugin_source(agent, hook) {
         Some(src) => src,
         None => serde_json::to_string_pretty(&hook_snippet(hook, agent)).unwrap_or_default(),
@@ -148,6 +187,10 @@ pub struct Report {
 /// Connect `agent` to Sushi. Idempotent; the previous file is backed up when it changes.
 pub fn install_agent(agent: Agent, hook: &Path, unix_time: u64) -> Result<Report, String> {
     let path = target_path(agent);
+    if agent == Agent::Antigravity {
+        let (added, backup) = install_group(&path, &antigravity_group(hook), unix_time)?;
+        return Ok(Report { path, added, backup });
+    }
     let (added, backup) = match plugin_source(agent, hook) {
         Some(src) => install_plugin(&path, &src, unix_time)?,
         None => install(&path, hook, agent, unix_time)?,
@@ -180,6 +223,42 @@ pub fn install_plugin(path: &Path, source: &str, unix_time: u64) -> Result<(Vec<
     }
     std::fs::write(path, source).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok((vec!["plugin".to_string()], backup))
+}
+
+/// Set each named group of `groups` in the JSON object at `path` (created if missing), keeping
+/// the other groups. A different previous file is backed up. Returns (events set, backup path).
+pub fn install_group(path: &Path, groups: &Value, unix_time: u64) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let existing = std::fs::read_to_string(path).ok();
+    let mut file: Value = match &existing {
+        Some(text) => serde_json::from_str(text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?,
+        None => json!({}),
+    };
+    let Some(obj) = file.as_object_mut() else { return Err(format!("{} is not a JSON object", path.display())) };
+    let mut added = Vec::new();
+    for (name, group) in groups.as_object().into_iter().flatten() {
+        if obj.get(name) != Some(group) {
+            obj.insert(name.clone(), group.clone());
+            added.extend(group.as_object().into_iter().flatten().filter(|(_, v)| v.is_array()).map(|(k, _)| k.clone()));
+        }
+    }
+    if added.is_empty() {
+        return Ok((added, None));
+    }
+    let backup = match existing {
+        Some(text) => {
+            let b = backup_name(path, unix_time);
+            std::fs::write(&b, text).map_err(|e| format!("cannot write the backup {}: {e}", b.display()))?;
+            Some(b)
+        }
+        None => None,
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok((added, backup))
 }
 
 /// Merge the hooks into `path` (created if missing). The previous file is kept next to it as
@@ -224,7 +303,18 @@ mod tests {
         let mut s = json!({});
         let added = merge_hooks(&mut s, &hook_snippet(&hook(), Agent::Claude));
         assert_eq!(added.len(), 9);
-        assert!(s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] == 40);
+        assert!(s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] == 310);
+    }
+
+    #[test]
+    fn an_older_timeout_is_brought_up_to_date() {
+        let mut s = json!({});
+        merge_hooks(&mut s, &hook_snippet(&hook(), Agent::Claude));
+        s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] = json!(40);
+        let changed = merge_hooks(&mut s, &hook_snippet(&hook(), Agent::Claude));
+        assert_eq!(changed, ["PermissionRequest"]);
+        assert_eq!(s["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1, "not added twice");
+        assert_eq!(s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 310);
     }
 
     #[test]
@@ -300,6 +390,32 @@ mod tests {
             "'/my bin/sushi-hook' --agent codex"
         };
         assert_eq!(spaced["hooks"]["Stop"][0]["hooks"][0]["command"], expected);
+    }
+
+    #[test]
+    fn antigravity_gets_a_named_group_in_its_hooks_file() {
+        let g = antigravity_group(&hook());
+        let sushi = &g["sushi"];
+        assert_eq!(sushi["PreToolUse"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook --agent antigravity");
+        assert_eq!((sushi["PreToolUse"][0]["hooks"][0]["timeout"].as_u64(), sushi["Stop"][0]["timeout"].as_u64()), (Some(5), Some(5)));
+        assert_eq!(sushi["enabled"], true);
+        assert!(plugin_source(Agent::Antigravity, &hook()).is_none());
+
+        let dir = std::env::temp_dir().join(format!("sushi-agy-{}", std::process::id()));
+        let path = dir.join("hooks.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = json!({ "lint": { "PreToolUse": [{ "matcher": "run_command", "hooks": [{ "type": "command", "command": "mine" }] }] } });
+        std::fs::write(&path, serde_json::to_string(&mine).unwrap()).unwrap();
+        let (added, backup) = install_group(&path, &g, 7).unwrap();
+        assert_eq!(added.len(), 4);
+        assert!(backup.unwrap().to_string_lossy().ends_with("hooks.json.bak-sushi-7"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((&v["lint"], &v["sushi"]), (&mine["lint"], &g["sushi"]));
+        let (added, backup) = install_group(&path, &g, 8).unwrap();
+        assert!(added.is_empty() && backup.is_none(), "second run: nothing to do");
+        std::fs::write(&path, "nope").unwrap();
+        assert!(install_group(&path, &g, 9).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

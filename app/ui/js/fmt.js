@@ -71,6 +71,57 @@ export function canChat(snap) {
   return Object.values(snap.agents).some((a) => a.capabilities?.chat);
 }
 
+/** How many things wait for you: the pending requests, plus the sessions blocked on their own
+ *  terminal with nothing to answer here (Antigravity asking, or a request whose hook gave up). */
+export function needsYou(snap) {
+  const pending = snap?.pending || [];
+  const asked = new Set(pending.map((p) => p.session_id));
+  return pending.length + (snap?.sessions || []).filter((s) => s.status === "waiting" && !asked.has(s.id)).length;
+}
+
+// ── Following a session's steps in the Live viewer ──
+
+/** How long the typewriter takes to type a diff's added lines (as the viewers type it). */
+export function typingMs(detail) {
+  if (detail?.type !== "diff") return 0;
+  const total = (detail.lines || []).filter((l) => l.kind === "add").reduce((n, l) => n + Array.from(l.text || "").length, 0);
+  return Math.min(total * 22, 1500);
+}
+
+/** How long a step stays in the viewer before the next one replaces it: an edit until it is typed
+ *  out and a moment to read it, a command long enough to see it, a read or a search briefly. */
+export function dwellMs(e) {
+  const type = e?.detail?.type;
+  if (type === "diff") return Math.max(1800, typingMs(e.detail) + 1200);
+  if (type === "terminal") return 1500;
+  if (type === "file") return 700;
+  return 400;
+}
+
+const worthStopping = (e) => e?.detail?.type === "diff" || e?.detail?.type === "terminal";
+
+/** The step to show while following a session. Steps arrive faster than they can be read, so each
+ *  stays for `dwellMs` before the next; reads and searches with an edit or a command after them are
+ *  skipped, and it never lags more than three steps. `state` ({key, since}) is kept by the caller across frames. */
+export function followStep(state, sessionId, list, now) {
+  if (!list.length) {
+    state.key = null;
+    return null;
+  }
+  const last = list.length - 1;
+  const keyOf = (e) => `${sessionId}:${e.ts_ms}`;
+  let i = list.findIndex((e) => keyOf(e) === state.key);
+  if (i < 0) i = last; // a new session, a new turn, or the step scrolled out of the list
+  else if (i < last && now - state.since >= dwellMs(list[i])) {
+    i++;
+    while (i < last && !worthStopping(list[i])) i++;
+    i = Math.max(i, last - 3);
+  } else return list[i];
+  state.key = keyOf(list[i]);
+  state.since = now;
+  return list[i];
+}
+
 /** More than one agent has a session right now. */
 export const multiAgent = (snap) => new Set((snap?.sessions || []).map((s) => s.agent).filter(Boolean)).size > 1;
 

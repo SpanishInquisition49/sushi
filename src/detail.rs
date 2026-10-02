@@ -9,10 +9,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 const MAX_COLS: usize = 160;
-const MAX_CHANGED_DEL: usize = 6;
-const MAX_CHANGED_ADD: usize = 8;
-const MAX_FILE_LINES: usize = 14;
-const OUTPUT_LINES: usize = 12;
+const MAX_CHANGED_DEL: usize = 12;
+const MAX_CHANGED_ADD: usize = 24;
+const MAX_FILE_LINES: usize = 20;
+const OUTPUT_LINES: usize = 20;
 const CONTEXT: usize = 3;
 const MAX_FILE_BYTES: u64 = 2_000_000;
 
@@ -398,13 +398,14 @@ mod tests {
 
     #[test]
     fn long_changes_and_columns_are_truncated() {
-        let old = (0..20).map(|i| format!("old{i}")).collect::<Vec<_>>().join("\n");
-        let new = (0..20).map(|i| format!("new{i}")).collect::<Vec<_>>().join("\n");
+        let n = 40;
+        let old = (0..n).map(|i| format!("old{i}")).collect::<Vec<_>>().join("\n");
+        let new = (0..n).map(|i| format!("new{i}")).collect::<Vec<_>>().join("\n");
         match diff_snippet("/nonexistent", "f", &old, &new, false) {
             Detail::Diff { lines, more, .. } => {
                 assert_eq!(lines.iter().filter(|l| l.kind == "del").count(), MAX_CHANGED_DEL);
                 assert_eq!(lines.iter().filter(|l| l.kind == "add").count(), MAX_CHANGED_ADD);
-                assert_eq!(more as usize, (20 - MAX_CHANGED_DEL) + (20 - MAX_CHANGED_ADD));
+                assert_eq!(more as usize, (n - MAX_CHANGED_DEL) + (n - MAX_CHANGED_ADD));
             }
             other => panic!("{other:?}"),
         }

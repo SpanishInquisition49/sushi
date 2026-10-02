@@ -134,16 +134,51 @@ do
     print("questions: options as buttons, one-click answers, several questions, multi-select, Send, no Allow/Deny")
 end
 
--- ── plans: shown, never answered from here ────────────────────────────────────────────────
+-- ── following the steps: each stays long enough to be seen, reads are skipped, the lag is capped ──
 do
-    local plan = { { id = 5, kind = "plan", session_id = "b", session_name = "beta", tool = "", tool_name = "ExitPlanMode",
-        detail = { type = "text", title = "Plan", body = "1. Do the thing\n2. Check it" }, created_ms = NOW } }
-    local t = open({}, snapshot({ H.session("b", "beta", "waiting", 5, {}) }, plan))
+    local Fmt = H.load("panel.luau").env.require("./lib/fmt.luau")
+    local function diff(ts) return { ts_ms = ts, detail = { type = "diff", lines = { { kind = "add", text = string.rep("x", 40) } } } } end
+    local function read(ts) return { ts_ms = ts, detail = { type = "file", lines = {} } } end
+    local function run(ts) return { ts_ms = ts, detail = { type = "terminal", command = "ls", output = {} } } end
+    local st = { key = nil, since = 0 }
+    assert(Fmt.followStep(st, "s", { diff(1) }, 0).ts_ms == 1, "the first step")
+    local list = { diff(1), read(2), run(3) }
+    assert(Fmt.followStep(st, "s", list, 500).ts_ms == 1, "an edit stays while it is typed out")
+    assert(Fmt.followStep(st, "s", list, 2100).ts_ms == 3, "then the next command, skipping the read")
+    assert(Fmt.followStep(st, "s", list, 2200).ts_ms == 3)
+    local many = { diff(1), diff(2), diff(3), diff(4), diff(5), diff(6) }
+    st = { key = nil, since = 0 }
+    Fmt.followStep(st, "s", { diff(1) }, 0)
+    assert(Fmt.followStep(st, "s", many, 2100).ts_ms == 3, "never more than three steps behind")
+    assert(Fmt.followStep(st, "t", many, 2101).ts_ms == 6, "another session starts at its latest step")
+    assert(Fmt.followStep(st, "t", {}, 2102) == nil and st.key == nil)
+    print("follow: steps stay to be seen, reads skipped, lag capped")
+end
+
+-- ── plans: approved, approved with auto-accepted edits, or sent back; read-only once the hook gave up ──
+do
+    local function plan(answerable)
+        return { { id = 5, kind = "plan", session_id = "b", session_name = "beta", tool = "", tool_name = "ExitPlanMode",
+            detail = { type = "text", title = "Plan", body = "1. Do the thing\n2. Check it" }, created_ms = NOW, answerable = answerable } }
+    end
+    local sessions = { H.session("b", "beta", "waiting", 5, {}) }
+    local t = open({}, snapshot(sessions, plan(true)))
     local tx = texts(t.out())
     assert(tx:find("beta has a plan ready", 1, true) and tx:find("Do the thing", 1, true), tx)
-    assert(tx:find("approve it in the terminal", 1, true), "tells where to approve it")
-    assert(not button(t.out(), "Allow") and not button(t.out(), "Deny"), "a plan has no Allow / Deny here")
-    print("plans: shown for reading, approved in the terminal")
+    assert(not button(t.out(), "Allow") and not button(t.out(), "Deny"), "a plan has no Allow / Deny")
+    button(t.out(), "Approve").p.onClick()
+    assert(t.calls[1]:find(" approve 5$"), t.calls[1])
+    local t2 = open({}, snapshot(sessions, plan(true)))
+    button(t2.out(), "Approve, auto-accept edits").p.onClick()
+    assert(t2.calls[1]:find(" approve 5 %-%-accept%-edits$"), t2.calls[1])
+    local t3 = open({}, snapshot(sessions, plan(true)))
+    button(t3.out(), "Keep planning").p.onClick()
+    assert(t3.calls[1]:find(" deny 5$"), t3.calls[1])
+
+    local t4 = open({}, snapshot(sessions, plan(false)))
+    assert(texts(t4.out()):find("approve it in the terminal", 1, true), "tells where to approve it")
+    assert(not button(t4.out(), "Approve"), "nothing waits for an answer any more")
+    print("plans: Approve, auto-accept edits, Keep planning; read-only once the hook gave up")
 end
 
 -- ── robustness ─────────────────────────────────────────────────────────────────────────────
@@ -286,4 +321,69 @@ do
     local call = t.calls[#t.calls]
     assert(call:find("chat hello --agent copilot --model auto", 1, true), call)
     print("chat agent: named in the tab, passed to the daemon with its model")
+end
+
+-- ── a file fed to the pet ─────────────────────────────────────────────────────────────────
+do
+    local base = snapshot({ H.session("a", "alpha", "idle", 10, {}) })
+    base.chat = { busy = false, messages = {} }
+    local t = open({}, base)
+    local e = t.env
+    assert(not byKey(t.out(), "chat-attachment")[1], "no chip without a file")
+
+    byKey(t.out(), "emote-feed")[1].p.onClick()
+    t.runs[#t.runs].cb({ exitCode = 0, stdout = "file:///home/x/report%20v2.txt\n" })
+    assert(t.state.fedFile.path == "/home/x/report v2.txt" and t.state.petEvent.kind == "eat", "a copied file is eaten")
+    assert(byKey(t.out(), "chat-attachment")[1] and texts(t.out()):find("report v2.txt", 1, true), "the chat shows the file")
+    local sendBtn = find(t.out(), function(n) return n.k == "button" and n.p.glyph == "send" end)[1]
+    assert(sendBtn.p.enabled == true, "a file alone can be sent")
+    e.onFeedDiscard()
+    assert(not byKey(t.out(), "chat-attachment")[1] and t.state.fedFile.path == "", "the chip's x drops it")
+
+    -- the Feed button reads the clipboard
+    byKey(t.out(), "emote-feed")[1].p.onClick()
+    t.runs[#t.runs].cb({ exitCode = 0, stdout = "file:///tmp/a.rs\n" })
+    assert(t.state.fedFile.path == "/tmp/a.rs")
+    e.onChatSubmit("")
+    local call = t.calls[#t.calls]
+    assert(call:find("chat --file /tmp/a.rs --agent claude", 1, true), "only the file: " .. call)
+    assert(t.state.fedFile.path == "", "sent: the file is no longer attached")
+    assert(texts(t.out()):find("a.rs", 1, true), "the provisional bubble names the file")
+    e.noctalia.state.set("snapshot", (function() local s = {}; for k, v in pairs(base) do s[k] = v end
+        s.chat = { busy = false, messages = { { role = "user", text = "what is it?", file = "a.rs" }, { role = "assistant", text = "A test." } } }; return s end)())
+    assert(texts(t.out()):find("a.rs | what is it?", 1, true), "the log shows the file above the question")
+
+    -- fed from the bar widget while the panel shows another tab
+    local t2 = open({}, base)
+    byKey(t2.out(), "tab-usage")[1].p.onClick()
+    t2.env.noctalia.state.set("fedFile", { path = "/tmp/b.md", name = "b.md", ts = 1 })
+    assert(byKey(t2.out(), "chat-attachment")[1], "switches to the chat")
+    print("feed: feed button, chip, discard, send with a file, file in the log")
+end
+
+-- ── many steps must not push the sessions out of the panel ──────────────────────────────────
+do
+    local steps = {}
+    for i = 1, 12 do steps[i] = { ts_ms = NOW - 20000 + i * 1000, tool = "Bash", kind = "run", label = "echo " .. i, ok = true, added = 0, removed = 0 } end
+    local function sessions(n, status)
+        local list = { H.session("a", "alpha", status, 20, steps, { finished_ms = NOW }) }
+        for i = 2, n do list[i] = H.session("s" .. i, "other" .. i, "idle", i, {}) end
+        return list
+    end
+    local function railRows(t) return #byKey(t.out(), "step-") end
+    local function sessionScroll(t)
+        return find(t.out(), function(n) return n.k == "scroll" and #byKey(n, "session-") > 0 end)[1]
+    end
+    for _, n in ipairs({ 1, 2, 4 }) do
+        local t = open({}, snapshot(sessions(n, "idle")))
+        local shown = math.min(n, 3)
+        assert(railRows(t) == 6 - shown + 1, n .. " sessions: rail rows (Done included) " .. railRows(t))
+        assert(byKey(t.out(), "step-done")[1], "Done is still there")
+        assert(sessionScroll(t).p.minHeight == shown * 28, n .. " sessions: the list keeps room for " .. shown .. " rows")
+        assert(#byKey(sessionScroll(t), "session-") == n, "every session is listed")
+    end
+    local t = open({}, snapshot(sessions(2, "working")))
+    assert(railRows(t) == 5 and not byKey(t.out(), "step-done")[1], "a working turn uses the whole budget for steps")
+    assert(texts(t.out()):find("echo 12", 1, true) and not texts(t.out()):find("echo 7 ", 1, true), "the latest steps are kept")
+    print("rail: bounded by the number of sessions; the session list always has room")
 end

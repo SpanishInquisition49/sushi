@@ -1,5 +1,5 @@
 // Sushi desktop app: a small always-on-top pet window and a panel window, both web views of
-// `app/ui`. The daemon (`sushi daemon`) stays the single source of truth; this process polls its
+// `app/ui`. The daemon (`sushi daemon`) stays the single source of truth; this process follows its
 // state over the local socket, forwards it to the windows and turns Allow / Deny clicks back
 // into requests. It works the same on macOS, Linux and Windows.
 
@@ -7,14 +7,15 @@
 
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sushi::client::request;
+use sushi::client::{request, watch};
 use sushi::paths::config_home;
 use sushi::protocol::Request;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, DragDropEvent, Emitter, Manager, WindowEvent};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,7 +52,12 @@ fn get_state(latest: tauri::State<Latest>) -> Value {
 
 #[tauri::command]
 async fn decide(action: String, id: u64) -> Result<(), String> {
-    send(if action == "approve" { Request::Approve { id } } else { Request::Deny { id } })
+    // "approve-edits": approve a plan and let the agent edit without asking.
+    send(match action.as_str() {
+        "approve" => Request::Approve { id, accept_edits: false },
+        "approve-edits" => Request::Approve { id, accept_edits: true },
+        _ => Request::Deny { id },
+    })
 }
 
 #[tauri::command]
@@ -60,8 +66,8 @@ async fn answer(id: u64, answers: Value) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn chat_send(text: String, model: Option<String>, agent: Option<String>) -> Result<(), String> {
-    send(Request::ChatSend { text, model, agent })
+async fn chat_send(text: String, model: Option<String>, agent: Option<String>, file: Option<String>) -> Result<(), String> {
+    send(Request::ChatSend { text, model, agent, file })
 }
 
 #[tauri::command]
@@ -120,6 +126,50 @@ fn close_panel(app: AppHandle) {
     }
 }
 
+/// Set once the pet window has been sized by its page (or given up on): it is shown from then on.
+static PET_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// The pet window takes the size of what it can show. Its minimum and maximum are that size too: a
+/// fixed-size window is one tiling compositors (niri) open floating instead of giving it a column,
+/// and they take its size only when it opens, so it stays hidden until it is sized.
+#[tauri::command]
+fn fit_pet(window: tauri::WebviewWindow, width: f64, height: f64) {
+    if window.label() != "pet" || !(width >= 1.0 && height >= 1.0) {
+        return;
+    }
+    let size = tauri::LogicalSize::new(width.ceil(), height.ceil());
+    let _ = window.set_min_size(Some(size));
+    let _ = window.set_max_size(Some(size));
+    let _ = window.set_size(size);
+    if !PET_SHOWN.swap(true, Ordering::SeqCst) {
+        let _ = window.show();
+    }
+}
+
+/// Show the pet window at its configured size if its page never sized it.
+fn show_pet_anyway(app: &AppHandle) {
+    if !PET_SHOWN.swap(true, Ordering::SeqCst)
+        && let Some(w) = app.get_webview_window("pet")
+    {
+        let _ = w.show();
+    }
+}
+
+/// The panel, made here rather than from the config so that on Linux it can be transient for the
+/// pet window: tiling compositors (niri) open such a window floating. On macOS a parent would drag
+/// the panel along with the pet, and on Windows hide it with the pet, so it stays on its own there.
+fn create_panel(app: &tauri::App) -> tauri::Result<()> {
+    let Some(config) = app.config().app.windows.iter().find(|w| w.label == "panel").cloned() else { return Ok(()) };
+    let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+    #[cfg(target_os = "linux")]
+    let builder = match app.get_webview_window("pet") {
+        Some(pet) => builder.parent(&pet)?,
+        None => builder,
+    };
+    builder.build()?;
+    Ok(())
+}
+
 #[tauri::command]
 fn quit(app: AppHandle) {
     app.exit(0);
@@ -150,34 +200,75 @@ fn pending_keys(snapshot: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Poll the daemon, tell the windows when something changed and open the panel for a new request.
-fn poll_loop(app: AppHandle, latest: Latest) {
-    let mut known: Vec<String> = Vec::new();
-    let mut first = true;
-    let mut last_sent = String::new();
-    loop {
-        let (up, snapshot) = match request(&Request::State, Duration::from_secs(2)) {
-            Ok(r) => (true, r.state.unwrap_or(Value::Null)),
-            Err(_) => (false, Value::Null),
-        };
-        let busy = snapshot["chat"]["busy"].as_bool().unwrap_or(false);
+/// What the windows were last told, and the requests already seen (a new one opens the panel).
+#[derive(Default)]
+struct Feed {
+    known: Vec<String>,
+    first: bool,
+    last_sent: String,
+}
+
+impl Feed {
+    fn update(&mut self, app: &AppHandle, latest: &Latest, up: bool, snapshot: Value) {
+        let keys = pending_keys(&snapshot);
         let payload = json!({ "up": up, "snapshot": snapshot });
         let body = payload.to_string();
-        if body != last_sent {
-            last_sent = body;
+        if body != self.last_sent {
+            self.last_sent = body;
             if let Ok(mut l) = latest.0.lock() {
                 *l = payload.clone();
             }
             let _ = app.emit("state", payload);
         }
-        let keys = pending_keys(&snapshot);
-        if !first && keys.iter().any(|k| !known.contains(k)) && setting_on("autoOpen") {
-            show_panel(&app);
+        if !self.first && keys.iter().any(|k| !self.known.contains(k)) && setting_on("autoOpen") {
+            show_panel(app);
         }
-        known = keys;
-        first = false;
-        // Look more often while the chat streams an answer, so the text appears smoothly.
-        std::thread::sleep(Duration::from_millis(if busy { 200 } else { 1000 }));
+        self.known = keys;
+        self.first = false;
+    }
+}
+
+/// Follow the daemon's state and pass it on to the windows. The daemon pushes every change as it
+/// happens; an older one that cannot be watched is asked every second, and a missing one is looked
+/// for again every second.
+fn state_loop(app: AppHandle, latest: Latest) {
+    let mut feed = Feed { first: true, ..Feed::default() };
+    loop {
+        if watch(|snapshot| feed.update(&app, &latest, true, snapshot)).is_ok() {
+            // The connection dropped: the daemon restarted or quit.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        match request(&Request::State, Duration::from_secs(2)) {
+            Ok(r) => feed.update(&app, &latest, true, r.state.unwrap_or(Value::Null)),
+            Err(_) => feed.update(&app, &latest, false, Value::Null),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// A file dragged onto either window is fed to the pet: it waves when the file comes over it, eats
+/// it when dropped, and the panel opens on the chat with the file attached (see `fedFile` in panel.js).
+fn on_drag_drop(app: &AppHandle, event: &DragDropEvent) {
+    let pet_event = |kind: &str| {
+        let _ = app.emit("petEvent", json!({ "kind": kind, "ts": now_ms() }));
+    };
+    match event {
+        DragDropEvent::Enter { .. } => pet_event("hello"),
+        DragDropEvent::Drop { paths, .. } => match paths.iter().find(|p| p.is_file()) {
+            Some(path) => {
+                pet_event("eat");
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let _ = app.emit("fedFile", json!({ "path": path.to_string_lossy(), "name": name }));
+                show_panel(app);
+            }
+            None => pet_event("sad"), // a folder: nothing it can eat
+        },
+        _ => {}
     }
 }
 
@@ -187,16 +278,16 @@ fn main() {
         .manage(latest.clone())
         .invoke_handler(tauri::generate_handler![
             get_state, decide, answer, chat_send, chat_stop, chat_clear, get_settings, set_settings, toggle_panel,
-            open_panel, close_panel, quit
+            open_panel, close_panel, fit_pet, quit
         ])
-        .on_window_event(|window, event| {
+        .on_window_event(|window, event| match event {
             // Closing the panel only hides it; the pet window is closed from the tray.
-            if let WindowEvent::CloseRequested { api, .. } = event
-                && window.label() == "panel"
-            {
+            WindowEvent::CloseRequested { api, .. } if window.label() == "panel" => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            WindowEvent::DragDrop(drop) => on_drag_drop(window.app_handle(), drop),
+            _ => {}
         })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -222,10 +313,16 @@ fn main() {
                 })
                 .build(app)?;
 
+            create_panel(app)?;
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                show_pet_anyway(&handle);
+            });
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 ensure_daemon();
-                poll_loop(handle, latest);
+                state_loop(handle, latest);
             });
             Ok(())
         })

@@ -292,7 +292,13 @@ end
 function Pet:onSnapshot(snap, daemonUp, nowMs)
     local mood = "idle"
     local working = false
+    -- Requests to answer, plus sessions blocked on their own terminal with nothing to answer here.
     local pending = #((snap and snap.pending) or {})
+    local asked = {}
+    for _, p in ipairs((snap and snap.pending) or {}) do asked[p.session_id or ""] = true end
+    for _, s in ipairs((snap and snap.sessions) or {}) do
+        if s.status == "waiting" and not asked[s.id or ""] then pending = pending + 1 end
+    end
     local newSession = false
     if not daemonUp then
         mood = "sleep"
@@ -1307,7 +1313,7 @@ function Pet:caption(nSessions, nWorking, nPending)
     if mood == "sleep" then return "Zzz... the daemon is asleep" end
     if mood == "nap" then return "Zzz... taking a nap" end
     if mood == "alert" or nPending > 0 then
-        return nPending == 1 and "I need you!" or ("I need you! (" .. nPending .. ")")
+        return nPending <= 1 and "I need you!" or ("I need you! (" .. nPending .. ")")
     end
     local reactions = {
         love = "Thank you!", sad = "Aww...", startled = "Whoa!", dizzy = "Whoa, everything is spinning!",

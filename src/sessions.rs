@@ -2,7 +2,7 @@
 //! reconciled with `~/.claude/sessions/<pid>.json`.
 
 use crate::activity::Activity;
-use crate::agent::{Agent, AgentEvent, EventKind, Tool};
+use crate::agent::{Agent, AgentEvent, EventKind, Tool, antigravity};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -141,6 +141,10 @@ impl Sessions {
             (EventKind::ToolEnd { .. }, None) => s.status = Status::Working,
             (EventKind::ToolStart, tool) => {
                 s.status = Status::Working;
+                // Antigravity cannot be answered from here, but the pet can call you to its terminal.
+                if ev.agent == Agent::Antigravity && tool.as_ref().is_some_and(|t| antigravity::needs_confirmation(&t.name)) {
+                    s.status = Status::Waiting;
+                }
                 if let Some(tool) = tool {
                     s.last_tool = Some(LastTool::of(tool));
                     s.activity.pre_tool(tool, now_ms, &cwd, show_code);
@@ -150,6 +154,10 @@ impl Sessions {
                 s.status = Status::Waiting;
                 if let Some(tool) = tool {
                     s.last_tool = Some(LastTool::of(tool));
+                    // Antigravity has no separate "tool starts" event for the tools it asks about.
+                    if ev.agent == Agent::Antigravity {
+                        s.activity.pre_tool(tool, now_ms, &cwd, show_code);
+                    }
                 }
             }
             (EventKind::Waiting, _) => s.status = Status::Waiting,

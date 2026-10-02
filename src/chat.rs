@@ -21,16 +21,28 @@ use std::sync::{Arc, Mutex};
 
 pub const MAX_MESSAGES: usize = 50;
 pub const MAX_INPUT_CHARS: usize = 8000;
+/// How much of a fed file goes into the prompt. The prompt is one command-line argument, and
+/// Windows caps the whole command line at 32k characters.
+#[cfg(not(windows))]
+pub const MAX_FILE_CHARS: usize = 60_000;
+#[cfg(windows)]
+pub const MAX_FILE_CHARS: usize = 20_000;
+/// The question asked when a file is fed with nothing else.
+pub const DEFAULT_FILE_QUESTION: &str = "What is this file? Summarize it briefly.";
 
 const SYSTEM_PROMPT: &str = "You are the assistant inside a small desktop widget: a pet that lives in the \
 user's notch. Reply briefly and plainly, in the language of the question, without headings. You have no \
-tools, no files and no internet: never claim to have run or opened anything.";
+tools and no internet: never claim to have run or opened anything. The user may feed you a file: its \
+content is then included in the message itself.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     /// `user` or `assistant`.
     pub role: String,
     pub text: String,
+    /// The name of a file fed with this message (its content went to the agent, not here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// What is kept on disk between runs.
@@ -107,10 +119,11 @@ impl Chat {
         self.generation += 1;
     }
 
-    /// Add a user message and an empty assistant message that the answer streams into.
-    pub fn begin_turn(&mut self, text: &str) {
-        self.saved.messages.push(Message { role: "user".into(), text: text.to_string() });
-        self.saved.messages.push(Message { role: "assistant".into(), text: String::new() });
+    /// Add a user message (with the name of the file fed with it, if any) and an empty assistant
+    /// message that the answer streams into.
+    pub fn begin_turn(&mut self, text: &str, file: Option<&str>) {
+        self.saved.messages.push(Message { role: "user".into(), text: text.to_string(), file: file.map(str::to_string) });
+        self.saved.messages.push(Message { role: "assistant".into(), text: String::new(), file: None });
         let excess = self.saved.messages.len().saturating_sub(MAX_MESSAGES);
         self.saved.messages.drain(..excess);
         self.busy = true;
@@ -134,6 +147,36 @@ impl Chat {
     pub fn to_json(&self) -> Value {
         json!({ "agent": self.saved.agent, "busy": self.busy, "error": self.error, "messages": self.saved.messages })
     }
+}
+
+/// Read a file fed to the chat: its name and its text, cut to `MAX_FILE_CHARS`. Only text files
+/// are taken (the chat has no tools, so the content goes into the prompt).
+pub fn read_attachment(path: &Path) -> Result<(String, String), String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{name} is not a file"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+    if bytes.contains(&0) {
+        return Err(format!("{name} is not a text file"));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
+    if text.chars().count() <= MAX_FILE_CHARS {
+        return Ok((name, text));
+    }
+    let mut cut: String = text.chars().take(MAX_FILE_CHARS).collect();
+    cut.push_str("\n[… truncated]");
+    Ok((name, cut))
+}
+
+/// The message the agent gets when a file was fed: the file inline, then the question.
+pub fn prompt_with_file(name: &str, content: &str, question: &str) -> String {
+    let question = if question.trim().is_empty() { DEFAULT_FILE_QUESTION } else { question };
+    // A fence longer than any run of backticks in the file, so the file cannot close it.
+    let longest = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("The user fed you the file `{name}`:\n{fence}\n{}\n{fence}\n\n{question}", content.trim_end_matches('\n'))
 }
 
 /// The model to ask for when nothing was chosen: only Claude Code has one of its own here
@@ -193,7 +236,7 @@ pub fn build_args(agent: Agent, session_id: &str, started: bool, model: Option<&
             }
             a.extend(strings(&["--", &first_prompt()]));
         }
-        Agent::Opencode => a = Vec::new(), // no way to run it without tools: not offered
+        Agent::Opencode | Agent::Antigravity => a = Vec::new(), // not offered (no tool-free mode)
     }
     a
 }
@@ -216,7 +259,7 @@ pub fn parse_line(agent: Agent, turn: &mut Turn, line: &str) -> bool {
         Agent::Copilot => copilot_line(turn, &v),
         Agent::Pi => pi_line(turn, &v),
         Agent::Codex => codex_line(turn, &v),
-        Agent::Opencode => false,
+        Agent::Opencode | Agent::Antigravity => false,
     }
 }
 
@@ -528,7 +571,7 @@ mod tests {
     fn history_is_capped_cleared_and_saved() {
         let mut c = Chat::default();
         for i in 0..40 {
-            c.begin_turn(&format!("q{i}"));
+            c.begin_turn(&format!("q{i}"), None);
             c.set_answer(&format!("a{i}"));
         }
         assert_eq!(c.saved.messages.len(), MAX_MESSAGES);
@@ -685,7 +728,7 @@ mod tests {
     fn a_conversation_is_with_one_agent() {
         let mut c = Chat::default();
         c.saved.agent = "claude".into();
-        c.begin_turn("hi");
+        c.begin_turn("hi", None);
         let old = c.saved.session_id.clone();
         c.use_agent(Agent::Claude);
         assert_eq!(c.saved.messages.len(), 2, "same agent: the conversation goes on");
@@ -699,6 +742,52 @@ mod tests {
         assert!(is_claude_alias("sonnet") && !is_claude_alias("gpt-5"));
         assert_eq!(default_model(Agent::Claude, "haiku").as_deref(), Some("haiku"));
         assert_eq!(default_model(Agent::Pi, "haiku"), None);
+    }
+
+    #[test]
+    fn fed_files_are_read_as_text_and_cut() {
+        let dir = std::env::temp_dir().join(format!("sushi-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("notes.md");
+        std::fs::write(&text, "hello\n").unwrap();
+        assert_eq!(read_attachment(&text).unwrap(), ("notes.md".to_string(), "hello\n".to_string()));
+
+        let binary = dir.join("a.bin");
+        std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0, 1]).unwrap();
+        assert!(read_attachment(&binary).unwrap_err().contains("not a text file"));
+        std::fs::write(&binary, [0xff, 0xfe, 0x41]).unwrap();
+        assert!(read_attachment(&binary).unwrap_err().contains("not a text file"));
+
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "é".repeat(MAX_FILE_CHARS + 10)).unwrap();
+        let (_, cut) = read_attachment(&big).unwrap();
+        assert!(cut.ends_with("[… truncated]") && cut.chars().count() < MAX_FILE_CHARS + 20);
+
+        assert!(read_attachment(&dir.join("missing")).unwrap_err().contains("cannot open missing"));
+        assert!(read_attachment(&dir).unwrap_err().contains("is not a file"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fed_file_goes_inline_before_the_question() {
+        let p = prompt_with_file("a.rs", "fn main() {}\n", "what is it?");
+        assert_eq!(p, "The user fed you the file `a.rs`:\n```\nfn main() {}\n```\n\nwhat is it?");
+        assert!(prompt_with_file("a.rs", "x", "  ").ends_with(DEFAULT_FILE_QUESTION));
+        // A file with its own fences gets a longer one around it.
+        assert!(prompt_with_file("README.md", "```sh\nls\n```", "?").contains("\n````\n```sh"));
+    }
+
+    #[test]
+    fn the_log_keeps_the_file_name_not_its_content() {
+        let mut c = Chat::default();
+        c.begin_turn("what is it?", Some("a.rs"));
+        assert_eq!(c.saved.messages[0].file.as_deref(), Some("a.rs"));
+        assert_eq!(c.saved.messages[0].text, "what is it?");
+        let json = c.to_json().to_string();
+        assert!(json.contains(r#""file":"a.rs""#));
+        assert_eq!(json.matches("\"file\"").count(), 1, "no file key on messages without one");
+        let old: Message = serde_json::from_str(r#"{"role":"user","text":"hi"}"#).unwrap();
+        assert_eq!(old.file, None, "chats saved by older versions still load");
     }
 }
 

@@ -1,7 +1,7 @@
 --!nonstrict
 -- bar_widget.luau — Nigiri, the animated pet that sits on the notch.
 -- The pet's mood follows the daemon (idle / working / alert / sleep). Next to it:
---   "!N"        pending permission requests (when any)
+--   "!N"        requests waiting for you, and sessions waiting in their own terminal (when any)
 --   "2:13"      how long the active session's current turn has been running
 --   pencil "3"  files changed this turn ("detailed" also adds +lines -lines, commands, failures)
 --   "44%"       plan usage of the 5-hour window (falls back to the context window of
@@ -12,11 +12,15 @@
 -- (usage = only the percentage, session = + time and files, detailed = + more).
 -- Left click   → toggle the panel attached to the notch.
 -- Right click  → pet it (it blushes and sends hearts).
+-- Middle click → feed it the file copied in the file manager: it eats it and the chat opens
+--                with the file attached (see lib/feed.luau).
 
 local Pet = require("./lib/pet.luau")
 local Fmt = require("./lib/fmt.luau")
 local Sounds = require("./lib/sounds.luau")
+local Feed = require("./lib/feed.luau")
 Pet.setUi(ui)
+Feed.init(noctalia)
 
 local PANEL_ID = "scanna/sushi:panel"
 local PET_SIZE = 26   -- sushi width in px (it is ~0.8x as tall); the bar is one control tall
@@ -37,7 +41,7 @@ if widgetInfo ~= "usage" and widgetInfo ~= "detailed" then widgetInfo = "session
 
 local STATUS_LABEL = { idle = "idle", working = "working", waiting = "waiting" }
 
-local function pendingCount() return #(snapshot.pending or {}) end
+local function pendingCount() return Fmt.needsYou(snapshot) end
 
 local function planLimits()
     local l = Fmt.limits(snapshot)
@@ -169,6 +173,17 @@ end
 
 function onRightClick()
     sendEvent("love")
+end
+
+function onMiddleClick()
+    Feed.fromClipboard(function(path)
+        if path then
+            Feed.feed(path)
+            sendEvent("eat")
+        else
+            sendEvent("sad") -- nothing to eat: copy a file first
+        end
+    end)
 end
 
 -- Reactions triggered from the panel (approve → love, deny → sad, buttons).

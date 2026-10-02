@@ -54,6 +54,7 @@ body {
 
 /* ── Pet window ─────────────────────────────────────────────────────────────── */
 :root[data-view="pet"] #root { display: flex; align-items: center; padding: 6px; cursor: grab; }
+:root[data-view="pet"] #root > .pill { flex: none; } /* its own size: the window is fitted to it */
 .pill {
   background: rgba(20, 22, 28, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -81,6 +82,7 @@ body {
 .item { cursor: pointer; }
 .item:hover { background: color-mix(in srgb, var(--surface-variant) 30%, transparent); }
 .item.selected { background: color-mix(in srgb, var(--surface-variant) 55%, transparent); }
+.item.shown { background: color-mix(in srgb, var(--surface-variant) 22%, transparent); } /* the step in the viewer */
 
 /* ── Buttons ────────────────────────────────────────────────────────────────── */
 .btn {
@@ -106,6 +108,8 @@ body {
 .bar { height: 100%; border-radius: 3px; transition: width 0.4s; }
 .chat { display: flex; flex-direction: column; gap: 10px; }
 .chat-input { display: flex; align-items: center; gap: 6px; }
+.chat-file { display: flex; align-items: center; gap: 6px; }
+.chat-file > :first-child { flex: 1; min-width: 0; }
 .chat-log span, #chatLog span { user-select: text; -webkit-user-select: text; white-space: pre-wrap; }
 input[type="text"], input[type="number"], select {
   font: inherit; color: var(--on-surface); background: color-mix(in srgb, var(--surface-variant) 35%, transparent);

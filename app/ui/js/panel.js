@@ -19,8 +19,10 @@ import * as Viewer from "./viewer.js";
 
 const HERO_SIZE = 92;
 const FRAME_MS = 33; // ~30 fps
-const TYPE_WINDOW_MS = 8000; // only steps this recent get the typewriter effect
-const MAX_RAIL = 7;
+const TYPE_WINDOW_MS = 20000; // only steps this recent get the typewriter effect (they may be shown a little late)
+const MAX_RAIL = 6; // rows of the step rail ("Done" included) with a single session
+const SESSION_ROWS_MIN = 3; // session rows that always stay visible below the rail
+const SESSION_ROW_H = 28; // height of a session row in px
 const SPINNER_STEP_MS = 40;
 
 const $ = (id) => document.getElementById(id);
@@ -49,10 +51,13 @@ const mem = {
 // live | chat | usage | settings (`?tab=` overrides the remembered one, for development)
 let tab = new URLSearchParams(location.search).get("tab") || mem.get("tab", "live");
 let pinnedSession = mem.get("session", null); // null = follow the active session
-let pinnedStep = null; // ts_ms of a step chosen in the rail (null = follow the latest)
+let pinnedStep = null; // ts_ms of a step chosen in the rail (null = follow the session)
+const follow = { key: null, since: 0 }; // the step the viewer follows (see Fmt.followStep)
+let typing = false; // the viewer is typing a diff out (redrawn at the full frame rate)
 let pinnedTurn = null; // the turn that step belongs to
 const seenAt = new Map(); // first time a step was drawn (drives the typewriter)
-let optimistic = null; // {text, base}: a message just sent, shown until the daemon confirms it
+let optimistic = null; // {text, file, base}: a message just sent, shown until the daemon confirms it
+let fedFile = null; // {path, name}: a file fed to the pet, sent with the next chat message
 let lastChatRev = "";
 const choices = new Map(); // pending id → question index → Set(labels)
 
@@ -104,8 +109,8 @@ function currentSession() {
 
 const stepsOf = (s) => s?.activity?.recent || [];
 
-/** The step shown in the viewer, and whether it is the latest one (follows the session). */
-function currentStep(s) {
+/** The step shown in the viewer, and whether it follows the session (rather than being pinned). */
+function currentStep(s, t) {
   const list = stepsOf(s);
   if (pinnedStep != null) {
     if (pinnedTurn === s.activity?.turn_started_ms) {
@@ -114,7 +119,7 @@ function currentStep(s) {
     }
     pinnedStep = null; // a new turn started, or the step scrolled out of the list
   }
-  return [list.at(-1), true];
+  return [Fmt.followStep(follow, s.id, list, t), true];
 }
 
 function setTab(id) {
@@ -154,7 +159,7 @@ function settle(id, send, eventKind) {
   else renderAll();
 }
 
-const decide = (action, id) => settle(id, () => invoke("decide", { action, id }), action === "approve" ? "approve" : "deny");
+const decide = (action, id) => settle(id, () => invoke("decide", { action, id }), action === "deny" ? "deny" : "approve");
 
 const picked = (id, qi) => choices.get(id)?.get(qi) || new Set();
 
@@ -198,7 +203,7 @@ const SPINNER_ANGLE = (t) => Math.floor(t / SPINNER_STEP_MS) * 30;
 
 function counts() {
   const working = snap().sessions.filter((s) => s.status === "working").length;
-  return [working, snap().pending.length];
+  return [working, Fmt.needsYou(snap())];
 }
 
 function petBlock(nWorking, nPending) {
@@ -231,7 +236,8 @@ function railRow(s, e, t) {
   else icon = ui.glyph({ name: "loader", size: 18, color: "on_surface", rotate: SPINNER_ANGLE(t) });
   return ui.row(
     {
-      cls: "item" + (pinnedStep === e.ts_ms ? " selected" : ""), data: { act: "pin-step", ts: e.ts_ms },
+      cls: "item" + (pinnedStep === e.ts_ms ? " selected" : pinnedStep == null && follow.key === `${s.id}:${e.ts_ms}` ? " shown" : ""),
+      data: { act: "pin-step", ts: e.ts_ms },
       align: "center", gap: 10, paddingH: 8, paddingV: 5, radius: 8, title: `${e.tool} ${e.label || ""}`,
     },
     [
@@ -242,11 +248,17 @@ function railRow(s, e, t) {
   );
 }
 
+/** Session rows kept visible below the rail. */
+const sessionRowsShown = () => Math.max(1, Math.min(snap().sessions.length, SESSION_ROWS_MIN));
+
 function rail(s, t) {
   const rows = [];
   if (s) {
-    for (const e of stepsOf(s).slice(-MAX_RAIL)) rows.push(railRow(s, e, t));
-    if (s.status === "idle" && s.activity?.finished_ms) {
+    // Fewer steps when there are sessions to list, so a long turn cannot push the list away.
+    const done = s.status === "idle" && !!s.activity?.finished_ms;
+    const room = MAX_RAIL - sessionRowsShown() + 1 - (done ? 1 : 0);
+    for (const e of stepsOf(s).slice(-room)) rows.push(railRow(s, e, t));
+    if (done) {
       rows.push(
         ui.row({ align: "center", gap: 10, paddingH: 8, paddingV: 5 }, [
           ui.glyph({ name: "circle-check-filled", size: 18, color: "on_surface_variant", opacity: 0.6 }),
@@ -319,8 +331,8 @@ function questionCard(p, who) {
   return ui.column({ gap: 10, padding: 10, fill: "primary/0.10", radius: 12 }, children);
 }
 
-/** A plan the agent wants approved: that dialog only exists in the terminal, so it is shown here for
- *  reading and goes away once it has been dealt with there. */
+/** A plan the agent wants approved (Claude Code's "Ready to code?"). While its hook waits it can be
+ *  approved here; after that it stays for reading until it has been dealt with in the terminal. */
 function planCard(p, who) {
   const children = [
     ui.row({ align: "center", gap: 8 }, [
@@ -329,7 +341,15 @@ function planCard(p, who) {
     ]),
   ];
   if (p.detail && typeof p.detail === "object") children.push(Viewer.render(p.detail, { bodyLines: 14 }));
-  children.push(ui.label({ text: "Review and approve it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
+  if (p.answerable === false) {
+    children.push(ui.label({ text: "Review and approve it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
+  } else {
+    const data = { id: p.id };
+    children.push(
+      `<div class="btn-row">${btn("Approve", { variant: "primary", act: "plan-approve", data, tip: "Claude asks before each edit" })}${btn("Approve, auto-accept edits", { variant: "outline", act: "plan-approve-edits", data })}${btn("Keep planning", { variant: "outline", act: "deny", data, tip: "Then tell Claude what to change in the terminal" })}</div>`,
+    );
+    children.push(ui.label({ text: "You can also answer it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
+  }
   return ui.column({ gap: 8, padding: 10, fill: "primary/0.10", radius: 12 }, children);
 }
 
@@ -355,10 +375,10 @@ function permissionCard(p) {
 
 // ── Right column: Live ─────────────────────────────────────────────────────────
 
-function stepLine(e) {
+function stepLine(e, t) {
   const right = [];
   if (e.added > 0 || e.removed > 0) right.push(ui.label({ text: `+${e.added || 0} -${e.removed || 0}`, fontSize: 11, color: "on_surface_variant" }));
-  const status = e.ok === true ? "done" : e.ok === false ? "failed" : "running";
+  const status = e.ok === true ? "done" : e.ok === false ? "failed" : `running · ${Fmt.duration(t - e.ts_ms)}`;
   right.push(ui.label({ text: status, fontSize: 11, fontWeight: "semibold", color: e.ok === false ? Viewer.COLORS.fail : e.ok === true ? Viewer.COLORS.ok : "primary" }));
   return ui.row({ align: "center", gap: 8 }, [
     ui.label({ text: `${e.tool}  ${e.label || ""}`, fontSize: 12, color: "on_surface_variant", maxLines: 1, flexGrow: 1 }),
@@ -369,7 +389,7 @@ function stepLine(e) {
 /** The viewer for a step. The latest step of a working session is typed out. */
 function viewerFor(s, e, t, following) {
   const detail = e.detail;
-  const opts = { ok: e.ok, maxRows: 22 };
+  const opts = { ok: e.ok, maxRows: 34 };
   if (following && detail?.type === "diff" && t - e.ts_ms < TYPE_WINDOW_MS) {
     const key = `${s.id}:${e.ts_ms}`;
     const first = seenAt.get(key) ?? t;
@@ -380,6 +400,7 @@ function viewerFor(s, e, t, following) {
     if (n < total || e.ok == null) {
       opts.typed = Math.min(n, total);
       opts.cursor = Math.floor(t / 450) % 2 === 0;
+      typing = n < total;
     }
   }
   return Viewer.render(detail, opts);
@@ -393,11 +414,12 @@ const resultCard = (text) =>
 
 function liveContent(s, t) {
   const nodes = [];
+  typing = false;
   if (!s) {
     nodes.push(Viewer.render(null, { empty: "No agent session yet. Start Claude Code, Codex, opencode or pi in a terminal and it shows up here." }));
   } else {
-    const [e, following] = currentStep(s);
-    if (e) nodes.push(stepLine(e), viewerFor(s, e, t, following));
+    const [e, following] = currentStep(s, t);
+    if (e) nodes.push(stepLine(e, t), viewerFor(s, e, t, following));
     else nodes.push(Viewer.render(null, { empty: s.status === "idle" ? "Idle: nothing running." : "Waiting for the first step of this turn…" }));
     if (s.activity?.last_result && s.status === "idle") nodes.push(resultCard(s.activity.last_result));
   }
@@ -412,9 +434,17 @@ function bubble(m, streaming) {
   const mine = m.role === "user";
   let text = m.text || "";
   if (!text && streaming) text = "…";
-  const box = ui.column({ padding: 10, radius: 12, fill: mine ? "primary/0.22" : "surface_variant/0.45", maxWidth: 430 }, [
-    ui.label({ text, fontSize: 13, color: "on_surface" }),
-  ]);
+  const body = [];
+  if (m.file) {
+    body.push(
+      ui.row({ gap: 4, align: "center" }, [
+        ui.glyph({ name: "file-text", size: 13, color: "primary" }),
+        ui.label({ text: m.file, fontSize: 11, fontWeight: "semibold", color: "primary", maxLines: 1 }),
+      ]),
+    );
+  }
+  if (text) body.push(ui.label({ text, fontSize: 13, color: "on_surface" }));
+  const box = ui.column({ padding: 10, radius: 12, gap: 4, fill: mine ? "primary/0.22" : "surface_variant/0.45", maxWidth: 430 }, body);
   return ui.row({ justify: mine ? "end" : "start" }, [box]);
 }
 
@@ -430,13 +460,13 @@ function renderChat() {
   if (optimistic && msgs.length > optimistic.base) optimistic = null;
   const who = Fmt.agentLabel(snap(), chat.agent || chatAgent());
   const rows = msgs.map((m, i) => bubble(m, chat.busy && i === msgs.length - 1));
-  if (optimistic) rows.push(bubble({ role: "user", text: optimistic.text }), bubble({ role: "assistant", text: "" }, true));
+  if (optimistic) rows.push(bubble({ role: "user", text: optimistic.text, file: optimistic.file }), bubble({ role: "assistant", text: "" }, true));
   if (!rows.length) {
     rows.push(
       ui.column({ gap: 6, padding: 6 }, [
         ui.label({ text: `Ask ${who} anything`, fontSize: 16, fontWeight: "semibold", color: "on_surface" }),
         ui.label({
-          text: `Quick questions and answers, right from here. This chat has no tools and no access to your files; it uses your ${who} login.`,
+          text: `Quick questions and answers, right from here. This chat has no tools and no access to your files, but you can drop a file on the pet to ask about it. It uses your ${who} login.`,
           fontSize: 12, color: "on_surface_variant", maxLines: 4, maxWidth: 430,
         }),
       ]),
@@ -457,8 +487,18 @@ function renderChat() {
   const busy = chatBusy();
   const input = $("chatInput");
   input.disabled = busy;
-  input.placeholder = busy ? `${who} is answering…` : `Ask ${who} anything…`;
-  const ready = input.value.trim() !== "";
+  input.placeholder = busy ? `${who} is answering…` : fedFile ? `Ask about ${fedFile.name}…` : `Ask ${who} anything…`;
+  const ready = input.value.trim() !== "" || fedFile != null;
+  setHtml(
+    $("chatFile"),
+    fedFile
+      ? ui.row({ gap: 6, align: "center", paddingH: 8, paddingV: 4, radius: 8, fill: "primary/0.12" }, [
+          ui.glyph({ name: "file-text", size: 14, color: "primary" }),
+          ui.label({ text: fedFile.name, fontSize: 12, fontWeight: "semibold", color: "on_surface", maxLines: 1, flexGrow: 1 }),
+        ]) + btn("", { act: "feed-discard", glyph: "x", tip: "Don't send this file", small: true })
+      : "",
+  );
+  $("chatFile").classList.toggle("hidden", !fedFile);
   setHtml(
     $("chatBtns"),
     (busy
@@ -472,11 +512,13 @@ function submitChat() {
   const input = $("chatInput");
   const text = input.value.trim();
   const chat = snap().chat || {};
-  if (!text || chat.busy || optimistic) return;
-  optimistic = { text, base: (chat.messages || []).length };
+  if ((!text && !fedFile) || chat.busy || optimistic) return;
+  const file = fedFile;
+  fedFile = null;
+  optimistic = { text, file: file?.name, base: (chat.messages || []).length };
   input.value = "";
   const model = setting("chatModel");
-  invoke("chat_send", { text, model: model || null, agent: chatAgent() }).catch((e) => {
+  invoke("chat_send", { text, model: model || null, agent: chatAgent(), file: file?.path || null }).catch((e) => {
     optimistic = null;
     console.warn("sushi: chat failed:", e);
     renderChat();
@@ -603,6 +645,7 @@ function renderLeft(t) {
   setHtml($("title"), titleBlock(s, nWorking, nPending, t));
   setHtml($("rail"), rail(s, t));
   setHtml($("sessions"), sessionList(s));
+  $("sessions").style.minHeight = `${sessionRowsShown() * SESSION_ROW_H}px`;
 }
 
 function renderRight() {
@@ -628,7 +671,11 @@ function renderRight() {
       ]),
     );
   } else if (tab === "usage") setHtml($("content"), usageContent(s, t));
-  else if (tab === "live") setHtml($("content"), liveContent(s, t));
+  else if (tab === "live") {
+    setHtml($("content"), liveContent(s, t));
+    // Keep the line being typed in sight (only while typing: then the page is free to scroll).
+    if (typing) $("content").querySelector(".caret")?.scrollIntoView({ block: "nearest" });
+  }
   else if (tab === "chat") renderChat();
   else if (tab === "settings" && !$("settings")._built) {
     $("settings").innerHTML = settingsView();
@@ -655,6 +702,8 @@ function onClick(e) {
     case "poke": return pet.poke(now());
     case "allow": return decide("approve", id);
     case "deny": return decide("deny", id);
+    case "plan-approve": return decide("approve", id);
+    case "plan-approve-edits": return decide("approve-edits", id);
     case "choose": {
       const p = snap().pending.find((x) => x.id === id);
       return p && choose(p, Number(d.qi), d.label);
@@ -671,6 +720,9 @@ function onClick(e) {
     }
     case "chat-send": return submitChat();
     case "chat-stop": return void invoke("chat_stop");
+    case "feed-discard":
+      fedFile = null;
+      return renderChat();
     case "chat-clear":
       optimistic = null;
       $("chatInput").value = "";
@@ -717,6 +769,7 @@ const SKELETON = `
     <div id="content" class="scroll grow"></div>
     <div id="chat" class="chat grow hidden">
       <div id="chatLog" class="scroll grow"></div>
+      <div id="chatFile" class="chat-file hidden"></div>
       <div class="chat-input"><input id="chatInput" type="text" autocomplete="off" spellcheck="true"><span id="chatBtns" class="btn-row"></span></div>
     </div>
     <div id="settings" class="scroll grow hidden"></div>
@@ -738,6 +791,13 @@ export function mount(root) {
   $("chatInput").addEventListener("input", renderChat);
 
   listen("petEvent", (ev) => ev && pet.onEvent(ev.kind, ev.ts, now()));
+  // A file dropped on either window (the Rust side sends it): attach it to the next message and show the chat.
+  listen("fedFile", (f) => {
+    if (!f?.path) return;
+    fedFile = f;
+    if (Fmt.canChat(snap())) setTab("chat");
+    renderChat();
+  });
 
   start(
     () => {
@@ -765,7 +825,7 @@ export function mount(root) {
         slow = t;
         renderLeft(t);
         if (tab === "live" || tab === "usage") renderRight();
-      }
+      } else if (tab === "live" && typing) renderRight(); // the typewriter runs at the full frame rate
     }
     requestAnimationFrame(frame);
   };

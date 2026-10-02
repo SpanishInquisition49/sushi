@@ -34,7 +34,7 @@ enum Kind {
     Permission,
     /// The agent asks a question: answer it (the answers go back through the hook).
     Question,
-    /// A plan: the dialog can only be answered in the terminal; shown for information.
+    /// A plan (Claude Code's `ExitPlanMode`): approve it (maybe with auto-accepted edits) or keep planning.
     Plan,
 }
 
@@ -48,8 +48,9 @@ impl Kind {
     }
 }
 
-/// The hook's final word: a decision and, for questions, the input carrying the answers.
-type Verdict = (Decision, Option<Value>);
+/// The hook's final word: a decision, the input to use instead (the answers of a question, the
+/// approved plan) and the permission mode to switch to.
+type Verdict = (Decision, Option<Value>, Option<&'static str>);
 
 struct Pending {
     id: u64,
@@ -60,14 +61,15 @@ struct Pending {
     tool_name: String,
     detail: Option<Detail>,
     kind: Kind,
-    /// The original tool input, kept for questions (the answers are added to it).
+    /// The original tool input, kept for questions (the answers are added to it) and plans.
     tool_input: Value,
     created_ms: u64,
-    /// `None` for plans: nothing is waiting for an answer.
+    /// `None` once nothing waits for an answer: a plan whose hook gave up stays shown until it is
+    /// dealt with in the terminal.
     tx: Option<Sender<Verdict>>,
 }
 
-/// Plans nobody answered in this long are dropped (they have no hook waiting to give up).
+/// Plans left to the terminal are dropped after this long (no hook is waiting to give up).
 const PLAN_TTL_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Default)]
@@ -82,6 +84,8 @@ struct State {
     limits: Option<Limits>,
     limits_error: Option<String>,
     chat: Chat,
+    /// Connections that asked to watch the state: each change is written to them at once.
+    watchers: Vec<UnixStream>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -132,7 +136,7 @@ impl State {
                 json!({
                     "id": p.id, "agent": p.agent, "session_id": p.session_id, "session_name": name,
                     "tool": p.tool, "tool_name": p.tool_name, "detail": p.detail, "kind": p.kind.as_str(),
-                    "created_ms": p.created_ms,
+                    "created_ms": p.created_ms, "answerable": p.tx.is_some(),
                 })
             })
             .collect();
@@ -165,8 +169,14 @@ impl State {
         if body == self.last_published && now.saturating_sub(self.last_write_ms) < HEARTBEAT.as_millis() as u64 {
             return;
         }
+        let changed = body != self.last_published;
         let mut out = snap;
         out["updated_ms"] = json!(now);
+        if changed && !self.watchers.is_empty() {
+            let reply = Reply { state: Some(out.clone()), ..Reply::ok() };
+            // A watcher that is gone, or too slow to keep up, is dropped (it reconnects).
+            self.watchers.retain_mut(|w| write_line(w, &reply).is_ok());
+        }
         let dir = state_dir();
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join("state.json.tmp");
@@ -211,10 +221,13 @@ fn peer_closed(stream: &mut UnixStream) -> bool {
 }
 
 fn write_reply(stream: &mut UnixStream, reply: &Reply) {
-    if let Ok(mut line) = serde_json::to_string(reply) {
-        line.push('\n');
-        let _ = stream.write_all(line.as_bytes());
-    }
+    let _ = write_line(stream, reply);
+}
+
+fn write_line(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<()> {
+    let mut line = serde_json::to_string(reply).map_err(std::io::Error::other)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())
 }
 
 fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: Value) {
@@ -248,16 +261,10 @@ fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: V
                     Role::Plan if caps.plans => Kind::Plan,
                     _ => Kind::Permission,
                 };
-                // A plan has nothing to decide, so nothing waits; the others wait for the notch.
-                let (tx, rx) = if kind == Kind::Plan {
-                    (None, None)
-                } else {
-                    let (tx, rx) = mpsc::channel();
-                    (Some(tx), Some(rx))
-                };
-                let tool_input = if kind == Kind::Question { input } else { Value::Null };
-                st.pending.push(Pending { id, agent, session_id: sid, tool: tool_summary, tool_name, detail, kind, tool_input, created_ms: now, tx });
-                rx.map(|rx| (id, rx))
+                let (tx, rx) = mpsc::channel();
+                let tool_input = if matches!(kind, Kind::Question | Kind::Plan) { input } else { Value::Null };
+                st.pending.push(Pending { id, agent, session_id: sid, tool: tool_summary, tool_name, detail, kind, tool_input, created_ms: now, tx: Some(tx) });
+                Some((id, rx))
             }
             _ => None,
         };
@@ -280,20 +287,27 @@ fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: V
         }
     };
     let mut st = lock(shared);
-    st.pending.retain(|p| p.id != id);
+    match st.pending.iter_mut().find(|p| p.id == id) {
+        // The plan is still open in the terminal: keep showing it until Claude moves on.
+        Some(p) if p.kind == Kind::Plan && decision.is_none() => p.tx = None,
+        _ => st.pending.retain(|p| p.id != id),
+    }
     st.publish();
     drop(st);
-    if let Some((d, updated_input)) = decision {
-        write_reply(&mut stream, &Reply { decision: Some(d), updated_input, ..Reply::ok() });
+    if let Some((d, updated_input, mode)) = decision {
+        write_reply(&mut stream, &Reply { decision: Some(d), updated_input, mode: mode.map(str::to_string), ..Reply::ok() });
     }
 }
 
-/// Allow or deny a pending permission.
-fn handle_decision(shared: &Shared, id: u64, decision: Decision) -> Reply {
-    resolve(shared, id, |p| match p.kind {
-        Kind::Permission => Ok((decision, None)),
-        Kind::Question => Err("this is a question: answer it (sushi answer) or answer it in the terminal".into()),
-        Kind::Plan => Err("a plan is approved in the terminal".into()),
+/// Allow or deny a pending permission, or approve a plan (`accept_edits`: and let Claude edit
+/// without asking) or send it back to keep planning.
+fn handle_decision(shared: &Shared, id: u64, decision: Decision, accept_edits: bool) -> Reply {
+    resolve(shared, id, |p| match (p.kind, decision) {
+        (Kind::Permission, _) => Ok((decision, None, None)),
+        (Kind::Question, _) => Err("this is a question: answer it (sushi answer) or answer it in the terminal".into()),
+        // Claude Code only takes the approval of a plan along with its input.
+        (Kind::Plan, Decision::Allow) => Ok((decision, Some(p.tool_input.clone()), accept_edits.then_some("acceptEdits"))),
+        (Kind::Plan, Decision::Deny) => Ok((decision, None, None)),
     })
 }
 
@@ -313,7 +327,7 @@ fn handle_answer(shared: &Shared, id: u64, answers: Value) -> Reply {
             Some(obj) => obj.insert("answers".into(), answers.clone()),
             None => return Err("the question has no input to answer".into()),
         };
-        Ok((Decision::Allow, Some(input)))
+        Ok((Decision::Allow, Some(input), None))
     })
 }
 
@@ -323,6 +337,9 @@ fn resolve(shared: &Shared, id: u64, decide: impl FnOnce(&Pending) -> Result<Ver
     let Some(pos) = st.pending.iter().position(|p| p.id == id) else {
         return Reply::err(format!("no pending request with id {id}"));
     };
+    if st.pending[pos].tx.is_none() {
+        return Reply::err("nothing is waiting for this answer any more: answer it in the terminal");
+    }
     let verdict = match decide(&st.pending[pos]) {
         Ok(v) => v,
         Err(e) => return Reply::err(e),
@@ -347,12 +364,24 @@ fn chat_file() -> std::path::PathBuf {
 }
 
 /// Start a chat turn in the background; the answer streams into the shared state. `agent` and
-/// `model` override the configured ones.
-fn chat_send(shared: &Shared, text: &str, model: Option<String>, agent: Option<String>) -> Reply {
+/// `model` override the configured ones; `file` is a file fed with the message, whose content goes
+/// into the prompt (the log only keeps its name).
+fn chat_send(shared: &Shared, text: &str, model: Option<String>, agent: Option<String>, file: Option<String>) -> Reply {
     let text: String = text.trim().chars().take(chat::MAX_INPUT_CHARS).collect();
-    if text.is_empty() {
+    let attachment = match file.filter(|f| !f.trim().is_empty()) {
+        Some(f) => match chat::read_attachment(std::path::Path::new(&f)) {
+            Ok(a) => Some(a),
+            Err(e) => return Reply::err(e),
+        },
+        None => None,
+    };
+    if text.is_empty() && attachment.is_none() {
         return Reply::err("empty message");
     }
+    let prompt = match &attachment {
+        Some((name, content)) => chat::prompt_with_file(name, content, &text),
+        None => text.clone(),
+    };
     let (agent, program, args, slot, generation, was_started) = {
         let mut st = lock(shared);
         if st.chat.busy {
@@ -370,9 +399,9 @@ fn chat_send(shared: &Shared, text: &str, model: Option<String>, agent: Option<S
             .filter(|m| agent == Agent::Claude || !chat::is_claude_alias(m))
             .or_else(|| st.config.chat_models.get(agent.id()).cloned())
             .or_else(|| chat::default_model(agent, &st.config.chat_model));
-        let args = chat::build_args(agent, &st.chat.saved.session_id, st.chat.saved.started, model.as_deref(), &text);
+        let args = chat::build_args(agent, &st.chat.saved.session_id, st.chat.saved.started, model.as_deref(), &prompt);
         let was_started = st.chat.saved.started;
-        st.chat.begin_turn(&text);
+        st.chat.begin_turn(&text, attachment.as_ref().map(|(name, _)| name.as_str()));
         st.publish();
         (agent, st.config.program_for(agent), args, st.chat.child.clone(), st.chat.generation, was_started)
     };
@@ -436,14 +465,25 @@ fn handle_conn(mut stream: UnixStream, shared: Shared) {
             Some(agent) => handle_hook(stream, &shared, agent, payload),
             None => write_reply(&mut stream, &Reply::err(format!("unknown agent {agent}"))),
         },
-        Ok(Request::Approve { id }) => write_reply(&mut stream, &handle_decision(&shared, id, Decision::Allow)),
-        Ok(Request::Deny { id }) => write_reply(&mut stream, &handle_decision(&shared, id, Decision::Deny)),
+        Ok(Request::Approve { id, accept_edits }) => write_reply(&mut stream, &handle_decision(&shared, id, Decision::Allow, accept_edits)),
+        Ok(Request::Deny { id }) => write_reply(&mut stream, &handle_decision(&shared, id, Decision::Deny, false)),
         Ok(Request::State) => {
             let snap = lock(&shared).snapshot();
             write_reply(&mut stream, &Reply { state: Some(snap), ..Reply::ok() });
         }
+        Ok(Request::Watch) => {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            let mut st = lock(&shared);
+            let mut snap = st.snapshot();
+            snap["updated_ms"] = json!(now_ms());
+            if write_line(&mut stream, &Reply { state: Some(snap), ..Reply::ok() }).is_ok() {
+                st.watchers.push(stream);
+            }
+        }
         Ok(Request::Answer { id, answers }) => write_reply(&mut stream, &handle_answer(&shared, id, answers)),
-        Ok(Request::ChatSend { text, model, agent }) => write_reply(&mut stream, &chat_send(&shared, &text, model, agent)),
+        Ok(Request::ChatSend { text, model, agent, file }) => {
+            write_reply(&mut stream, &chat_send(&shared, &text, model, agent, file))
+        }
         Ok(Request::ChatStop) => {
             let slot = lock(&shared).chat.child.clone();
             chat::stop(&slot);
@@ -615,7 +655,7 @@ fn install_command(agents: &[Agent], write: bool) -> Result<(), String> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: sushi <daemon | state | approve ID | deny ID | answer ID JSON | chat TEXT [--model M] [--agent A] | chat-stop | chat-clear | install [--agent claude|codex|opencode|pi|all] [--write]>");
+    eprintln!("usage: sushi <daemon | state | approve ID [--accept-edits] | deny ID | answer ID JSON | chat [TEXT] [--file PATH] [--model M] [--agent A] | chat-stop | chat-clear | install [--agent claude|codex|opencode|pi|copilot|antigravity|all] [--write]>");
     std::process::exit(2)
 }
 
@@ -627,9 +667,10 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&r.state).unwrap_or_default());
         }),
         ["chat", rest @ ..] if !rest.is_empty() => {
-            // sushi chat <text...> [--model <alias>] [--agent <id>]
+            // sushi chat [text...] [--file <path>] [--model <alias>] [--agent <id>]
             let mut model = None;
             let mut agent = None;
+            let mut file = None;
             let mut words = Vec::new();
             let mut it = rest.iter();
             while let Some(w) = it.next() {
@@ -637,11 +678,15 @@ fn main() {
                     model = it.next().map(|m| m.to_string());
                 } else if *w == "--agent" {
                     agent = it.next().map(|m| m.to_string());
+                } else if *w == "--file" {
+                    // The daemon runs elsewhere: hand it an absolute path.
+                    let Some(p) = it.next() else { usage() };
+                    file = Some(std::fs::canonicalize(p).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string()));
                 } else {
                     words.push(*w);
                 }
             }
-            client(&Request::ChatSend { text: words.join(" "), model, agent })
+            client(&Request::ChatSend { text: words.join(" "), model, agent, file })
                 .and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
         }
         ["answer", id, json] => match (id.parse::<u64>(), serde_json::from_str::<Value>(json)) {
@@ -652,9 +697,9 @@ fn main() {
         },
         ["chat-stop"] => client(&Request::ChatStop).map(|_| ()),
         ["chat-clear"] => client(&Request::ChatClear).map(|_| ()),
-        [cmd @ ("approve" | "deny"), id] => match id.parse::<u64>() {
+        [cmd @ ("approve" | "deny"), id, flags @ ..] if flags.is_empty() || (*cmd == "approve" && flags == ["--accept-edits"]) => match id.parse::<u64>() {
             Ok(id) => {
-                let req = if *cmd == "approve" { Request::Approve { id } } else { Request::Deny { id } };
+                let req = if *cmd == "approve" { Request::Approve { id, accept_edits: !flags.is_empty() } } else { Request::Deny { id } };
                 client(&req).and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
             }
             Err(_) => usage(),

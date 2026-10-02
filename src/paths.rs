@@ -118,6 +118,11 @@ pub fn copilot_dir() -> PathBuf {
     env::var_os("COPILOT_HOME").map(PathBuf::from).unwrap_or_else(|| home_join(".copilot"))
 }
 
+/// Where Antigravity CLI reads its user-wide hooks (`~/.gemini/config`).
+pub fn antigravity_config_dir() -> PathBuf {
+    home_join(".gemini/config")
+}
+
 /// pi's agent folder (`~/.pi/agent`).
 pub fn pi_dir() -> PathBuf {
     home_join(".pi/agent")

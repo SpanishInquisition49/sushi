@@ -1,5 +1,6 @@
-# Sushi — a pet on the notch that shows your coding agents' sessions (Claude Code, Codex, GitHub Copilot, opencode, pi).
+# Sushi — a pet on the notch that shows your coding agents' sessions (Claude Code, Codex, GitHub Copilot, Antigravity, opencode, pi).
 # Clicking the pet opens a window attached to the notch.
+# Middle-clicking it feeds it the file copied in the file manager (the chat then asks about it).
 # Data comes from the `sushi daemon` (see the repo README / src/main.rs).
 
 id           = "scanna/sushi"
@@ -8,9 +9,9 @@ version      = "0.11.0"
 plugin_api   = 21
 author       = "scanna"
 license      = "MIT"
-tags         = ["bar", "panel", "service", "claude", "codex", "copilot", "opencode", "pi"]
+tags         = ["bar", "panel", "service", "claude", "codex", "copilot", "antigravity", "opencode", "pi"]
 icon         = "robot"
-description  = "A pet on the notch that tracks your coding agents (Claude Code, Codex, GitHub Copilot, opencode, pi)."
+description  = "A pet on the notch that tracks your coding agents (Claude Code, Codex, GitHub Copilot, Antigravity, opencode, pi)."
 dependencies = []
 
 # ── Plugin-level settings ─────────────────────────────────────────────────────

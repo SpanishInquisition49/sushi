@@ -1,11 +1,13 @@
 // pet-window.js — the small always-on-top window: the pet plus a few numbers (port of plugin/bar_widget.luau).
-//   "!N"        pending permission requests (when any)
+//   "!N"        requests waiting for you, and sessions waiting in their own terminal (when any)
 //   "2:13"      how long the active session's current turn has been running
 //   pencil "3"  files changed this turn ("detailed" also adds +lines -lines, commands, failures)
 //   "44%"       plan usage of the 5-hour window (falls back to the context window of the most
 //               recently active session when plan limits are unavailable)
 // The tooltip carries the full progress of the active session.
 // Click → open / close the panel · drag → move the window · right click → pet it.
+// Drop a file on it → it eats the file and the chat opens with the file attached (handled on the
+// Rust side, which sends the pet's reactions as petEvent and the file as fedFile).
 
 import { invoke, listen, emit, startDragging } from "./api.js";
 import { store, setting, start } from "./store.js";
@@ -67,11 +69,13 @@ function tooltipRows() {
 
 /** Small pieces describing the active session's turn (time, changes, commands). */
 function sessionChips(info) {
-  const chips = [];
   const s = Fmt.activeSession(snap());
-  if (!s || s.status === "idle") return chips;
-  const a = s.activity || {};
-  const elapsed = Fmt.turnElapsed(s, now());
+  if (!s || s.status === "idle") return [];
+  return chips(info, s.activity || {}, Fmt.turnElapsed(s, now()));
+}
+
+function chips(info, a, elapsed) {
+  const chips = [];
   if (elapsed != null) chips.push(ui.label({ text: Fmt.duration(elapsed), fontSize: 12, color: "on_surface_variant" }));
   if (a.files_changed > 0) {
     chips.push(ui.glyph({ name: "pencil", size: 12, color: "primary" }), ui.label({ text: String(a.files_changed), fontSize: 12, fontWeight: "bold", color: "primary" }));
@@ -84,17 +88,18 @@ function sessionChips(info) {
   return chips;
 }
 
+/** The pill: the pet, then `pending` ("!N"), the session chips and the headline percentage. */
+function pill(pending, sessionChips, h) {
+  const children = [pet.build(PET_SIZE, { room: 6, margin: 4, mouth: true, maxHeight: 74 })];
+  if (pending > 0) children.push(ui.label({ text: "!" + pending, fontSize: 13, fontWeight: "bold", color: "error" }));
+  children.push(...sessionChips);
+  if (h) children.push(ui.label({ text: h[0], fontSize: 13, fontWeight: "bold", color: h[1] }));
+  return ui.row({ gap: 6, align: "center", cls: "pill" }, children);
+}
+
 function render() {
   const info = setting("widgetInfo");
-  const children = [pet.build(PET_SIZE, { room: 6, margin: 4, mouth: true, maxHeight: 74 })];
-  if (store.up) {
-    const pending = snap().pending.length;
-    if (pending > 0) children.push(ui.label({ text: "!" + pending, fontSize: 13, fontWeight: "bold", color: "error" }));
-    if (info !== "usage") children.push(...sessionChips(info));
-    const h = headline();
-    if (h) children.push(ui.label({ text: h[0], fontSize: 13, fontWeight: "bold", color: h[1] }));
-  }
-  const html = ui.row({ gap: 6, align: "center", cls: "pill" }, children);
+  const html = store.up ? pill(Fmt.needsYou(snap()), info !== "usage" ? sessionChips(info) : [], headline()) : pill(0, [], null);
   const root = document.getElementById("root");
   if (html !== lastHtml) {
     lastHtml = html;
@@ -105,6 +110,27 @@ function render() {
     lastTip = tip;
     root.title = tip;
   }
+}
+
+/** Size the window for the pill at its widest with the current settings, so it takes no more room
+ *  than it can show. Done before the window first shows and when the settings change: tiling
+ *  compositors (niri) only take a window's size when it opens, so it cannot follow every chip. */
+let fitted = "";
+function fitWindow() {
+  const a = { files_changed: 99, lines_added: 9999, lines_removed: 9999, commands: 99, failures: 9 };
+  const info = setting("widgetInfo");
+  const widest = pill(9, info !== "usage" ? chips(info, a, 9 * 3600e3 + 59 * 60e3 + 59e3) : [], ["100%", "error"]);
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:absolute;left:0;top:0;visibility:hidden;width:max-content";
+  probe.innerHTML = widest;
+  document.body.appendChild(probe);
+  const r = probe.firstElementChild.getBoundingClientRect();
+  probe.remove();
+  const pad = 12 + 4; // #root's padding on both sides, and a little room for the font
+  const size = [Math.ceil(r.width) + pad, Math.ceil(r.height) + pad];
+  if (size.join("x") === fitted) return;
+  fitted = size.join("x");
+  invoke("fit_pet", { width: size[0], height: size[1] });
 }
 
 /** Click, drag and right click on the pet. */
@@ -151,6 +177,7 @@ export function mount(root) {
     () => {
       pet.configure(configFrom(store.settings));
       pet.enableSounds(setting("sounds"));
+      fitWindow();
     },
   );
 

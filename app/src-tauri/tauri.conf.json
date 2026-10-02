@@ -16,10 +16,15 @@
         "title": "Sushi",
         "width": 300,
         "height": 96,
+        "minWidth": 300,
+        "maxWidth": 300,
+        "minHeight": 96,
+        "maxHeight": 96,
+        "visible": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
-        "resizable": false,
+        "resizable": true,
         "skipTaskbar": true,
         "shadow": false
       },
@@ -32,6 +37,7 @@
         "minWidth": 720,
         "minHeight": 480,
         "visible": false,
+        "create": false,
         "center": true
       }
     ],

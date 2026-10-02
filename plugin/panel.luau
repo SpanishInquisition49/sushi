@@ -9,22 +9,28 @@
 --         the Chat tab ("Ask <agent> anything") talks to the daemon's headless chat
 --
 -- Clicking a step shows that step in the viewer; clicking a session pins it (click it
--- again to follow the active session). Everything is drawn from the daemon's snapshot.
+-- again to follow the active session). A file fed to the pet ("Feed a file", or
+-- from the bar widget) is attached to the next chat message. Everything is drawn from the
+-- daemon's snapshot.
 
 local Pet = require("./lib/pet.luau")
 local Fmt = require("./lib/fmt.luau")
 local Highlight = require("./lib/highlight.luau")
 local Viewer = require("./lib/viewer.luau")
 local Chat = require("./lib/chat.luau")
+local Feed = require("./lib/feed.luau")
 Pet.setUi(ui)
 Viewer.init(ui, Highlight)
 Chat.init(ui)
+Feed.init(noctalia)
 
 local HERO_SIZE = 92
 local LEFT_W = 292
 local FRAME_MS = 33          -- cap the redraw rate at ~30 fps
-local TYPE_WINDOW_MS = 8000  -- only steps this recent get the typewriter effect
-local MAX_RAIL = 7
+local TYPE_WINDOW_MS = 20000 -- only steps this recent get the typewriter effect (they may be shown a little late)
+local MAX_RAIL = 6           -- rows of the step rail ("Done" included) with a single session
+local SESSION_ROWS_MIN = 3   -- session rows that always stay visible below the rail
+local SESSION_ROW_H = 28     -- height of a session row (paddingV 5 + a 12 px label + gap)
 
 local snapshot = { sessions = {}, pending = {}, usage = {} }
 local daemonUp = false
@@ -45,14 +51,15 @@ end
 
 local pinnedSession = recall("selectedSession", "sel") -- nil = follow the active session
 local tab = recall("panelTab", "tab") or "live"
-local pinnedStep = nil   -- ts_ms of a step chosen in the rail (nil = follow the latest)
+local pinnedStep = nil   -- ts_ms of a step chosen in the rail (nil = follow the session)
+local follow = { key = nil, since = 0 } -- the step the viewer follows (see Fmt.followStep)
 local pinnedTurn = nil   -- the turn that step belongs to
 local seenAt = {}        -- first time a step was drawn (drives the typewriter)
 local viewCache = {}     -- finished viewer trees, so they are not rebuilt every frame
 local viewCacheSize = 0
 local chatInputKey = 0   -- bumped after each send: recreates (empties) the text field
 local chatDraft = ""     -- what is typed so far (the send button needs it)
-local optimistic = nil   -- {text, base}: a message just sent, shown until the daemon confirms it
+local optimistic = nil   -- {text, file, base}: a message just sent, shown until the daemon confirms it
 
 --- Make the pet react here and in the bar widget (events are shared through noctalia.state).
 local function sendEvent(kind)
@@ -105,8 +112,11 @@ local function settle(id, argv, eventKind)
     end
 end
 
-local function decide(action, id)
-    settle(id, { binPath(), action, tostring(id) }, (action == "approve") and "approve" or "deny")
+--- `extra`: more CLI arguments (`--accept-edits` to approve a plan with auto-accepted edits).
+local function decide(action, id, extra)
+    local argv = { binPath(), action, tostring(id) }
+    if extra then argv[#argv + 1] = extra end
+    settle(id, argv, (action == "approve") and "approve" or "deny")
 end
 
 -- ── Gaze ──────────────────────────────────────────────────────────────────────
@@ -144,7 +154,7 @@ end
 local function stepsOf(s) return (s and s.activity and s.activity.recent) or {} end
 
 --- The step shown in the viewer, and whether it is the latest one (follows the session).
-local function currentStep(s)
+local function currentStep(s, now)
     local list = stepsOf(s)
     if pinnedStep then
         local turn = s.activity and s.activity.turn_started_ms
@@ -155,7 +165,7 @@ local function currentStep(s)
         end
         pinnedStep = nil -- a new turn started, or the step scrolled out of the list
     end
-    return list[#list], true
+    return Fmt.followStep(follow, s.id, list, now), true
 end
 
 local function setTab(id)
@@ -197,7 +207,7 @@ local function counts()
     for _, s in ipairs(snapshot.sessions or {}) do
         if s.status == "working" then working = working + 1 end
     end
-    return working, #(snapshot.pending or {})
+    return working, Fmt.needsYou(snapshot)
 end
 
 local function petBlock(nWorking, nPending)
@@ -212,6 +222,23 @@ local function petBlock(nWorking, nPending)
     return ui.row({ key = "pet", onHover = "onGaze", onClick = function() pet:poke(noctalia.nowMs()) end, tooltip = "Poke it" }, {
         pet:build(HERO_SIZE, { room = 20, maxHeight = 124, margin = 20, badge = badge, badgeSlot = true }),
     })
+end
+
+--- Feed the pet a file: it eats it and the chat opens with the file attached.
+local function feed(path)
+    if not path then
+        sendEvent("sad") -- nothing to eat: copy a file in the file manager first
+        return
+    end
+    Feed.feed(path)
+    sendEvent("eat")
+    tab = "chat"
+    render()
+end
+
+function onFeedDiscard()
+    Feed.clear()
+    render()
 end
 
 local function titleBlock(s, nWorking, nPending, now)
@@ -239,7 +266,8 @@ local function railRow(s, e, now)
     end
     return ui.row({
         key = "step-" .. tostring(e.ts_ms), align = "center", gap = 10, paddingH = 8, paddingV = 5, radius = 8,
-        fill = (pinnedStep == e.ts_ms) and "surface_variant/0.55" or nil,
+        fill = (pinnedStep == e.ts_ms) and "surface_variant/0.55"
+            or ((pinnedStep == nil and follow.key == tostring(s.id) .. ":" .. tostring(e.ts_ms)) and "surface_variant/0.22" or nil),
         onClick = function() pinStep(s, e) end, onHover = "onGaze",
         tooltip = e.tool .. " " .. (e.label or ""),
     }, {
@@ -252,13 +280,26 @@ local function railRow(s, e, now)
     })
 end
 
+--- Session rows kept visible below the rail (the panel has a fixed height).
+local function sessionRowsShown()
+    return math.max(1, math.min(#(snapshot.sessions or {}), SESSION_ROWS_MIN))
+end
+
+--- How many rows the rail may take: fewer when there are sessions to list, so a turn with many
+--- steps cannot push the session list out of the panel.
+local function railBudget()
+    return MAX_RAIL - sessionRowsShown() + 1
+end
+
 local function rail(s, now)
     local rows = {}
     if s then
         local list = stepsOf(s)
-        for i = math.max(1, #list - MAX_RAIL + 1), #list do rows[#rows + 1] = railRow(s, list[i], now) end
         local a = s.activity or {}
-        if s.status == "idle" and a.finished_ms then
+        local done = (s.status == "idle" and a.finished_ms) and true or false
+        local room = railBudget() - (done and 1 or 0)
+        for i = math.max(1, #list - room + 1), #list do rows[#rows + 1] = railRow(s, list[i], now) end
+        if done then
             rows[#rows + 1] = ui.row({ key = "step-done", align = "center", gap = 10, paddingH = 8, paddingV = 5 }, {
                 ui.glyph({ name = "circle-check-filled", size = 18, color = "on_surface_variant", opacity = 0.6 }),
                 ui.label({ text = "Done", fontSize = 15, fontWeight = "semibold", color = "on_surface_variant", opacity = 0.7 }),
@@ -303,7 +344,7 @@ local function sessionList(current)
     if #rows == 0 then
         rows[1] = ui.label({ text = "No active sessions", fontSize = 12, color = "on_surface_variant" })
     end
-    return ui.scroll({ flexGrow = 1, gap = 2 }, rows)
+    return ui.scroll({ flexGrow = 1, gap = 2, minHeight = sessionRowsShown() * SESSION_ROW_H }, rows)
 end
 
 local function leftColumn(s, now)
@@ -316,6 +357,11 @@ local function leftColumn(s, now)
             action("cookie", "Feed it", "eat"),
             action("music", "Dance!", "dance"),
             action("moon", "Nap time", "nap"),
+            ui.button({
+                key = "emote-feed", glyph = "file-plus", variant = "ghost", controlSize = "sm",
+                tooltip = "Feed it a file (copy one in the file manager first)",
+                onClick = function() Feed.fromClipboard(feed) end, onHover = "onGaze",
+            }),
         }),
         ui.separator({ spacing = 2, color = "outline", opacity = 0.2 }),
         rail(s, now),
@@ -420,8 +466,8 @@ local function questionCard(p, who)
     return ui.column({ key = "perm-" .. tostring(p.id), gap = 10, padding = 10, fill = "primary/0.10", radius = 12 }, children)
 end
 
--- A plan the agent wants approved (Claude Code's ExitPlanMode): that dialog only exists in the terminal, so it is
--- shown here for reading and goes away once it has been dealt with there.
+-- A plan the agent wants approved (Claude Code's "Ready to code?"). While its hook waits it can be approved here;
+-- after that it stays for reading until it has been dealt with in the terminal.
 local function planCard(p, who)
     local children = {
         ui.row({ align = "center", gap = 8 }, {
@@ -432,7 +478,17 @@ local function planCard(p, who)
     if type(p.detail) == "table" then
         children[#children + 1] = Viewer.render(p.detail, { bodyLines = 14, ok = nil })
     end
-    children[#children + 1] = ui.label({ text = "Review and approve it in the terminal.", fontSize = 11, color = "on_surface_variant" })
+    if p.answerable == false then
+        children[#children + 1] = ui.label({ text = "Review and approve it in the terminal.", fontSize = 11, color = "on_surface_variant" })
+    else
+        local id = tostring(p.id)
+        children[#children + 1] = ui.row({ gap = 8 }, {
+            ui.button({ key = "plan-approve-" .. id, text = "Approve", variant = "primary", onHover = "onGaze", tooltip = "Claude asks before each edit", onClick = function() decide("approve", p.id) end }),
+            ui.button({ key = "plan-edits-" .. id, text = "Approve, auto-accept edits", variant = "outline", onHover = "onGaze", onClick = function() decide("approve", p.id, "--accept-edits") end }),
+            ui.button({ key = "plan-keep-" .. id, text = "Keep planning", variant = "outline", onHover = "onGaze", tooltip = "Then tell Claude what to change in the terminal", onClick = function() decide("deny", p.id) end }),
+        })
+        children[#children + 1] = ui.label({ text = "You can also answer it in the terminal.", fontSize = 11, color = "on_surface_variant" })
+    end
     return ui.column({ key = "perm-" .. tostring(p.id), gap = 8, padding = 10, fill = "primary/0.10", radius = 12 }, children)
 end
 
@@ -465,12 +521,12 @@ end
 
 -- ── Right column: Live ────────────────────────────────────────────────────────
 
-local function stepLine(e)
+local function stepLine(e, now)
     local right = {}
     if (e.added or 0) > 0 or (e.removed or 0) > 0 then
         right[#right + 1] = ui.label({ text = string.format("+%d -%d", e.added or 0, e.removed or 0), fontSize = 11, color = "on_surface_variant" })
     end
-    local status = (e.ok == true) and "done" or ((e.ok == false) and "failed" or "running")
+    local status = (e.ok == true) and "done" or ((e.ok == false) and "failed" or ("running · " .. Fmt.duration(now - (e.ts_ms or now))))
     right[#right + 1] = ui.label({
         text = status, fontSize = 11, fontWeight = "semibold",
         color = (e.ok == false) and Viewer.COLORS.fail or ((e.ok == true) and Viewer.COLORS.ok or "primary"),
@@ -485,7 +541,7 @@ end
 --- else is built once and cached.
 local function viewerFor(s, e, now, following)
     local detail = e.detail
-    local opts = { ok = e.ok, maxRows = 22 }
+    local opts = { ok = e.ok, maxRows = 34 }
     if following and type(detail) == "table" and detail.type == "diff" and (now - e.ts_ms) < TYPE_WINDOW_MS then
         local key = tostring(s.id) .. ":" .. tostring(e.ts_ms)
         local first = seenAt[key] or now
@@ -523,9 +579,9 @@ local function liveContent(s, now)
     if not s then
         nodes[1] = Viewer.render(nil, { empty = "No agent session yet. Start Claude Code, Codex, opencode or pi in a terminal and it shows up here." })
     else
-        local e, following = currentStep(s)
+        local e, following = currentStep(s, now)
         if e then
-            nodes[#nodes + 1] = stepLine(e)
+            nodes[#nodes + 1] = stepLine(e, now)
             nodes[#nodes + 1] = viewerFor(s, e, now, following)
         else
             nodes[#nodes + 1] = Viewer.render(nil, { empty = (s.status == "idle") and "Idle: nothing running." or "Waiting for the first step of this turn…" })
@@ -556,11 +612,14 @@ local function chatContent()
     local chat = snapshot.chat or {}
     -- The daemon's state caught up with what we sent: drop the provisional message.
     if optimistic and #(chat.messages or {}) > optimistic.base then optimistic = nil end
+    local fed = Feed.current()
     return Chat.view(chat, {
         optimistic = optimistic and optimistic.text or nil,
+        optimisticFile = optimistic and optimistic.file or nil,
+        attachment = fed and fed.name or nil,
         label = Fmt.agentLabel(snapshot, chat.agent or chatAgent()),
         inputKey = chatInputKey,
-        draftReady = chatDraft:match("%S") ~= nil,
+        draftReady = chatDraft:match("%S") ~= nil or fed ~= nil,
     })
 end
 
@@ -574,11 +633,20 @@ end
 function onChatSubmit(text)
     text = tostring(text or ""):match("^%s*(.-)%s*$")
     local chat = snapshot.chat or {}
-    if text == "" or chat.busy or optimistic then return end
-    optimistic = { text = text, base = #(chat.messages or {}) }
+    local fed = Feed.current()
+    if (text == "" and not fed) or chat.busy or optimistic then return end
+    optimistic = { text = text, file = fed and fed.name or nil, base = #(chat.messages or {}) }
     chatInputKey = chatInputKey + 1
     chatDraft = ""
-    local argv = { binPath(), "chat", text, "--agent", chatAgent() }
+    local argv = { binPath(), "chat" }
+    if text ~= "" then argv[#argv + 1] = text end
+    if fed then
+        argv[#argv + 1] = "--file"
+        argv[#argv + 1] = fed.path
+        Feed.clear()
+    end
+    argv[#argv + 1] = "--agent"
+    argv[#argv + 1] = chatAgent()
     if chatModel() ~= "" then
         argv[#argv + 1] = "--model"
         argv[#argv + 1] = chatModel()
@@ -759,6 +827,12 @@ end)
 noctalia.state.watch("daemonUp", function(val)
     daemonUp = (val == true)
     dataChanged()
+end)
+
+-- A file fed from the bar widget or over IPC: show the chat with it attached.
+noctalia.state.watch("fedFile", function()
+    if Feed.current() then tab = "chat" end
+    render()
 end)
 
 function onOpen(_context)

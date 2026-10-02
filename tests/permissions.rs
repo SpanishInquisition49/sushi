@@ -233,19 +233,60 @@ fn a_question_is_answered_through_the_updated_input() {
     assert_eq!(decision["updatedInput"]["questions"], questions, "the original questions travel along");
 }
 
+fn plan() -> Value {
+    permission("ExitPlanMode", json!({"plan": "1. Do the thing\n2. Check it", "planFilePath": "/tmp/plans/p.md"}))
+}
+
 #[test]
-fn a_plan_is_shown_but_never_blocks_the_hook() {
+fn a_plan_is_approved_from_the_notch_with_its_input() {
+    let d = Daemon::start("plan-approve");
+    let hook = d.hook(plan());
+    let p = d.wait_for_pending();
+    assert_eq!((p["kind"].as_str(), p["answerable"].as_bool()), (Some("plan"), Some(true)));
+    assert!(p["detail"]["body"].as_str().unwrap().contains("Do the thing"));
+    let (ok, text) = d.cli(&["approve", &p["id"].to_string()]);
+    assert!(ok, "{text}");
+    let (out, _) = hook.finish();
+    let v: Value = serde_json::from_str(out.trim()).unwrap();
+    let decision = &v["hookSpecificOutput"]["decision"];
+    // Claude Code ignores a bare allow for ExitPlanMode: the plan must travel along.
+    assert_eq!(decision["behavior"], "allow");
+    assert_eq!(decision["updatedInput"]["planFilePath"], "/tmp/plans/p.md");
+    assert!(decision.get("updatedPermissions").is_none(), "edits are still asked for");
+
+    let hook = d.hook(plan());
+    let id = d.wait_for_pending()["id"].to_string();
+    assert!(d.cli(&["approve", &id, "--accept-edits"]).0);
+    let v: Value = serde_json::from_str(hook.finish().0.trim()).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["updatedPermissions"][0]["mode"], "acceptEdits");
+
+    let hook = d.hook(plan());
+    let id = d.wait_for_pending()["id"].to_string();
+    assert!(!d.cli(&["deny", &id, "--accept-edits"]).0, "only approve takes --accept-edits");
+    assert!(d.cli(&["deny", &id]).0, "keep planning");
+    let v: Value = serde_json::from_str(hook.finish().0.trim()).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
+}
+
+#[test]
+fn a_plan_whose_hook_gave_up_stays_for_the_terminal() {
     let d = Daemon::start("plan");
-    let hook = d.hook(permission("ExitPlanMode", json!({"plan": "1. Do the thing\n2. Check it"})));
+    let hook = d.hook_with(plan(), &[("SUSHI_PLAN_TIMEOUT_SECS", "1")]);
     let (out, took) = hook.finish();
     assert!(out.trim().is_empty(), "no decision: the terminal dialog stays in charge");
-    assert!(took < Duration::from_secs(3), "the hook did not wait ({took:?})");
+    assert!(took < Duration::from_secs(4), "the plan timeout applies ({took:?})");
 
-    let p = d.wait_for_pending();
-    assert_eq!(p["kind"], "plan");
-    assert!(p["detail"]["body"].as_str().unwrap().contains("Do the thing"));
+    // The daemon notices the hook is gone within half a second.
+    let t0 = Instant::now();
+    let mut p = d.wait_for_pending();
+    while p["answerable"] == true && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+        p = d.wait_for_pending();
+    }
+    assert_eq!((p["kind"].as_str(), p["answerable"].as_bool()), (Some("plan"), Some(false)));
     let id = p["id"].to_string();
-    assert!(!d.cli(&["approve", &id]).0 && !d.cli(&["deny", &id]).0, "a plan is approved in the terminal");
+    let (ok, text) = d.cli(&["approve", &id]);
+    assert!(!ok && text.contains("terminal"), "nothing waits any more: {text}");
     assert_eq!(d.state()["pending"].as_array().unwrap().len(), 1, "still shown");
 
     // Claude moving on (a tool starts) means the plan was dealt with.
@@ -254,6 +295,26 @@ fn a_plan_is_shown_but_never_blocks_the_hook() {
     pre["tool_input"] = json!({"file_path": "/tmp/x"});
     d.hook(pre).finish();
     assert!(d.wait_until_no_pending(Duration::from_secs(2)), "the plan went away when work resumed");
+}
+
+#[cfg(target_os = "linux")] // the socket is in XDG_RUNTIME_DIR there
+#[test]
+fn a_watcher_gets_the_state_now_and_on_every_change() {
+    use std::io::BufRead;
+    let d = Daemon::start("watch");
+    let mut sock = std::os::unix::net::UnixStream::connect(d.dir.join("sushi.sock")).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    sock.write_all(b"{\"kind\":\"watch\"}\n").unwrap();
+    let mut lines = std::io::BufReader::new(sock).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    let first = next();
+    assert_eq!(first["state"]["sessions"].as_array().map(Vec::len), Some(0), "the state right away");
+
+    let t0 = Instant::now();
+    d.hook(event("UserPromptSubmit")).finish();
+    let pushed = next();
+    assert_eq!(pushed["state"]["sessions"][0]["status"], "working", "{pushed}");
+    assert!(t0.elapsed() < Duration::from_secs(2), "pushed, not polled ({:?})", t0.elapsed());
 }
 
 #[test]
@@ -392,6 +453,7 @@ fn the_state_declares_what_each_agent_can_do() {
     assert_eq!(s["agents"]["claude"]["capabilities"]["chat"], true);
     assert_eq!(s["agents"]["pi"]["capabilities"]["chat"], true);
     assert_eq!(s["agents"]["opencode"]["capabilities"]["chat"], false);
+    assert_eq!(s["agents"]["antigravity"]["capabilities"]["approve"], false);
     assert!(s["agents"]["claude"].get("limits").is_some() && s["agents"]["codex"].get("limits").is_none());
 }
 
@@ -449,6 +511,48 @@ fn copilot_steps_are_followed_without_call_ids_and_edits_show_as_diffs() {
     assert_eq!((a["tool_calls"].as_u64(), a["files_changed"].as_u64(), a["failures"].as_u64()), (Some(2), Some(1), Some(1)));
     assert_eq!((a["recent"][0]["ok"].as_bool(), a["recent"][1]["ok"].as_bool()), (Some(true), Some(false)), "matched by tool name");
     d.hook_for("copilot", copilot_event("Stop", json!({"stop_reason": "end_turn"}))).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "idle");
+}
+
+/// Antigravity payloads, shaped like the ones recorded from `agy` 1.2.14: no event name, camelCase.
+fn agy_call(step: u64, name: &str, args: Value, error: Option<&str>) -> Value {
+    let mut v = json!({"conversationId": "ag1", "stepIdx": step, "modelName": "m", "workspacePaths": ["/tmp/proj"],
+        "transcriptPath": "/t.jsonl", "toolCall": {"name": name, "args": args}});
+    if let Some(e) = error {
+        v["error"] = json!(e);
+    }
+    v
+}
+
+#[test]
+fn antigravity_is_watched_and_waits_only_in_the_pet() {
+    let d = Daemon::start("antigravity");
+    let first = |n: u64| json!({"conversationId": "ag1", "invocationNum": n, "initialNumSteps": 1, "workspacePaths": ["/tmp/proj"]});
+    d.hook_for("antigravity", first(0)).finish();
+    // the process that ran the hook (here this test) stands for agy: the session ends with it
+    #[cfg(target_os = "linux")]
+    assert_eq!(d.state()["sessions"][0]["pid"], std::process::id());
+    // a read is just a step
+    d.hook_for("antigravity", agy_call(1, "view_file", json!({"AbsolutePath": "/tmp/proj/a.rs"}), None)).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "working");
+    // a command may be waiting for the user's answer in agy: flagged, but nothing waits in the notch
+    let shell = agy_call(2, "run_command", json!({"CommandLine": "echo hi", "Cwd": "/tmp/proj"}), None);
+    let (out, took) = d.hook_for("antigravity", shell.clone()).finish();
+    assert!(out.is_empty() && took < Duration::from_secs(2), "the hook answers at once and prints nothing");
+    let s = d.state();
+    assert!(s["pending"].as_array().unwrap().is_empty());
+    assert_eq!(s["sessions"][0]["status"], "waiting");
+    // the answer was no: the next model call puts it back to work, with no PostToolUse
+    d.hook_for("antigravity", first(1)).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "working");
+    // answered yes: PostToolUse closes the step through its step index
+    d.hook_for("antigravity", shell).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "waiting");
+    d.hook_for("antigravity", agy_call(2, "run_command", json!({"CommandLine": "echo hi"}), Some(""))).finish();
+    let a = d.state()["sessions"][0]["activity"].clone();
+    assert_eq!(d.state()["sessions"][0]["status"], "working");
+    assert!(a["recent"].as_array().unwrap().iter().any(|s| s["ok"] == true), "{a}");
+    d.hook_for("antigravity", json!({"conversationId": "ag1", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true})).finish();
     assert_eq!(d.state()["sessions"][0]["status"], "idle");
 }
 

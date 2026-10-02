@@ -92,7 +92,11 @@ do
     t.files[PATH] = body(',"chat":{"busy":true}'); e.update()
     t.files[PATH] = body(',"chat":{"busy":false}', NOW + 1); e.update()
     local iv = t.intervals
-    assert(iv[#iv - 1] == 200 and iv[#iv] == 1000, "200 ms while the chat streams, then back to 1 s: " .. table.concat(iv, ","))
+    assert(iv[#iv - 1] == 250 and iv[#iv] == 1000, "250 ms while the chat streams, then back to 1 s: " .. table.concat(iv, ","))
+    t.files[PATH] = '{"updated_ms":' .. (NOW + 2) .. ',"sessions":[{"id":"a","status":"working"}],"pending":[]}'; e.update()
+    assert(iv[#iv] == 250, "250 ms while a session works: " .. table.concat(iv, ","))
+    t.files[PATH] = '{"updated_ms":' .. (NOW + 3) .. ',"sessions":[{"id":"a","status":"idle"}],"pending":[]}'; e.update()
+    assert(iv[#iv] == 1000, "1 s when everything is idle")
 
     assert(t.state.daemonUp == true and type(t.state.snapshot) == "table", "publishes the snapshot")
     t.files[PATH] = body("", NOW - 60000); e.update()
@@ -121,4 +125,31 @@ do
     e.onIpc("emote", "dance"); assert(t.state.petEvent.kind == "dance")
     t.state.petEvent = nil; e.onIpc("emote", "explode"); assert(t.state.petEvent == nil, "unknown emotes are ignored")
     print("service: polling speed, daemon down, auto-open of the panel, tab and emote commands")
+end
+
+-- ── feeding a file ────────────────────────────────────────────────────────────────────────
+do
+    local s = H.load("service.luau")
+    s.env.onIpc("feed", "/home/x/My%20Notes.md")
+    assert(s.state.fedFile and s.state.fedFile.path == "/home/x/My%20Notes.md", "a plain path is taken as it is")
+    s.env.onIpc("feed", "file:///home/x/My%20Notes.md")
+    assert(s.state.fedFile.path == "/home/x/My Notes.md" and s.state.fedFile.name == "My Notes.md", "file:// URIs are decoded")
+    assert(s.state.petEvent.kind == "eat" and s.state.panelTab.tab == "chat", "the pet eats it, the chat opens")
+    assert(s.calls[#s.calls]:find("panel-open scanna/sushi:panel", 1, true), "and the panel with it")
+    local n = #s.calls; s.state.fedFile = nil
+    s.env.onIpc("feed", "not a path"); s.env.onIpc("feed", nil)
+    assert(#s.calls == n and s.state.fedFile == nil, "nothing to feed: nothing happens")
+
+    -- middle click: the file copied in the file manager (wl-paste), else the plain text, else a sad pet
+    local w = widget({}, snap)
+    w.env.onMiddleClick()
+    assert(w.calls[#w.calls] == "wl-paste --no-newline --type text/uri-list", w.calls[#w.calls])
+    w.runs[#w.runs].cb({ exitCode = 0, stdout = "# copied\r\nfile://host/tmp/a%2Bb.rs\r\nfile:///tmp/other\r\n" })
+    assert(w.state.fedFile.path == "/tmp/a+b.rs" and w.state.petEvent.kind == "eat", "the first file of the uri-list")
+    w.env.onMiddleClick()
+    w.runs[#w.runs].cb({ exitCode = 1, stdout = "", stderr = "No suitable type of content copied" })
+    assert(w.calls[#w.calls] == "wl-paste --no-newline --type text/plain", "falls back to plain text")
+    w.runs[#w.runs].cb({ exitCode = 0, stdout = "hello there" })
+    assert(w.state.petEvent.kind == "sad" and w.state.fedFile.path == "/tmp/a+b.rs", "no file: the pet is sad, nothing changes")
+    print("feed: IPC paths and URIs, middle click from the clipboard, nothing to eat")
 end

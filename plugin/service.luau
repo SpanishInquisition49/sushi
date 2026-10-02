@@ -8,6 +8,9 @@
 -- The daemon rewrites state.json at least every 5 s, so a file older than
 -- STALE_MS means the daemon is gone.
 
+local Feed = require("./lib/feed.luau")
+Feed.init(noctalia)
+
 local PANEL_ID = "scanna/sushi:panel"
 local STALE_MS = 15000
 
@@ -70,8 +73,13 @@ function update()
     local age = noctalia.nowMs() - (tonumber(snap.updated_ms) or 0)
     setUp(age < STALE_MS)
 
-    -- Look more often while the chat is streaming an answer, so the text appears smoothly.
-    local want = (snap.chat and snap.chat.busy) and 200 or 1000
+    -- Look more often while something moves (a session at work or waiting, the chat streaming an
+    -- answer), so steps and text show up as they happen; reading an unchanged file costs little.
+    local busy = snap.chat and snap.chat.busy
+    for _, s in ipairs(snap.sessions or {}) do
+        if s.status == "working" or s.status == "waiting" then busy = true end
+    end
+    local want = busy and 250 or 1000
     if want ~= interval then
         interval = want
         noctalia.setUpdateInterval(interval)
@@ -94,11 +102,20 @@ end
 -- Choose the tab the panel opens on, e.g. from a keybinding:
 --   noctalia msg plugin scanna/sushi:state all tab chat      (live | chat | usage)
 --   noctalia msg panel-open scanna/sushi:panel
+-- Feed the pet a file (it opens the chat with the file attached):
+--   noctalia msg plugin scanna/sushi:state all feed /path/to/file
 function onIpc(event, payload)
     if event == "tab" and (payload == "live" or payload == "chat" or payload == "usage") then
         noctalia.state.set("panelTab", { tab = payload })
     elseif event == "emote" and (payload == "love" or payload == "eat" or payload == "dance" or payload == "nap") then
         -- Make the pet do something, e.g. from a keybinding: ... all emote dance
         noctalia.state.set("petEvent", { kind = payload, ts = noctalia.nowMs() })
+    elseif event == "feed" and type(payload) == "string" then
+        -- Feed the pet a file, e.g. from a file manager action: ... all feed /path/to/file
+        local path = Feed.pathFrom(payload)
+        if path then
+            Feed.feed(path)
+            noctalia.state.set("petEvent", { kind = "eat", ts = noctalia.nowMs() })
+        end
     end
 end

@@ -10,12 +10,21 @@ const NAMES = [
 const audio = new Map();
 let volume = 0.6;
 
-/** Create the audio elements (the files load lazily, on first use). */
+/**
+ * Load the sounds. They are fetched and played from blob: URLs because WebKitGTK (Linux) cannot
+ * play media straight from Tauri's custom `tauri://` scheme (it fails with a format error), while
+ * fetch() over that scheme works everywhere.
+ */
 export function init() {
   for (const n of NAMES) {
-    const a = new Audio(`sounds/${n}.wav`);
-    a.preload = "auto";
-    audio.set(n, a);
+    fetch(`sounds/${n}.wav`)
+      .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(`${r.status}`))))
+      .then((b) => {
+        const a = new Audio(URL.createObjectURL(b));
+        a.preload = "auto";
+        audio.set(n, a);
+      })
+      .catch((e) => console.warn(`sushi: sound ${n} not loaded:`, e));
   }
 }
 

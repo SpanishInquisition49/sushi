@@ -104,7 +104,7 @@ function diffRows(d, opts) {
   }
   const out = rows.map((r, idx) => {
     let body = r.body;
-    if (opts.cursor && cursorAt === idx) body = ui.row({ gap: 0, align: "center" }, [r.body, ui.label({ text: "|", fontSize: 12, fontFamily: MONO, color: COLORS.text })]);
+    if (opts.cursor && cursorAt === idx) body = ui.row({ gap: 0, align: "center" }, [r.body, ui.label({ text: "|", fontSize: 12, fontFamily: MONO, color: COLORS.text, cls: "caret" })]);
     return numbered(r.kind, r.n, body);
   });
   if ((d.more || 0) > 0) out.push(ui.label({ text: `  … ${d.more} more changed lines`, fontSize: 11, color: COLORS.dim }));

@@ -19,15 +19,27 @@ pub enum Request {
         agent: String,
         payload: Value,
     },
-    Approve { id: u64 },
+    /// `accept_edits`: for a plan, also let the agent make its edits without asking (Claude Code's
+    /// "Yes, auto-accept edits").
+    Approve {
+        id: u64,
+        #[serde(default)]
+        accept_edits: bool,
+    },
     Deny { id: u64 },
     State,
+    /// Keep the connection open: the daemon writes a `Reply` with the state now and again every
+    /// time it changes, until the connection closes.
+    Watch,
     /// Send a message to the built-in chat (`model` and `agent` override the configured ones).
     ChatSend {
         text: String,
         model: Option<String>,
         #[serde(default)]
         agent: Option<String>,
+        /// The absolute path of a file fed with the message: its content goes into the prompt.
+        #[serde(default)]
+        file: Option<String>,
     },
     ChatStop,
     ChatClear,
@@ -50,6 +62,9 @@ pub struct Reply {
     /// The tool input to use instead of the original (how answers reach `AskUserQuestion`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_input: Option<Value>,
+    /// The permission mode the agent switches to (`acceptEdits` when a plan is approved that way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,10 +73,10 @@ pub struct Reply {
 
 impl Reply {
     pub fn ok() -> Self {
-        Reply { ok: true, decision: None, updated_input: None, error: None, state: None }
+        Reply { ok: true, decision: None, updated_input: None, mode: None, error: None, state: None }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Reply { ok: false, decision: None, updated_input: None, error: Some(msg.into()), state: None }
+        Reply { ok: false, decision: None, updated_input: None, mode: None, error: Some(msg.into()), state: None }
     }
 }
 
@@ -73,7 +88,23 @@ mod tests {
     fn request_roundtrip() {
         let line = r#"{"kind":"approve","id":7}"#;
         match serde_json::from_str::<Request>(line).unwrap() {
-            Request::Approve { id } => assert_eq!(id, 7),
+            Request::Approve { id, accept_edits } => assert_eq!((id, accept_edits), (7, false)),
+            other => panic!("unexpected {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"kind":"approve","id":8,"accept_edits":true}"#).unwrap() {
+            Request::Approve { id, accept_edits } => assert_eq!((id, accept_edits), (8, true)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_messages_may_carry_a_file() {
+        match serde_json::from_str::<Request>(r#"{"kind":"chat_send","text":"hi","model":null}"#).unwrap() {
+            Request::ChatSend { file, .. } => assert_eq!(file, None, "older clients send no file"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"kind":"chat_send","text":"","model":null,"file":"/tmp/a.rs"}"#).unwrap() {
+            Request::ChatSend { file, .. } => assert_eq!(file.as_deref(), Some("/tmp/a.rs")),
             other => panic!("unexpected {other:?}"),
         }
     }

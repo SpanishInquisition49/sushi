@@ -213,7 +213,9 @@ export class Pet {
   onSnapshot(snap, daemonUp, nowMs) {
     let mood = "idle";
     let working = false;
-    const pending = (snap?.pending || []).length;
+    // Requests to answer, plus sessions blocked on their own terminal with nothing to answer here.
+    const asked = new Set((snap?.pending || []).map((p) => p.session_id));
+    const pending = (snap?.pending || []).length + (snap?.sessions || []).filter((s) => s.status === "waiting" && !asked.has(s.id)).length;
     let newSession = false;
     if (!daemonUp) {
       mood = "sleep";
@@ -725,7 +727,7 @@ export class Pet {
     const mood = this.cur || this.baseMood;
     if (mood === "sleep") return "Zzz... the daemon is asleep";
     if (mood === "nap") return "Zzz... taking a nap";
-    if (mood === "alert" || nPending > 0) return nPending === 1 ? "I need you!" : `I need you! (${nPending})`;
+    if (mood === "alert" || nPending > 0) return nPending <= 1 ? "I need you!" : `I need you! (${nPending})`;
     const reactions = {
       love: "Thank you!", sad: "Aww...", startled: "Whoa!", dizzy: "Whoa, everything is spinning!", annoyed: "Hey!",
       happy: "Done!", yawn: "*yawn*", worried: "Usage is getting high...", stuffed: "So full... compact the context?",

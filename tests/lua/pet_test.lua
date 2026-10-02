@@ -104,6 +104,10 @@ do
     local hot = snapWith("Read: x", 95); hot.agents = { claude = { limits = { data = { five_hour = { percent = 95 } } } } }
     pet:onSnapshot(hot, true, 1e6); assert(pet.baseMood == "worried", "limits beat the context")
     hot.pending = { { id = 1 } }; pet:onSnapshot(hot, true, 1e6); assert(pet.baseMood == "alert", "a request beats everything")
+    -- an agent asking in its own terminal (Antigravity) has no request here, but still needs you
+    local asking = { sessions = { { id = "antigravity:c1", status = "waiting", last_event_ms = 1 } }, pending = {} }
+    pet:onSnapshot(asking, true, 1e6); assert(pet.baseMood == "alert", "a waiting session calls you")
+    assert(pet:caption(1, 0, 1) == "I need you!")
 
     -- the service says "daemon up" a moment before it sends the sessions: they are not newcomers
     local p2 = new()

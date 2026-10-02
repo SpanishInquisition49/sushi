@@ -6,7 +6,8 @@ set -e
 cd "$(dirname "$0")/.."
 echo "== cargo test";   cargo test 2>&1 | grep -E "^test result|FAILED|panicked" | grep -v "0 passed" || true
 cargo test >/dev/null 2>&1 || { echo "cargo test FAILED"; cargo test 2>&1 | tail -30; exit 1; }
-echo "== clippy";       test -z "$(cargo clippy --all-targets 2>&1 | grep -E '^(warning|error)')" && echo "clean"
+echo "== clippy";       w="$(cargo clippy --all-targets 2>&1 | grep -E '^(warning|error)' || true)"
+if [ -n "$w" ]; then cargo clippy --all-targets 2>&1 | tail -30; echo "clippy FAILED"; exit 1; fi; echo "clean"
 echo "== luau syntax";  for f in plugin/*.luau plugin/lib/*.luau; do luajit -bl "$f" >/dev/null || { echo "syntax error in $f"; exit 1; }; done; echo ok
 if command -v noctalia >/dev/null 2>&1; then echo "== noctalia lint"; noctalia plugins lint plugin | tail -1; fi
 for t in tests/lua/*_test.lua; do echo "== $t"; luajit "$t"; done

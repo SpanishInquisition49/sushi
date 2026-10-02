@@ -91,6 +91,76 @@ function F.canChat(snap)
     return false
 end
 
+--- How many things wait for you: the pending requests, plus the sessions blocked on their own
+--- terminal with nothing to answer here (Antigravity asking, or a request whose hook gave up).
+function F.needsYou(snap)
+    local pending = (snap and snap.pending) or {}
+    local asked = {}
+    for _, p in ipairs(pending) do asked[p.session_id or ""] = true end
+    local n = #pending
+    for _, s in ipairs((snap and snap.sessions) or {}) do
+        if s.status == "waiting" and not asked[s.id or ""] then n = n + 1 end
+    end
+    return n
+end
+
+-- ── Following a session's steps in the Live viewer ──
+
+--- How long the typewriter takes to type a diff's added lines (as the viewer types it).
+function F.typingMs(detail)
+    if type(detail) ~= "table" or detail.type ~= "diff" then return 0 end
+    local total = 0
+    for _, l in ipairs(detail.lines or {}) do
+        local text = l.text or ""
+        if l.kind == "add" then total = total + (utf8 and utf8.len and utf8.len(text) or #text) end
+    end
+    return math.min(total * 22, 1500)
+end
+
+--- How long a step stays in the viewer before the next one replaces it: an edit until it is typed
+--- out and a moment to read it, a command long enough to see it, a read or a search briefly.
+function F.dwellMs(e)
+    local d = e and e.detail
+    local t = type(d) == "table" and d.type or nil
+    if t == "diff" then return math.max(1800, F.typingMs(d) + 1200) end
+    if t == "terminal" then return 1500 end
+    if t == "file" then return 700 end
+    return 400
+end
+
+local function worthStopping(e)
+    local d = e and e.detail
+    return type(d) == "table" and (d.type == "diff" or d.type == "terminal")
+end
+
+--- The step to show while following a session. Steps arrive faster than they can be read, so each
+--- stays for `dwellMs` before the next; reads and searches with an edit or a command after them are
+--- skipped, and it never lags more than three steps. `state` ({key, since}) is kept by the caller.
+function F.followStep(state, sessionId, list, now)
+    local last = #list
+    if last == 0 then
+        state.key = nil
+        return nil
+    end
+    local function keyOf(e) return tostring(sessionId) .. ":" .. tostring(e.ts_ms) end
+    local i = nil
+    for j, e in ipairs(list) do
+        if keyOf(e) == state.key then i = j end
+    end
+    if not i then
+        i = last -- a new session, a new turn, or the step scrolled out of the list
+    elseif i < last and now - (state.since or 0) >= F.dwellMs(list[i]) then
+        i = i + 1
+        while i < last and not worthStopping(list[i]) do i = i + 1 end
+        i = math.max(i, last - 3)
+    else
+        return list[i]
+    end
+    state.key = keyOf(list[i])
+    state.since = now
+    return list[i]
+end
+
 --- More than one agent has a session right now.
 function F.multiAgent(snap)
     local seen, n = {}, 0
