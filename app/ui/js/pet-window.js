@@ -24,6 +24,9 @@ const now = () => Date.now();
 const pet = new Pet(now(), configFrom(store.settings));
 let lastHtml = "";
 let lastTip = "";
+// Set by `mount()`: normally `#root` itself, but the macOS notch window mounts this into a
+// sub-container (see notch-window.js), so `render()` must not re-look it up by a fixed id.
+let rootEl = null;
 
 const snap = () => store.snapshot;
 
@@ -100,7 +103,7 @@ function pill(pending, sessionChips, h) {
 function render() {
   const info = setting("widgetInfo");
   const html = store.up ? pill(Fmt.needsYou(snap()), info !== "usage" ? sessionChips(info) : [], headline()) : pill(0, [], null);
-  const root = document.getElementById("root");
+  const root = rootEl;
   if (html !== lastHtml) {
     lastHtml = html;
     root.innerHTML = html;
@@ -145,7 +148,8 @@ function wirePointer(root) {
     pet.lookAt(Math.max(-1, Math.min(1, (e.clientX - (r.left + 40)) / 120)), Math.max(-1, Math.min(1, (e.clientY - (r.top + r.height / 2)) / 60)));
     if (down && !down.dragged && Math.hypot(e.screenX - down.x, e.screenY - down.y) > DRAG_PX) {
       down.dragged = true;
-      startDragging();
+      // In the docked window the position is pinned by the Rust side, not dragged by hand.
+      if (document.documentElement.dataset.view !== "dock") startDragging();
     }
   });
   root.addEventListener("mouseup", (e) => {
@@ -165,6 +169,7 @@ function wirePointer(root) {
 }
 
 export function mount(root) {
+  rootEl = root;
   Sounds.init();
   wirePointer(root);
   listen("petEvent", (ev) => ev && pet.onEvent(ev.kind, ev.ts, now()));

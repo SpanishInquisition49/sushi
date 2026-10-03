@@ -11,3 +11,21 @@ tauri-build = { version = "2", features = [] }
 Sushi = { path = "../.." }
 tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico", "macos-private-api"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+glib = "0.18"
+gtk = "0.18"
+# The high-level `gtk-layer-shell` crate (0.8.2) does not re-export `init_for_window`,
+# `set_layer`, `set_anchor` or `set_keyboard_mode` at all (checked its source), so this goes
+# through the `-sys` crate directly instead, which is a thin, always-public, 1:1 FFI layer.
+gtk-layer-shell-sys = { version = "0.7", features = ["v0_6"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Pinned to the versions tauri already pulls in transitively (see Cargo.lock), so there is
+# only ever one copy of the Objective-C runtime glue linked into the binary.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSScreen", "NSWindow"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }

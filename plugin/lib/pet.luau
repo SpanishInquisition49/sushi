@@ -10,7 +10,8 @@
 -- Characters (setting "character"): nigiri_salmon, nigiri_tuna, nigiri_tamago,
 --   unagi_nigiri, ebi_nigiri, ebi_tempura, ikura, maki, uramaki, inari, ravioli,
 --   bao, takoyaki, ramen, miso_soup, edamame, onigiri, dorayaki, mochi, dango,
---   bubble_tea, tofu.
+--   bubble_tea, sake, tofu, taiyaki, ramune, kakigori, wasabi, temaki, matcha,
+--   tamagoyaki.
 --
 -- Moods
 --   steady    idle · working · alert (permission asked) · sleep (daemon down)
@@ -80,6 +81,17 @@ local CERAMIC = "#f1f4f8"
 local CERAMIC_EDGE = "#ccd6e0"
 local SAKE_BLUE = "#3d6fb6"
 local CHEEK_HOT = "#ff6f85"
+local WAFFLE = "#d9973f"
+local WAFFLE_DARK = "#b5752c"
+local GLASS = "#2f7cb8"
+local GLASS_DARK = "#1f5c8c"
+local MARBLE = "#eef8ff"
+local ICE = "#eef6fb"
+local ICE_SHADE = "#cfe9f5"
+local WASABI_GREEN = "#7fae3a"
+local WASABI_RED = "#d23c3c"
+local MATCHA_GREEN = "#6fae52"
+local MATCHA_FOAM = "#bfe3a8"
 
 local CHARACTERS = {
     nigiri_salmon = { kind = "nigiri", ratio = 0.80, top = "#ff8a6b", fat = "#ffc9b5" },
@@ -105,12 +117,20 @@ local CHARACTERS = {
     dorayaki      = { kind = "dorayaki", ratio = 0.86 },
     dango         = { kind = "dango",  ratio = 1.60, top = "#ff9eb5", mid = "#f6f1ea", bottom = "#a8d58b" },
     tofu          = { kind = "tofu",   ratio = 1.00 },
+    taiyaki       = { kind = "taiyaki", ratio = 0.72, batter = WAFFLE, batterDark = WAFFLE_DARK },
+    ramune        = { kind = "ramune", ratio = 1.30, glass = GLASS, glassDark = GLASS_DARK },
+    kakigori      = { kind = "kakigori", ratio = 1.05, syrup = BERRY },
+    wasabi        = { kind = "wasabi", ratio = 0.90 },
+    temaki        = { kind = "temaki", ratio = 1.42, filling = "#ff8a6b" },
+    matcha        = { kind = "matcha", ratio = 0.88, steam = true },
+    tamagoyaki    = { kind = "tamagoyaki", ratio = 0.95 },
 }
 
 Pet.CHARACTER_IDS = {
     "nigiri_salmon", "nigiri_tuna", "nigiri_tamago", "unagi_nigiri", "ebi_nigiri", "ebi_tempura",
     "ikura", "maki", "uramaki", "inari", "ravioli", "bao", "takoyaki", "ramen", "miso_soup",
     "edamame", "onigiri", "dorayaki", "mochi", "dango", "bubble_tea", "sake", "tofu",
+    "taiyaki", "ramune", "kakigori", "wasabi", "temaki", "matcha", "tamagoyaki",
 }
 local DEFAULT_CHARACTER = "nigiri_salmon"
 
@@ -177,6 +197,8 @@ local EXTRA_FIDGETS = {
     mochi      = { { "jiggle", 1200 } },
     dango      = { { "jiggle", 1200 } },
     bao        = { { "jiggle", 1200 } },
+    taiyaki    = { { "wiggle", 1100 } }, -- wags its tail
+    matcha     = { { "sip", 2200 } },
 }
 
 -- Sound played when a mood starts (names of the files in plugin/sounds).
@@ -234,7 +256,10 @@ function Pet.new(nowMs, cfg)
     self.winkL = 0               -- 0..1, left eye closed (wink)
     self.cheek = 0               -- 0..1, how flushed the cheeks are
     self.workKind = "read"       -- read / write / run / search / think
+    self.contextPct = 0          -- the active session's context window, last seen (0..100)
     self.knownSessions = nil     -- ids seen in the last snapshot
+    self.failureCounts = {}      -- session id -> activity.failures last seen
+    self.turnHadFailure = false  -- a failure happened since the pet was last idle
     self.forceNap = false
     self.hover = nil
     self.prevWorking = false
@@ -300,19 +325,29 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
         if s.status == "waiting" and not asked[s.id or ""] then pending = pending + 1 end
     end
     local newSession = false
+    local newFails, severeFail = 0, false
     if not daemonUp then
         mood = "sleep"
         self.knownSessions = nil
         self.upSince = nil
+        self.contextPct = 0
     else
         -- Sessions that were already there when the daemon came up are not newcomers: the
         -- service reports "daemon up" a moment before it sends the session list.
         if not self.upSince then self.upSince = nowMs end
-        local active, ids = nil, {}
+        local active, ids, failCounts = nil, {}, {}
         for _, s in ipairs((snap and snap.sessions) or {}) do
             if s.id then
                 ids[s.id] = true
                 if self.knownSessions and not self.knownSessions[s.id] then newSession = true end
+                -- A tool failed since the last snapshot (not on the pet's very first look,
+                -- so an already-failed turn on startup doesn't trigger a false alarm).
+                local fails = (s.activity and s.activity.failures) or 0
+                failCounts[s.id] = fails
+                if self.knownSessions and fails > (self.failureCounts[s.id] or 0) then
+                    newFails = newFails + 1
+                    if fails >= 3 then severeFail = true end
+                end
             end
             if s.status == "working" then
                 working = true
@@ -320,10 +355,14 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
             end
         end
         self.knownSessions = ids
+        self.failureCounts = failCounts
         -- What kind of work is going on (drives the eyes and the little icon).
         -- (the daemon classifies the tool: read, write, run, search, think or other)
         local tool = active and type(active.last_tool) == "table" and active.last_tool.kind
         self.workKind = (tool and tool ~= "other") and tool or "read"
+        -- The active session's context window, kept until a new reading comes in
+        -- (drives the kakigori's melt; stays put while idle rather than snapping back).
+        if active and active.context and active.context.percent then self.contextPct = active.context.percent end
 
         local lim
         for _, a in pairs((snap and snap.agents) or {}) do
@@ -349,9 +388,17 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
         self.lastActive = nowMs
         self.forceNap = false
     end
-    -- A session finished → happy hop. A new one appeared → wave hello.
+    -- A tool failed → a worried blip (or a dizzy one once failures pile up in the same
+    -- turn). A pending question still comes first.
+    if newFails > 0 and mood ~= "alert" then
+        self.turnHadFailure = true
+        if severeFail then self:trigger("dizzy", 2000, nowMs) else self:trigger("worried", 1200, nowMs) end
+    end
+    -- A session finished → happy hop (a bigger one if it had to recover from a failure
+    -- first). A new one appeared → wave hello.
     if self.prevWorking and not working and mood == "idle" then
-        self:trigger("happy", 1400, nowMs)
+        self:trigger("happy", self.turnHadFailure and 2200 or 1400, nowMs)
+        self.turnHadFailure = false
     elseif newSession and mood ~= "alert" and nowMs - (self.upSince or nowMs) > 4000 then
         self:trigger("wave", 1600, nowMs)
     end
@@ -1138,11 +1185,154 @@ local function tofuBody(c, x)
     }, x.face)
 end
 
+--- Taiyaki: a fish-shaped waffle cake; a rounder head with the face, a smaller tail block.
+--- A generic "wiggle" fidget (see EXTRA_FIDGETS) reads as the tail wagging.
+local function taiyakiBody(c, x)
+    local tailW = round(x.bw * 0.22)
+    local headW = x.bw - tailW
+    local inner = {}
+    for _, f in ipairs(x.face) do inner[#inner + 1] = f end
+    if x.detail then
+        -- the crimped waffle seam
+        local cw, ch = round(x.w * 0.05), math.max(2, round(x.w * 0.03))
+        local function crimp() return ui.box({ width = cw, height = ch, radius = 1, fill = c.batterDark }) end
+        inner[#inner + 1] = ui.row({ gap = round(x.w * 0.03), align = "center" }, { crimp(), crimp(), crimp(), crimp() })
+    end
+    local head = ui.column({
+        width = headW, height = x.bh, fill = c.batter, radius = round(x.bh * 0.46),
+        align = "center", justify = "center", gap = round(x.w * 0.035),
+    }, inner)
+    local tail = ui.column({ width = tailW, height = round(x.bh * 0.46), fill = c.batterDark, radius = round(tailW * 0.30) }, {})
+    local tailWrap = ui.column({ width = tailW, height = x.bh, align = "center", justify = "center" }, { tail })
+    return ui.row({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { head, tailWrap })
+end
+
+--- Ramune: a soda bottle with a marble in the neck that pops up on the happy hop (x.lift,
+--- the same jump used for the whole frame when a turn finishes).
+local function ramuneBody(c, x)
+    local capH = math.max(2, round(x.bh * 0.06))
+    local neckH = round(x.bh * 0.22)
+    local bodyH = x.bh - capH - neckH
+    local cap = ui.box({ width = round(x.bw * 0.22), height = capH, radius = 2, fill = "#d9d9d9" })
+    local marbleD = round(x.bw * 0.16)
+    local bob = round((x.lift or 0) * neckH * 0.6)
+    local neck = ui.column({
+        width = round(x.bw * 0.30), height = neckH, fill = c.glass, radius = round(x.bw * 0.08),
+        align = "center", justify = "end",
+    }, {
+        spacerH(math.max(0, neckH - marbleD - bob)),
+        ui.box({ width = marbleD, height = marbleD, radius = round(marbleD / 2), fill = MARBLE }),
+        spacerH(bob),
+    })
+    local inner = {}
+    if x.detail then
+        inner[#inner + 1] = ui.box({ width = round(x.bw * 0.5), height = math.max(2, round(x.w * 0.03)), radius = 2, fill = c.glassDark })
+    end
+    for _, f in ipairs(x.face) do inner[#inner + 1] = f end
+    local body = ui.column({
+        width = x.bw, height = bodyH, fill = c.glass, radius = round(x.w * 0.26),
+        border = c.glassDark, borderWidth = 1, align = "center", justify = "center", gap = round(x.w * 0.03),
+    }, inner)
+    return ui.column({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { cap, neck, body })
+end
+
+--- Kakigori: shaved ice in a cup; the dome shrinks and the syrup pools as x.fullness (the
+--- active session's context window, 0..1) climbs, so it visibly melts as the context fills up.
+local function kakigoriBody(c, x)
+    local fullness = clamp(x.fullness or 0, 0, 1)
+    local cupH = round(x.bh * 0.22)
+    local iceH = round((x.bh - cupH) * (1 - 0.35 * fullness))
+    local gapH = x.bh - cupH - iceH
+    local inner = {}
+    if x.detail then
+        inner[#inner + 1] = ui.box({ width = round(x.bw * 0.6), height = math.max(2, round(x.w * 0.03)), radius = 2, fill = c.syrup })
+    end
+    for _, f in ipairs(x.face) do inner[#inner + 1] = f end
+    local dome = ui.column({
+        width = round(x.bw * 0.88), height = iceH, fill = ICE, radius = round(x.w * 0.30),
+        border = ICE_SHADE, borderWidth = 1, align = "center", justify = "center", gap = round(x.w * 0.03),
+    }, inner)
+    local drip = ui.box({
+        width = round(x.bw * (0.30 + 0.40 * fullness)), height = math.max(2, round(x.w * 0.035)), radius = 2,
+        fill = c.syrup, opacity = 0.5 + 0.5 * fullness,
+    })
+    local cup = ui.box({ width = x.bw, height = cupH, fill = CERAMIC, radius = round(x.w * 0.18) })
+    return ui.column({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { spacerH(gapH), dome, drip, cup })
+end
+
+-- Moods the wasabi ball turns red for (otherwise it stays its usual green).
+local ANGRY_MOODS = { sad = true, annoyed = true, dizzy = true, startled = true }
+
+--- Wasabi: a ball of wasabi, green and calm until something goes wrong (a deny, a poke,
+--- a sneeze) turns it red.
+local function wasabiBody(c, x)
+    local color = ANGRY_MOODS[x.mood] and WASABI_RED or WASABI_GREEN
+    return ui.column({
+        width = x.bw, height = x.bh, fill = color, radius = round(math.min(x.bw, x.bh) * 0.46),
+        align = "center", justify = "center", gap = round(x.w * 0.035),
+    }, x.face)
+end
+
+--- Temaki: a tall hand roll, nori on the outside, a sliver of rice, filling peeking at the top.
+local function temakiBody(c, x)
+    local fillH = round(x.bh * 0.14)
+    local wrapH = x.bh - fillH
+    local filling = ui.column({
+        width = round(x.bw * 0.70), height = fillH, fill = c.filling, radius = round(fillH * 0.40),
+        align = "center", justify = "center",
+    }, {})
+    local inner = {}
+    if x.detail then
+        inner[#inner + 1] = ui.box({ width = round(x.bw * 0.55), height = math.max(2, round(x.w * 0.03)), radius = 2, fill = RICE })
+    end
+    for _, f in ipairs(x.face) do inner[#inner + 1] = f end
+    local wrap = ui.column({
+        width = x.bw, height = wrapH, fill = NORI, radius = round(x.w * 0.14),
+        align = "center", justify = "center", gap = round(x.w * 0.035),
+    }, inner)
+    return ui.column({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { filling, wrap })
+end
+
+--- Matcha: a chawan of whisked tea; steam rises while working (character.steam) and it
+--- sips like the other hot drinks (see EXTRA_FIDGETS).
+local function matchaBody(c, x)
+    local surfH = round(x.bh * 0.22)
+    local foam = {}
+    if x.detail then
+        foam = { ui.box({ width = round(x.bw * 0.5), height = math.max(2, round(x.w * 0.03)), radius = 2, fill = MATCHA_FOAM }) }
+    end
+    local surface = ui.column({
+        width = round(x.bw * 0.90), height = surfH, fill = MATCHA_GREEN, radius = round(surfH * 0.5),
+        align = "center", justify = "center",
+    }, foam)
+    local bowl = ui.column({
+        width = x.bw, height = x.bh - surfH, fill = CERAMIC, radius = round(x.w * 0.30),
+        border = CERAMIC_EDGE, borderWidth = 1, align = "center", justify = "center", gap = round(x.w * 0.03),
+    }, x.face)
+    return ui.column({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { surface, bowl })
+end
+
+--- Tamagoyaki: a rolled, layered omelette; the face is on the top layer.
+local function tamagoyakiBody(c, x)
+    local h1 = round(x.bh * 0.40)
+    local seamH = math.max(2, round(x.bh * 0.06))
+    local h2 = x.bh - h1 - seamH
+    local top = ui.column({
+        width = x.bw, height = h1, fill = BATTER, radius = round(x.w * 0.12),
+        align = "center", justify = "center", gap = round(x.w * 0.03),
+    }, x.face)
+    local seam = ui.box({ width = round(x.bw * 0.94), height = seamH, radius = 2, fill = BATTER_DARK })
+    local bottom = ui.column({ width = x.bw, height = h2, fill = BATTER, radius = round(x.w * 0.12) }, {})
+    return ui.column({ width = x.bw, height = x.bh, align = "center", justify = "start" }, { top, seam, bottom })
+end
+
 local BODIES = {
     nigiri = nigiriBody, maki = makiBody, uramaki = uramakiBody, onigiri = onigiriBody, tofu = tofuBody,
     ikura = ikuraBody, inari = inariBody, dorayaki = dorayakiBody, dango = dangoBody, tempura = tempuraBody,
     ravioli = ravioliBody, bao = baoBody, ramen = ramenBody, takoyaki = takoyakiBody, miso = misoBody,
     edamame = edamameBody, mochi = mochiBody, boba = bobaBody, sake = sakeBody,
+    taiyaki = taiyakiBody, ramune = ramuneBody, kakigori = kakigoriBody, wasabi = wasabiBody,
+    temaki = temakiBody, matcha = matchaBody, tamagoyaki = tamagoyakiBody,
 }
 
 -- Floating decorations (z, hearts, sweat, ...) ----------------------------------
@@ -1258,7 +1448,7 @@ function Pet:badge(kind, width, height)
         width = d, height = d, fill = (kind == "alert") and "#f59e0b" or "#2f6fed", radius = round(d / 2),
         border = "#0d0f13", borderWidth = 2, align = "center", justify = "center",
     }, { inner })
-    return ui.column({ width = round(width), height = round(height), align = "start", justify = "start" }, { bubble })
+    return ui.column({ key = "badge", width = round(width), height = round(height), align = "start", justify = "start" }, { bubble })
 end
 
 --- Build the UI tree for a character `size` px wide.
@@ -1284,7 +1474,10 @@ function Pet:build(size, opts)
     local baseH = round(w * c.ratio)
     local bh = round(baseH * (1 + self.sy))
 
-    local body = BODIES[c.kind](c, { w = w, bw = bw, bh = bh, detail = detail, color = opts.color, face = self:face(w, detail, opts) })
+    local body = BODIES[c.kind](c, {
+        w = w, bw = bw, bh = bh, detail = detail, color = opts.color, face = self:face(w, detail, opts),
+        mood = self.cur, lift = self.lift, fullness = (self.contextPct or 0) / 100,
+    })
 
     -- Frame: leading spacers place the body (shake = x, lift = y). The right-hand
     -- room for decorations is always reserved so the layout never jumps.
@@ -1296,8 +1489,12 @@ function Pet:build(size, opts)
     local rowChildren = { spacerW(left), body }
     if opts.badge or opts.badgeSlot then
         -- A status bubble on the left, level with the top of the body; the room is always
-        -- reserved so the frame keeps the same width with or without it.
-        table.insert(rowChildren, 1, opts.badge and self:badge(opts.badge, margin, bh) or spacerW(margin))
+        -- reserved so the frame keeps the same width with or without it. The empty slot is a
+        -- column under the same key, not a spacer: Noctalia would otherwise hand the bubble's
+        -- nodes to the body when the bubble goes, and the body would keep its fill and opacity.
+        local slot = opts.badge and self:badge(opts.badge, margin, bh)
+            or ui.column({ key = "badge", width = round(margin), height = round(bh) }, {})
+        table.insert(rowChildren, 1, slot)
         fw = fw + margin
     end
     if detail then rowChildren[#rowChildren + 1] = self:decoration(w, baseH, decoW) end

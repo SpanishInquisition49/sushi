@@ -38,6 +38,16 @@
   --error: #ff6b7d;
   --on-icon: #14161b;
 }
+/* The docked window hosts both the pill and the full panel: only the pill gets the pet window's
+   forced-dark palette (below), the panel keeps following the system theme as it does elsewhere. */
+:root[data-view="dock"] #pillRoot {
+  --on-surface: #ecedf0;
+  --on-surface-variant: #aab0bd;
+  --primary: #ff8a6b;
+  --tertiary: #e5b24d;
+  --error: #ff6b7d;
+  --on-icon: #14161b;
+}
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
@@ -62,6 +72,16 @@ body {
   padding: 4px 14px 4px 4px;
   backdrop-filter: blur(6px);
 }
+
+/* ── Docked window (macOS, Windows, layer-shell Linux): the pill and the panel share one
+   window, see dock-window.js. Transparent only while collapsed (the pill's rounded corners need
+   to see through to the desktop, like the pet window above); the expanded panel is opaque like
+   it is everywhere else. */
+:root[data-view="dock"] #root { position: relative; height: 100%; }
+:root[data-view="dock"] #pillRoot, :root[data-view="dock"] #panelRoot { position: absolute; inset: 0; }
+:root[data-view="dock"] #pillRoot { display: flex; align-items: center; padding: 6px; cursor: pointer; }
+:root[data-view="dock"] #pillRoot > .pill { flex: none; }
+:root[data-view="dock"]:not(.expanded) body { background: transparent; }
 
 /* ── Panel layout ───────────────────────────────────────────────────────────── */
 .panel { display: flex; height: 100%; }

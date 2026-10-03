@@ -21,6 +21,7 @@
         "minHeight": 96,
         "maxHeight": 96,
         "visible": false,
+        "create": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

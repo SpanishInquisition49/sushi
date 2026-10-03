@@ -60,6 +60,13 @@ options = [
   { value = "bubble_tea",    label_key = "settings.character.options.bubble_tea" },
   { value = "sake",          label_key = "settings.character.options.sake" },
   { value = "tofu",          label_key = "settings.character.options.tofu" },
+  { value = "taiyaki",       label_key = "settings.character.options.taiyaki" },
+  { value = "ramune",        label_key = "settings.character.options.ramune" },
+  { value = "kakigori",      label_key = "settings.character.options.kakigori" },
+  { value = "wasabi",        label_key = "settings.character.options.wasabi" },
+  { value = "temaki",        label_key = "settings.character.options.temaki" },
+  { value = "matcha",        label_key = "settings.character.options.matcha" },
+  { value = "tamagoyaki",    label_key = "settings.character.options.tamagoyaki" },
 ]
 
 [[setting]]

@@ -3,7 +3,8 @@
 //
 // Characters (setting "character"): nigiri_salmon, nigiri_tuna, nigiri_tamago, unagi_nigiri,
 //   ebi_nigiri, ebi_tempura, ikura, maki, uramaki, inari, ravioli, bao, takoyaki, ramen,
-//   miso_soup, edamame, onigiri, dorayaki, mochi, dango, bubble_tea, sake, tofu.
+//   miso_soup, edamame, onigiri, dorayaki, mochi, dango, bubble_tea, sake, tofu, taiyaki,
+//   ramune, kakigori, wasabi, temaki, matcha, tamagoyaki.
 //
 // Moods
 //   steady    idle · working · alert (permission asked) · sleep (daemon down) · nap (idle for a
@@ -27,7 +28,10 @@ const INK = "#2b2023", SHINE = "#ffffff", CHEEK = "#ff9aa6", RICE = "#fbf6ec", R
   BOWL_EDGE = "#e0d6c0", BOWL_RED = "#c8453a", NOODLE = "#f2cf63", TAKO = "#d8a24c", SAUCE = "#5b2e1b",
   MISO = "#c98d4b", LACQUER = "#d94a2b", GOLD = "#e8b64c", POD = "#8cc063", POD_DARK = "#5f9140", BEAN = "#b4dc82",
   MOCHI = "#fbe4ea", MOCHI_EDGE = "#f0c6d2", BERRY = "#e8465a", TEA = "#d9ac80", PEARL = "#3b2b25",
-  CERAMIC = "#f1f4f8", CERAMIC_EDGE = "#ccd6e0", SAKE_BLUE = "#3d6fb6", CHEEK_HOT = "#ff6f85";
+  CERAMIC = "#f1f4f8", CERAMIC_EDGE = "#ccd6e0", SAKE_BLUE = "#3d6fb6", CHEEK_HOT = "#ff6f85",
+  WAFFLE = "#d9973f", WAFFLE_DARK = "#b5752c", GLASS = "#2f7cb8", GLASS_DARK = "#1f5c8c", MARBLE = "#eef8ff",
+  ICE = "#eef6fb", ICE_SHADE = "#cfe9f5", WASABI_GREEN = "#7fae3a", WASABI_RED = "#d23c3c",
+  MATCHA_GREEN = "#6fae52", MATCHA_FOAM = "#bfe3a8";
 
 const CHARACTERS = {
   nigiri_salmon: { kind: "nigiri", ratio: 0.8, top: "#ff8a6b", fat: "#ffc9b5" },
@@ -53,12 +57,20 @@ const CHARACTERS = {
   dorayaki: { kind: "dorayaki", ratio: 0.86 },
   dango: { kind: "dango", ratio: 1.6, top: "#ff9eb5", mid: "#f6f1ea", bottom: "#a8d58b" },
   tofu: { kind: "tofu", ratio: 1.0 },
+  taiyaki: { kind: "taiyaki", ratio: 0.72, batter: WAFFLE, batterDark: WAFFLE_DARK },
+  ramune: { kind: "ramune", ratio: 1.3, glass: GLASS, glassDark: GLASS_DARK },
+  kakigori: { kind: "kakigori", ratio: 1.05, syrup: BERRY },
+  wasabi: { kind: "wasabi", ratio: 0.9 },
+  temaki: { kind: "temaki", ratio: 1.42, filling: "#ff8a6b" },
+  matcha: { kind: "matcha", ratio: 0.88, steam: true },
+  tamagoyaki: { kind: "tamagoyaki", ratio: 0.95 },
 };
 
 export const CHARACTER_IDS = [
   "nigiri_salmon", "nigiri_tuna", "nigiri_tamago", "unagi_nigiri", "ebi_nigiri", "ebi_tempura", "ikura", "maki",
   "uramaki", "inari", "ravioli", "bao", "takoyaki", "ramen", "miso_soup", "edamame", "onigiri", "dorayaki", "mochi",
   "dango", "bubble_tea", "sake", "tofu",
+  "taiyaki", "ramune", "kakigori", "wasabi", "temaki", "matcha", "tamagoyaki",
 ];
 const DEFAULT_CHARACTER = "nigiri_salmon";
 
@@ -95,6 +107,8 @@ const EXTRA_FIDGETS = {
   sake: [["hiccup", 900], ["sip", 2200]],
   bubble_tea: [["sip", 2200]], ramen: [["sip", 2200]], miso_soup: [["sip", 2200]],
   takoyaki: [["jiggle", 1200]], mochi: [["jiggle", 1200]], dango: [["jiggle", 1200]], bao: [["jiggle", 1200]],
+  taiyaki: [["wiggle", 1100]], // wags its tail
+  matcha: [["sip", 2200]],
 };
 
 // Sound played when a mood starts (names of the files in ui/sounds).
@@ -146,7 +160,10 @@ export class Pet {
     this.winkL = 0; // 0..1, left eye closed (wink)
     this.cheek = 0; // 0..1, how flushed the cheeks are
     this.workKind = "read"; // read / write / run / search / think
+    this.contextPct = 0; // the active session's context window, last seen (0..100)
     this.knownSessions = null;
+    this.failureCounts = new Map(); // session id -> activity.failures last seen
+    this.turnHadFailure = false; // a failure happened since the pet was last idle
     this.forceNap = false;
     this.hover = null;
     this.prevWorking = false;
@@ -217,19 +234,30 @@ export class Pet {
     const asked = new Set((snap?.pending || []).map((p) => p.session_id));
     const pending = (snap?.pending || []).length + (snap?.sessions || []).filter((s) => s.status === "waiting" && !asked.has(s.id)).length;
     let newSession = false;
+    let newFails = 0, severeFail = false;
     if (!daemonUp) {
       mood = "sleep";
       this.knownSessions = null;
       this.upSince = null;
+      this.contextPct = 0;
     } else {
       // Sessions that were already there when the daemon came up are not newcomers.
       if (this.upSince == null) this.upSince = nowMs;
       let active = null;
       const ids = new Set();
+      const failCounts = new Map();
       for (const s of snap?.sessions || []) {
         if (s.id) {
           ids.add(s.id);
           if (this.knownSessions && !this.knownSessions.has(s.id)) newSession = true;
+          // A tool failed since the last snapshot (not on the pet's very first look, so an
+          // already-failed turn on startup doesn't trigger a false alarm).
+          const fails = s.activity?.failures || 0;
+          failCounts.set(s.id, fails);
+          if (this.knownSessions && fails > (this.failureCounts.get(s.id) || 0)) {
+            newFails += 1;
+            if (fails >= 3) severeFail = true;
+          }
         }
         if (s.status === "working") {
           working = true;
@@ -237,9 +265,13 @@ export class Pet {
         }
       }
       this.knownSessions = ids;
+      this.failureCounts = failCounts;
       // What kind of work is going on (drives the eyes and the little icon).
       const tool = active && typeof active.last_tool === "object" && active.last_tool?.kind;
       this.workKind = tool && tool !== "other" ? tool : "read";
+      // The active session's context window, kept until a new reading comes in (drives the
+      // kakigori's melt; stays put while idle rather than snapping back).
+      if (active?.context?.percent != null) this.contextPct = active.context.percent;
 
       let lim = null;
       for (const a of Object.values(snap?.agents || {})) if (a.limits?.data) lim = a.limits.data;
@@ -260,9 +292,20 @@ export class Pet {
       this.lastActive = nowMs;
       this.forceNap = false;
     }
-    // A session finished → happy hop. A new one appeared → wave hello.
-    if (this.prevWorking && !working && mood === "idle") this.trigger("happy", 1400, nowMs);
-    else if (newSession && mood !== "alert" && nowMs - (this.upSince ?? nowMs) > 4000) this.trigger("wave", 1600, nowMs);
+    // A tool failed → a worried blip (or a dizzy one once failures pile up in the same turn).
+    // A pending question still comes first.
+    if (newFails > 0 && mood !== "alert") {
+      this.turnHadFailure = true;
+      this.trigger(severeFail ? "dizzy" : "worried", severeFail ? 2000 : 1200, nowMs);
+    }
+    // A session finished → happy hop (a bigger one if it had to recover from a failure first).
+    // A new one appeared → wave hello.
+    if (this.prevWorking && !working && mood === "idle") {
+      this.trigger("happy", this.turnHadFailure ? 2200 : 1400, nowMs);
+      this.turnHadFailure = false;
+    } else if (newSession && mood !== "alert" && nowMs - (this.upSince ?? nowMs) > 4000) {
+      this.trigger("wave", 1600, nowMs);
+    }
     this.prevWorking = working;
     this.baseMood = mood;
   }
@@ -704,7 +747,10 @@ export class Pet {
     const baseH = round(w * c.ratio);
     const bh = round(baseH * (1 + this.sy));
 
-    const body = BODIES[c.kind](c, { w, bw, bh, detail, face: this.face(w, detail, opts) });
+    const body = BODIES[c.kind](c, {
+      w, bw, bh, detail, face: this.face(w, detail, opts),
+      mood: this.cur, lift: this.lift, fullness: (this.contextPct || 0) / 100,
+    });
 
     // Frame: leading spacers place the body (shake = x, lift = y). The right-hand room for
     // decorations is always reserved so the layout never jumps.
@@ -1087,9 +1133,128 @@ function tofuBody(c, x) {
   return ui.column({ width: x.bw, height: x.bh, fill: "primary", radius: round(Math.min(x.bw, x.bh) * 0.34), align: "center", justify: "center", gap: round(x.w * 0.1) }, x.face);
 }
 
+/** Taiyaki: a fish-shaped waffle cake; a rounder head with the face, a smaller tail block.
+ *  A generic "wiggle" fidget (see EXTRA_FIDGETS) reads as the tail wagging. */
+function taiyakiBody(c, x) {
+  const tailW = round(x.bw * 0.22);
+  const headW = x.bw - tailW;
+  const inner = [...x.face];
+  if (x.detail) {
+    const cw = round(x.w * 0.05), ch = Math.max(2, round(x.w * 0.03));
+    const crimp = () => ui.box({ width: cw, height: ch, radius: 1, fill: c.batterDark });
+    inner.push(ui.row({ gap: round(x.w * 0.03), align: "center" }, [crimp(), crimp(), crimp(), crimp()]));
+  }
+  const head = ui.column(
+    { width: headW, height: x.bh, fill: c.batter, radius: round(x.bh * 0.46), align: "center", justify: "center", gap: round(x.w * 0.035) },
+    inner,
+  );
+  const tail = ui.column({ width: tailW, height: round(x.bh * 0.46), fill: c.batterDark, radius: round(tailW * 0.3) }, []);
+  const tailWrap = ui.column({ width: tailW, height: x.bh, align: "center", justify: "center" }, [tail]);
+  return ui.row({ width: x.bw, height: x.bh, align: "center", justify: "start" }, [head, tailWrap]);
+}
+
+/** Ramune: a soda bottle with a marble in the neck that pops up on the happy hop (x.lift,
+ *  the same jump used for the whole frame when a turn finishes). */
+function ramuneBody(c, x) {
+  const capH = Math.max(2, round(x.bh * 0.06));
+  const neckH = round(x.bh * 0.22);
+  const bodyH = x.bh - capH - neckH;
+  const cap = ui.box({ width: round(x.bw * 0.22), height: capH, radius: 2, fill: "#d9d9d9" });
+  const marbleD = round(x.bw * 0.16);
+  const bob = round((x.lift || 0) * neckH * 0.6);
+  const neck = ui.column(
+    { width: round(x.bw * 0.3), height: neckH, fill: c.glass, radius: round(x.bw * 0.08), align: "center", justify: "end" },
+    [spacerH(Math.max(0, neckH - marbleD - bob)), ui.box({ width: marbleD, height: marbleD, radius: round(marbleD / 2), fill: MARBLE }), spacerH(bob)],
+  );
+  const inner = [];
+  if (x.detail) inner.push(ui.box({ width: round(x.bw * 0.5), height: Math.max(2, round(x.w * 0.03)), radius: 2, fill: c.glassDark }));
+  inner.push(...x.face);
+  const body = ui.column(
+    { width: x.bw, height: bodyH, fill: c.glass, radius: round(x.w * 0.26), border: c.glassDark, borderWidth: 1, align: "center", justify: "center", gap: round(x.w * 0.03) },
+    inner,
+  );
+  return col(x, {}, [cap, neck, body]);
+}
+
+/** Kakigori: shaved ice in a cup; the dome shrinks and the syrup pools as x.fullness (the
+ *  active session's context window, 0..1) climbs, so it visibly melts as the context fills up. */
+function kakigoriBody(c, x) {
+  const fullness = clamp(x.fullness || 0, 0, 1);
+  const cupH = round(x.bh * 0.22);
+  const iceH = round((x.bh - cupH) * (1 - 0.35 * fullness));
+  const gapH = x.bh - cupH - iceH;
+  const inner = [];
+  if (x.detail) inner.push(ui.box({ width: round(x.bw * 0.6), height: Math.max(2, round(x.w * 0.03)), radius: 2, fill: c.syrup }));
+  inner.push(...x.face);
+  const dome = ui.column(
+    { width: round(x.bw * 0.88), height: iceH, fill: ICE, radius: round(x.w * 0.3), border: ICE_SHADE, borderWidth: 1, align: "center", justify: "center", gap: round(x.w * 0.03) },
+    inner,
+  );
+  const drip = ui.box({
+    width: round(x.bw * (0.3 + 0.4 * fullness)), height: Math.max(2, round(x.w * 0.035)), radius: 2,
+    fill: c.syrup, opacity: 0.5 + 0.5 * fullness,
+  });
+  const cup = ui.box({ width: x.bw, height: cupH, fill: CERAMIC, radius: round(x.w * 0.18) });
+  return col(x, {}, [spacerH(gapH), dome, drip, cup]);
+}
+
+// Moods the wasabi ball turns red for (otherwise it stays its usual green).
+const ANGRY_MOODS = new Set(["sad", "annoyed", "dizzy", "startled"]);
+
+/** Wasabi: a ball of wasabi, green and calm until something goes wrong (a deny, a poke,
+ *  a sneeze) turns it red. */
+function wasabiBody(c, x) {
+  const color = ANGRY_MOODS.has(x.mood) ? WASABI_RED : WASABI_GREEN;
+  return ui.column(
+    { width: x.bw, height: x.bh, fill: color, radius: round(Math.min(x.bw, x.bh) * 0.46), align: "center", justify: "center", gap: round(x.w * 0.035) },
+    x.face,
+  );
+}
+
+/** Temaki: a tall hand roll, nori on the outside, a sliver of rice, filling peeking at the top. */
+function temakiBody(c, x) {
+  const fillH = round(x.bh * 0.14);
+  const wrapH = x.bh - fillH;
+  const filling = ui.column({ width: round(x.bw * 0.7), height: fillH, fill: c.filling, radius: round(fillH * 0.4), align: "center", justify: "center" }, []);
+  const inner = [];
+  if (x.detail) inner.push(ui.box({ width: round(x.bw * 0.55), height: Math.max(2, round(x.w * 0.03)), radius: 2, fill: RICE }));
+  inner.push(...x.face);
+  const wrap = ui.column(
+    { width: x.bw, height: wrapH, fill: NORI, radius: round(x.w * 0.14), align: "center", justify: "center", gap: round(x.w * 0.035) },
+    inner,
+  );
+  return col(x, {}, [filling, wrap]);
+}
+
+/** Matcha: a chawan of whisked tea; steam rises while working (character.steam) and it
+ *  sips like the other hot drinks (see EXTRA_FIDGETS). */
+function matchaBody(c, x) {
+  const surfH = round(x.bh * 0.22);
+  const foam = x.detail ? [ui.box({ width: round(x.bw * 0.5), height: Math.max(2, round(x.w * 0.03)), radius: 2, fill: MATCHA_FOAM })] : [];
+  const surface = ui.column({ width: round(x.bw * 0.9), height: surfH, fill: MATCHA_GREEN, radius: round(surfH * 0.5), align: "center", justify: "center" }, foam);
+  const bowl = ui.column(
+    { width: x.bw, height: x.bh - surfH, fill: CERAMIC, radius: round(x.w * 0.3), border: CERAMIC_EDGE, borderWidth: 1, align: "center", justify: "center", gap: round(x.w * 0.03) },
+    x.face,
+  );
+  return col(x, {}, [surface, bowl]);
+}
+
+/** Tamagoyaki: a rolled, layered omelette; the face is on the top layer. */
+function tamagoyakiBody(c, x) {
+  const h1 = round(x.bh * 0.4);
+  const seamH = Math.max(2, round(x.bh * 0.06));
+  const h2 = x.bh - h1 - seamH;
+  const top = ui.column({ width: x.bw, height: h1, fill: BATTER, radius: round(x.w * 0.12), align: "center", justify: "center", gap: round(x.w * 0.03) }, x.face);
+  const seam = ui.box({ width: round(x.bw * 0.94), height: seamH, radius: 2, fill: BATTER_DARK });
+  const bottom = ui.column({ width: x.bw, height: h2, fill: BATTER, radius: round(x.w * 0.12) }, []);
+  return col(x, {}, [top, seam, bottom]);
+}
+
 const BODIES = {
   nigiri: nigiriBody, maki: makiBody, uramaki: uramakiBody, onigiri: onigiriBody, tofu: tofuBody, ikura: ikuraBody,
   inari: inariBody, dorayaki: dorayakiBody, dango: dangoBody, tempura: tempuraBody, ravioli: ravioliBody, bao: baoBody,
   ramen: ramenBody, takoyaki: takoyakiBody, miso: misoBody, edamame: edamameBody, mochi: mochiBody, boba: bobaBody,
   sake: sakeBody,
+  taiyaki: taiyakiBody, ramune: ramuneBody, kakigori: kakigoriBody, wasabi: wasabiBody, temaki: temakiBody,
+  matcha: matchaBody, tamagoyaki: tamagoyakiBody,
 };

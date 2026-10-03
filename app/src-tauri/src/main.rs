@@ -17,6 +17,21 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, DragDropEvent, Emitter, Manager, WindowEvent};
 
+// Docks the pet window (into the camera notch on macOS, above everything via `HWND_TOPMOST` on
+// Windows, via `wlr-layer-shell` where the Linux compositor speaks it) and grows it in place
+// into the panel, instead of the two-window model below — see `docked()` and each module's own
+// doc comment for why, and the caveats. All three expose the same four functions, so the rest
+// of this file calls `dock::` without caring which platform it is.
+#[cfg(target_os = "macos")]
+#[path = "notch.rs"]
+mod dock;
+#[cfg(target_os = "linux")]
+#[path = "dock_linux.rs"]
+mod dock;
+#[cfg(windows)]
+#[path = "dock_windows.rs"]
+mod dock;
+
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The latest `{ up, snapshot }` sent to the windows, so a window that opens later can catch up.
@@ -96,7 +111,24 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this platform/session docks the pet window instead of using the classic two-window
+/// layout: always true on macOS and Windows, probed once on Linux (its compositor may not speak
+/// `wlr-layer-shell`) and cached, since the probe itself may block briefly.
+fn docked() -> bool {
+    static DOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DOCKED.get_or_init(dock::is_supported)
+}
+
 fn show_panel(app: &AppHandle) {
+    if docked() {
+        if let Some(w) = app.get_webview_window("pet") {
+            DOCK_EXPANDED.store(true, Ordering::SeqCst);
+            dock::set_expanded(&w, true);
+            let _ = w.set_focus();
+            let _ = app.emit("dockMode", json!({ "expanded": true }));
+        }
+        return;
+    }
     if let Some(w) = app.get_webview_window("panel") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -106,6 +138,10 @@ fn show_panel(app: &AppHandle) {
 
 #[tauri::command]
 fn toggle_panel(app: AppHandle) {
+    if docked() {
+        if DOCK_EXPANDED.load(Ordering::SeqCst) { close_panel(app) } else { show_panel(&app) }
+        return;
+    }
     match app.get_webview_window("panel") {
         Some(w) if w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false) => {
             let _ = w.hide();
@@ -121,6 +157,14 @@ fn open_panel(app: AppHandle) {
 
 #[tauri::command]
 fn close_panel(app: AppHandle) {
+    if docked() {
+        if let Some(w) = app.get_webview_window("pet") {
+            DOCK_EXPANDED.store(false, Ordering::SeqCst);
+            dock::set_expanded(&w, false);
+            let _ = app.emit("dockMode", json!({ "expanded": false }));
+        }
+        return;
+    }
     if let Some(w) = app.get_webview_window("panel") {
         let _ = w.hide();
     }
@@ -128,6 +172,10 @@ fn close_panel(app: AppHandle) {
 
 /// Set once the pet window has been sized by its page (or given up on): it is shown from then on.
 static PET_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the docked window is currently showing the panel rather than the pill (see
+/// `docked()`). There is no second window in that mode whose visibility could answer this.
+static DOCK_EXPANDED: AtomicBool = AtomicBool::new(false);
 
 /// The pet window takes the size of what it can show. Its minimum and maximum are that size too: a
 /// fixed-size window is one tiling compositors (niri) open floating instead of giving it a column,
@@ -137,10 +185,20 @@ fn fit_pet(window: tauri::WebviewWindow, width: f64, height: f64) {
     if window.label() != "pet" || !(width >= 1.0 && height >= 1.0) {
         return;
     }
-    let size = tauri::LogicalSize::new(width.ceil(), height.ceil());
-    let _ = window.set_min_size(Some(size));
-    let _ = window.set_max_size(Some(size));
-    let _ = window.set_size(size);
+    if docked() {
+        // While expanded this only remembers the size for when it collapses back: resizing the
+        // window now would fight with it currently showing the panel.
+        if DOCK_EXPANDED.load(Ordering::SeqCst) {
+            dock::remember_pill_size(width.ceil(), height.ceil());
+        } else {
+            dock::place_pill(&window, width.ceil(), height.ceil());
+        }
+    } else {
+        let size = tauri::LogicalSize::new(width.ceil(), height.ceil());
+        let _ = window.set_min_size(Some(size));
+        let _ = window.set_max_size(Some(size));
+        let _ = window.set_size(size);
+    }
     if !PET_SHOWN.swap(true, Ordering::SeqCst) {
         let _ = window.show();
     }
@@ -155,17 +213,29 @@ fn show_pet_anyway(app: &AppHandle) {
     }
 }
 
-/// The panel, made here rather than from the config so that on Linux it can be transient for the
-/// pet window: tiling compositors (niri) open such a window floating. On macOS a parent would drag
-/// the panel along with the pet, and on Windows hide it with the pet, so it stays on its own there.
-fn create_panel(app: &tauri::App) -> tauri::Result<()> {
-    let Some(config) = app.config().app.windows.iter().find(|w| w.label == "panel").cloned() else { return Ok(()) };
-    let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+/// Builds the pet window, and (when not docked, see `docked()`) the panel alongside it. Both are
+/// built here rather than left to the config's own auto-create so a docked pet window can be
+/// handed a different page (`?view=dock`) and skip the panel window entirely, growing itself
+/// into it instead. Where it is not docked this is the same two windows as before: on Linux the
+/// panel is made transient for the pet window because tiling compositors (niri) would otherwise
+/// open it floating; on Windows it stays on its own so hiding the pet does not also hide it.
+fn create_windows(app: &tauri::App) -> tauri::Result<()> {
+    let windows = &app.config().app.windows;
+    let Some(mut pet_config) = windows.iter().find(|w| w.label == "pet").cloned() else { return Ok(()) };
+
+    if docked() {
+        pet_config.url = tauri::WebviewUrl::App("index.html?view=dock".into());
+        let pet = tauri::WebviewWindowBuilder::from_config(app.handle(), &pet_config)?.build()?;
+        dock::style(&pet);
+        return Ok(());
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let pet = tauri::WebviewWindowBuilder::from_config(app.handle(), &pet_config)?.build()?;
+    let Some(panel_config) = windows.iter().find(|w| w.label == "panel").cloned() else { return Ok(()) };
+    let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &panel_config)?;
     #[cfg(target_os = "linux")]
-    let builder = match app.get_webview_window("pet") {
-        Some(pet) => builder.parent(&pet)?,
-        None => builder,
-    };
+    let builder = builder.parent(&pet)?;
     builder.build()?;
     Ok(())
 }
@@ -272,7 +342,21 @@ fn on_drag_drop(app: &AppHandle, event: &DragDropEvent) {
     }
 }
 
+/// libayatana-appindicator, which the tray uses on Linux, warns on load that it is deprecated in
+/// favour of its -glib successor, which the tray crate does not support yet: drop that one warning.
+#[cfg(target_os = "linux")]
+fn quiet_appindicator_warning() {
+    let levels = glib::LogLevels::LEVEL_WARNING;
+    glib::log_set_handler(Some("libayatana-appindicator"), levels, false, false, |domain, level, message| {
+        if !message.starts_with("libayatana-appindicator is deprecated") {
+            glib::log_default_handler(domain, level, Some(message));
+        }
+    });
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    quiet_appindicator_warning();
     let latest = Latest::default();
     tauri::Builder::default()
         .manage(latest.clone())
@@ -285,6 +369,10 @@ fn main() {
             WindowEvent::CloseRequested { api, .. } if window.label() == "panel" => {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            // Docked: clicking outside the window collapses it, like a Control Center drop-down.
+            WindowEvent::Focused(false) if window.label() == "pet" && docked() && DOCK_EXPANDED.load(Ordering::SeqCst) => {
+                close_panel(window.app_handle().clone());
             }
             WindowEvent::DragDrop(drop) => on_drag_drop(window.app_handle(), drop),
             _ => {}
@@ -313,7 +401,7 @@ fn main() {
                 })
                 .build(app)?;
 
-            create_panel(app)?;
+            create_windows(app)?;
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(3));

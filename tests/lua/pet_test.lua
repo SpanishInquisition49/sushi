@@ -36,8 +36,8 @@ do
     assert(cfg.character == "nigiri_salmon" and cfg.fidgets == true and cfg.napAfterSec == 120)
     cfg = Pet.configFrom(function(k) return ({ character = "bogus", fidgets = false, napAfterSec = 0 })[k] end)
     assert(cfg.character == "nigiri_salmon" and cfg.fidgets == false and cfg.napAfterSec == 0, "an unknown character falls back")
-    assert(#Pet.CHARACTER_IDS == 23)
-    print("config: defaults and validation; 23 characters")
+    assert(#Pet.CHARACTER_IDS == 30)
+    print("config: defaults and validation; 30 characters")
 end
 
 -- ── every character in every mood, at both sizes ───────────────────────────────────────────
@@ -65,6 +65,24 @@ do
         end
     end
     print("rendering: " .. frames .. " frames, " .. #Pet.CHARACTER_IDS .. " characters x " .. #moods .. " moods, all sizes valid")
+end
+
+-- ── the badge slot keeps its kind: Noctalia would otherwise give the bubble's nodes (blue fill,
+-- dimmed dots) to the body when the bubble goes ───────────────────────────────────────────────
+do
+    local pet = new({ character = "ikura", fidgets = false, napAfterSec = 0 })
+    local function slot(badge)
+        local row = pet:build(92, { room = 20, maxHeight = 124, margin = 20, badge = badge, badgeSlot = true }).c[2]
+        local kinds = {}
+        for i, n in ipairs(row.c) do kinds[i] = n.k end
+        return row.c[1], table.concat(kinds, ",")
+    end
+    local work, workKinds = slot("work")
+    local none, noneKinds = slot(nil)
+    assert(workKinds == noneKinds, "the frame row changes shape with the badge: " .. workKinds .. " vs " .. noneKinds)
+    assert(work.p.key == "badge" and none.p.key == "badge", "the badge slot is keyed")
+    assert(work.p.width == none.p.width, "the badge slot keeps its width")
+    print("badge slot: same kind, key and width with and without the bubble")
 end
 
 -- ── height budgets: the bar and the panel hero never overflow ──────────────────────────────
@@ -135,7 +153,35 @@ do
     assert(chat.baseMood == "think", "thinks while the chat answers")
     chat:onSnapshot({ sessions = { { id = "a", status = "idle" } }, pending = {}, chat = { busy = false, messages = { {} } } }, true, 2e6 + 100)
     assert(chat.override and chat.override.mood == "happy", "happy when it answered")
-    print("mood: tool kinds, priorities, wave, eat chain, nap, events, chat")
+
+    -- a failed tool worries it, but failures already there on the pet's first look don't count
+    local function withFails(status, fails, extra)
+        local s = { id = "a", status = status, activity = { failures = fails } }
+        return { sessions = { s }, pending = extra and extra.pending or {} }
+    end
+    local p6 = new()
+    p6:onSnapshot(withFails("working", 0), true, 5e6)
+    assert(not p6.override or p6.override.mood ~= "worried", "no false alarm for failures already on the first look")
+    p6:onSnapshot(withFails("working", 1), true, 5e6 + 300)
+    assert(p6.override and p6.override.mood == "worried", "a failed tool worries it")
+    -- three failures in the same turn overwhelm it instead
+    local p7 = new()
+    p7:onSnapshot(withFails("working", 0), true, 6e6)
+    p7:onSnapshot(withFails("working", 3), true, 6e6 + 300)
+    assert(p7.override and p7.override.mood == "dizzy", "a pile of failures overwhelms it")
+    -- succeeding after a failure earns a bigger celebration
+    local p8 = new()
+    p8:onSnapshot(withFails("working", 0), true, 7e6)
+    p8:onSnapshot(withFails("working", 1), true, 7e6 + 300)
+    p8:onSnapshot(withFails("idle", 1), true, 7e6 + 600)
+    assert(p8.override and p8.override.mood == "happy" and p8.override.untilMs - p8.override.startMs > 1400,
+        "a bigger celebration after recovering from a failure")
+    -- a pending question still comes first
+    local p9 = new()
+    p9:onSnapshot(withFails("working", 0), true, 8e6)
+    p9:onSnapshot(withFails("waiting", 1, { pending = { { id = 1 } } }), true, 8e6 + 300)
+    assert(p9.baseMood == "alert" and (not p9.override or p9.override.mood ~= "worried"), "a pending question beats a failure")
+    print("mood: tool kinds, priorities, wave, eat chain, nap, events, chat, failures")
 end
 
 -- ── idle quirks ────────────────────────────────────────────────────────────────────────────

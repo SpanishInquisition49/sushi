@@ -28,7 +28,7 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
 - **Feed it a file**: drop a file on the pet and it swallows it; the chat opens with the file attached, so the
   next question is about it.
 - **Usage** (Claude Code only): plan limits (5-hour and weekly), context window trend, tokens today.
-- **A pet with a personality**: 23 characters (nigiri, maki, ramen, bao, dango, sake…), breathing, blinking,
+- **A pet with a personality**: 30 characters (nigiri, maki, ramen, bao, dango, sake, taiyaki, ramune…), breathing, blinking,
   eyes that glance at whatever you hover, 30+ emotes and idle quirks, a nap after a while, a greeting
   on launch and 28 little sounds.
 
