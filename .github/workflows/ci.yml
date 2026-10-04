@@ -27,6 +27,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev libgtk-layer-shell-dev patchelf
+      # tauri.windows.conf.json bundles windows-bin/sushi(.exe)/sushi-hook(.exe) as resources (see
+      # `just bundle-windows`); that folder is gitignored, so even a plain `cargo build` needs them
+      # built and copied in first, or tauri-build's resource check fails before compiling anything.
+      - name: Build the CLI for the Windows bundle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --bin sushi --bin sushi-hook
+          mkdir -p app/src-tauri/windows-bin
+          cp target/debug/sushi.exe target/debug/sushi-hook.exe app/src-tauri/windows-bin/
       - run: cargo build -p sushi-app
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
