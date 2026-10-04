@@ -456,7 +456,17 @@ fn the_state_declares_what_each_agent_can_do() {
     assert_eq!(s["agents"]["antigravity"]["capabilities"]["approve"], false);
     assert_eq!(s["agents"]["gemini"]["capabilities"]["approve"], true);
     assert_eq!(s["agents"]["gemini"]["capabilities"]["chat"], false);
-    assert!(s["agents"]["claude"].get("limits").is_some() && s["agents"]["codex"].get("limits").is_none());
+    // Whether an agent *can* report plan usage is a capability, independent of whether it has
+    // actually fetched anything yet (`SUSHI_NO_LIMITS=1` here means it never will — the `limits`
+    // key itself only appears once there is real data or a real error to publish, so an agent
+    // nobody is logged into never shows up as broken; see `State::snapshot`).
+    for a in ["claude", "codex", "copilot", "antigravity"] {
+        assert_eq!(s["agents"][a]["capabilities"]["limits"], true, "{a} should report plan usage");
+        assert!(s["agents"][a].get("limits").is_none(), "{a} has not fetched anything under SUSHI_NO_LIMITS");
+    }
+    for a in ["opencode", "pi", "gemini"] {
+        assert_eq!(s["agents"][a]["capabilities"]["limits"], false, "{a} has no known usage endpoint");
+    }
 }
 
 #[test]
@@ -603,6 +613,94 @@ fn gemini_only_waits_for_tools_that_ask_and_steps_are_followed_by_name() {
 
     d.hook_for("gemini", gemini_event("AfterAgent", json!({"response": "All done"}))).finish();
     assert_eq!(d.state()["sessions"][0]["status"], "idle");
+}
+
+#[test]
+fn steps_can_be_flagged_and_exported() {
+    let d = Daemon::start("history");
+    d.hook(event("UserPromptSubmit")).finish();
+    let mut pre = event("PreToolUse");
+    pre["tool_name"] = json!("Bash");
+    pre["tool_input"] = json!({"command": "echo hi"});
+    pre["tool_use_id"] = json!("t1");
+    d.hook(pre.clone()).finish();
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    post["tool_response"] = json!({"stdout": "hi\n"});
+    d.hook(post).finish();
+
+    let step = d.state()["sessions"][0]["activity"]["recent"][0].clone();
+    let id = step["id"].as_str().expect("a step has an id").to_string();
+    assert_eq!((step["flagged"].as_bool(), id.as_str()), (Some(false), "t1"), "the agent's own call id is used, not a synthetic one");
+
+    let (ok, text) = d.cli(&["flag", "claude:s1", &id, "on", "--note", "check this"]);
+    assert!(ok, "{text}");
+    assert_eq!(d.state()["sessions"][0]["activity"]["recent"][0]["flagged"], true, "the live rail shows the flag at once");
+
+    let (ok, text) = d.cli(&["history", "claude:s1"]);
+    assert!(ok, "{text}");
+    let steps: Value = serde_json::from_str(&text).expect("history is JSON");
+    assert_eq!((steps[0]["flagged"].as_bool(), steps[0]["note"].as_str()), (Some(true), Some("check this")));
+    // A query that matches nothing in this one-step session comes back empty.
+    let (ok, text) = d.cli(&["history", "claude:s1", "--query", "nope"]);
+    assert!(ok, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap().as_array().map(Vec::len), Some(0));
+
+    let (ok, text) = d.cli(&["export", "claude:s1"]);
+    assert!(ok, "{text}");
+    let path = text.trim();
+    let markdown = std::fs::read_to_string(path).expect("the export file exists on disk");
+    assert!(markdown.contains("Flagged: needs review") && markdown.contains("check this"), "{markdown}");
+    assert!(markdown.contains("$ echo hi") && markdown.contains("hi"), "{markdown}");
+
+    // Flagging or exporting a session nobody has history for is a clean error, not a panic.
+    assert!(!d.cli(&["flag", "claude:nope", "t1", "on"]).0);
+    assert!(!d.cli(&["export", "claude:nope"]).0);
+}
+
+/// Writes one assistant line (Claude Code transcript shape, including the `cwd` every real line
+/// carries) so the housekeeping loop's `find_transcript` + `usage.refresh` picks it up.
+fn write_transcript(home: &std::path::Path, session_id: &str, cwd: &str, day_iso: &str, input_tokens: u64) {
+    let dir = home.join(".claude/projects/proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = json!({
+        "type": "assistant", "requestId": "r1", "cwd": cwd, "timestamp": day_iso,
+        "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": input_tokens, "output_tokens": 0}},
+    });
+    std::fs::write(dir.join(format!("{session_id}.jsonl")), format!("{line}\n")).unwrap();
+}
+
+#[test]
+fn a_per_project_budget_fires_independently_of_the_global_one() {
+    let today = sushi::usage::utc_day(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64);
+    let config = r#"{"budget_alerts_by_cwd": {"/tmp/proj": {"daily_cost_usd": 1.0, "daily_percent": [50]}}}"#;
+    let d = Daemon::start_with("project-budget", Some(config));
+    // 1M input tokens of claude-sonnet-5 is $3 at the default list price: well past the $0.50
+    // (50% of $1) per-project threshold, while the global budget (unset, "0 = disabled") never fires.
+    write_transcript(&d.dir, "s1", "/tmp/proj", &format!("{today}T12:00:00Z"), 1_000_000);
+    d.hook(event("UserPromptSubmit")).finish(); // creates the session `find_transcript` will match by native id
+
+    let t0 = Instant::now();
+    let budgets = loop {
+        let s = d.state();
+        let by_cwd = s["budgets"]["by_cwd"]["/tmp/proj"].clone();
+        if by_cwd["cost_today_usd"].as_f64().is_some_and(|c| c > 0.0) {
+            break by_cwd;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(6), "the per-project cost never showed up: {s}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!((budgets["cost_today_usd"].as_f64().unwrap() - 3.0).abs() < 1e-6, "{budgets}");
+
+    let events = d.state()["events"].clone();
+    let alert = events.as_array().unwrap().iter().find(|e| e["kind"] == "budget_alert" && e["project"] == "/tmp/proj");
+    assert!(alert.is_some(), "no per-project budget_alert fired: {events}");
+    assert!(events.as_array().unwrap().iter().all(|e| e["kind"] != "budget_alert" || e["project"] == "/tmp/proj"), "the unset global budget must stay quiet: {events}");
+
+    // The day-by-day ledger carries today's real figure too (not the global's since it's unset,
+    // but it is derived the same way `day_cost` computes the per-project one above).
+    let history = d.state()["usage_history"]["by_day"][&today].clone();
+    assert!(history.is_object(), "{history}");
 }
 
 #[cfg(unix)]

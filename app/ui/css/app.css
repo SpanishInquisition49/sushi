@@ -98,6 +98,8 @@ body {
 .perms { display: flex; flex-direction: column; gap: 10px; }
 .perms:empty { display: none; }
 .tabs { display: flex; align-items: center; gap: 6px; }
+.rail-tools { display: flex; align-items: center; gap: 6px; }
+#railFilter { flex: 1; min-width: 0; }
 
 .item { cursor: pointer; }
 .item:hover { background: color-mix(in srgb, var(--surface-variant) 30%, transparent); }

@@ -62,6 +62,12 @@ fn send(req: Request) -> Result<(), String> {
     if reply.ok { Ok(()) } else { Err(reply.error.unwrap_or_else(|| "the daemon refused the request".into())) }
 }
 
+/// Same as `send`, for a request whose reply carries a value in `state` (see `History`/`Export`).
+fn send_value(req: Request) -> Result<Value, String> {
+    let reply = request(&req, TIMEOUT)?;
+    if reply.ok { Ok(reply.state.unwrap_or(Value::Null)) } else { Err(reply.error.unwrap_or_else(|| "the daemon refused the request".into())) }
+}
+
 #[tauri::command]
 fn get_state(latest: tauri::State<Latest>) -> Value {
     latest.0.lock().map(|v| v.clone()).unwrap_or(Value::Null)
@@ -125,6 +131,30 @@ async fn care_buy(id: String) -> Result<(), String> {
 #[tauri::command]
 async fn care_equip(id: String) -> Result<(), String> {
     send(Request::CareEquip { id })
+}
+
+/// The durable step history of a session (see `sushi::history`), beyond the live rail's last 8
+/// steps — optionally filtered by `query`, so a non-empty search box can show a long session's
+/// earlier steps instead of just what `get_state` already carries.
+#[tauri::command]
+async fn get_history(session_id: String, query: Option<String>) -> Result<Value, String> {
+    send_value(Request::History { session_id, query })
+}
+
+#[tauri::command]
+async fn flag_step(session_id: String, step_id: String, flagged: bool, note: Option<String>) -> Result<(), String> {
+    send(Request::FlagStep { session_id, step_id, flagged, note })
+}
+
+/// Writes a markdown export of the session and returns the file's path (there is no "Save As"
+/// dialog wired up: the daemon always writes to its own fixed `exports` folder, same as the
+/// Noctalia plugin, which cannot write files from Lua at all — see `main.rs`'s `exports_dir`).
+#[tauri::command]
+async fn export_session(session_id: String, query: Option<String>) -> Result<String, String> {
+    match send_value(Request::Export { session_id, query })? {
+        Value::String(s) => Ok(s),
+        other => Err(format!("unexpected export reply: {other}")),
+    }
 }
 
 #[tauri::command]
@@ -414,7 +444,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state, decide, answer, chat_send, chat_stop, chat_clear, get_settings, set_settings, toggle_panel,
             open_panel, close_panel, fit_pet, quit, feed_clipboard, care_feed, care_pet, care_nap, care_play,
-            care_buy, care_equip
+            care_buy, care_equip, get_history, flag_step, export_session
         ])
         .on_window_event(|window, event| match event {
             // Closing the panel only hides it; the pet window is closed from the tray.

@@ -219,19 +219,19 @@ do
     button(t.out(), "Chat").p.onClick()
     assert(t.state.panelTab.tab == "chat")
     assert(texts(t.out()):find("Ask Claude Code anything", 1, true), "empty state")
-    local input = find(t.out(), function(n) return n.k == "input" end)[1]
+    local input = find(t.out(), function(n) return n.k == "input" and n.p.key and n.p.key:match("^chat%-input") end)[1]
     assert(input and input.p.onSubmit == "onChatSubmit" and input.p.submitOnEnter == true, "text field, Enter sends")
     local function sendBtn() return find(t.out(), function(n) return n.k == "button" and n.p.glyph == "send" end)[1] end
     assert(sendBtn().p.enabled == false, "send is disabled with an empty field")
     e.onChatChange("hel")
     assert(sendBtn().p.enabled == true and sendBtn().p.variant == "primary")
 
-    local keyBefore = find(t.out(), function(n) return n.k == "input" end)[1].p.key
+    local keyBefore = find(t.out(), function(n) return n.k == "input" and n.p.key and n.p.key:match("^chat%-input") end)[1].p.key
     e.onChatSubmit("  how are you?  ")
     assert(t.calls[#t.calls]:find("chat how are you? --agent claude", 1, true), "argv call with the agent: " .. tostring(t.calls[#t.calls]))
     assert(not t.calls[#t.calls]:find("--model", 1, true), "no model chosen: the agent's default")
     assert(texts(t.out()):find("how are you?", 1, true), "provisional bubble")
-    assert(find(t.out(), function(n) return n.k == "input" end)[1].p.key ~= keyBefore, "the field is recreated so it empties")
+    assert(find(t.out(), function(n) return n.k == "input" and n.p.key and n.p.key:match("^chat%-input") end)[1].p.key ~= keyBefore, "the field is recreated so it empties")
     local n = #t.calls; e.onChatSubmit("another"); assert(#t.calls == n, "ignored while a message is pending")
     set({ busy = true, messages = { { role = "user", text = "how are you?" }, { role = "assistant", text = "I am fi" } } })
     local tx = texts(t.out())

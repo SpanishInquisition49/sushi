@@ -76,6 +76,17 @@ local chatInputKey = 0   -- bumped after each send: recreates (empties) the text
 local chatDraft = ""     -- what is typed so far (the send button needs it)
 local optimistic = nil   -- {text, file, base}: a message just sent, shown until the daemon confirms it
 
+-- Search over a session's full stored history (see src/history.rs), beyond the live rail's last
+-- few steps. Empty query = the normal live rail; a non-empty one shells out to the CLI.
+local railQuery = ""
+local railQueryFor = nil     -- session id the fetched results below belong to
+local railQueryResults = nil -- nil while loading/not searching, {} once loaded (even if empty)
+local railQueryPendingAt = nil -- nowMs the debounced fetch should fire (set by onRailFilterChange)
+local railFilterKey = 0      -- bumped to force-clear the input's own text (same trick as chatInputKey)
+local searchSelectedId = nil -- a step's `id` picked from the search results, shown in the viewer
+local exportStatus = nil     -- a short status line next to the filter box ("Exported to …", an error)
+local exportStatusUntil = 0
+
 --- Make the pet react here and in the bar widget (events are shared through noctalia.state).
 local function sendEvent(kind)
     local ts = noctalia.nowMs()
@@ -192,6 +203,10 @@ end
 local function pinSession(s)
     if pinnedSession == s.id then pinnedSession = nil else pinnedSession = s.id end
     pinnedStep = nil
+    railQuery = ""
+    railQueryResults = nil
+    searchSelectedId = nil
+    railFilterKey = railFilterKey + 1
     remember("selectedSession", "sel", pinnedSession)
     render()
 end
@@ -204,6 +219,59 @@ local function pinStep(s, e)
         if tab ~= "live" then setTab("live"); return end
     end
     render()
+end
+
+local function runRailQuery(sessionId, query)
+    railQueryFor = sessionId
+    local q = query:match("^%s*(.-)%s*$")
+    if q == "" then
+        railQueryResults = nil
+        searchSelectedId = nil
+        render()
+        return
+    end
+    noctalia.runAsync({ binPath(), "history", sessionId, "--query", q }, function(res)
+        if type(res) == "table" and res.exitCode == 0 then
+            local ok, decoded = pcall(function() return noctalia.json.decode(res.stdout) end)
+            railQueryResults = (ok and type(decoded) == "table") and decoded or {}
+        else
+            railQueryResults = {}
+        end
+        render()
+    end)
+end
+
+function onRailFilterChange(text)
+    railQuery = tostring(text or "")
+    railQueryPendingAt = noctalia.nowMs() + 200
+end
+
+local function flagStep(sessionId, stepId, flagged)
+    noctalia.runAsync({ binPath(), "flag", sessionId, stepId, flagged and "on" or "off" }, function(res)
+        -- The live rail picks it up on the next snapshot; a search result needs its own refresh.
+        if railQuery:match("%S") and railQueryFor == sessionId then runRailQuery(sessionId, railQuery) end
+    end)
+end
+
+local function exportSession()
+    local s = currentSession()
+    if not s then return end
+    exportStatus = "Exporting…"
+    render()
+    local argv = { binPath(), "export", s.id }
+    if railQuery:match("%S") then
+        argv[#argv + 1] = "--query"
+        argv[#argv + 1] = railQuery
+    end
+    noctalia.runAsync(argv, function(res)
+        if type(res) == "table" and res.exitCode == 0 then
+            exportStatus = "Exported to " .. tostring(res.stdout):gsub("%s+$", "")
+        else
+            exportStatus = "Export failed: " .. tostring(res and res.stderr or "unknown error")
+        end
+        exportStatusUntil = noctalia.nowMs() + 8000
+        render()
+    end)
 end
 
 -- ── Left column ───────────────────────────────────────────────────────────────
@@ -292,7 +360,8 @@ local function titleBlock(s, nWorking, nPending, now)
     })
 end
 
-local function railRow(s, e, now)
+local function railRow(s, e, now, opts)
+    opts = opts or {}
     local running = (e.ok == nil)
     local icon
     if e.ok == true then
@@ -317,12 +386,31 @@ local function railRow(s, e, now)
         tooltip = tooltip .. " — policy: " .. tostring(e.policy.label)
         children[#children + 1] = ui.glyph({ name = "alert-triangle", size = 14, color = (e.policy.level == "deny") and "error" or "#f59e0b" })
     end
-    return ui.row({
-        key = "step-" .. tostring(e.ts_ms), align = "center", gap = 10, paddingH = 8, paddingV = 5, radius = 8,
+    -- Manual "needs review" annotation (see src/history.rs), durable across restarts; `e.id` is
+    -- the same stable step id the daemon uses, whether this row is from the live rail or a search.
+    local flagged = e.flagged == true
+    if e.id then
+        children[#children + 1] = ui.button({
+            key = "flag-" .. tostring(e.id), glyph = "flag", variant = flagged and "primary" or "ghost", controlSize = "sm",
+            tooltip = flagged and "Flagged — click to clear" or "Flag: needs review",
+            onClick = function() flagStep(s.id, e.id, not flagged) end, onHover = "onGaze",
+        })
+    end
+    local onClickFn, fill
+    if opts.searchResult then
+        onClickFn = function()
+            searchSelectedId = (searchSelectedId == e.id) and nil or e.id
+            render()
+        end
+        fill = (searchSelectedId == e.id) and "surface_variant/0.55" or nil
+    else
+        onClickFn = function() pinStep(s, e) end
         fill = (pinnedStep == e.ts_ms) and "surface_variant/0.55"
-            or ((pinnedStep == nil and follow.key == tostring(s.id) .. ":" .. tostring(e.ts_ms)) and "surface_variant/0.22" or nil),
-        onClick = function() pinStep(s, e) end, onHover = "onGaze",
-        tooltip = tooltip,
+            or ((pinnedStep == nil and follow.key == tostring(s.id) .. ":" .. tostring(e.ts_ms)) and "surface_variant/0.22" or nil)
+    end
+    return ui.row({
+        key = "step-" .. tostring(e.id or e.ts_ms), align = "center", gap = 10, paddingH = 8, paddingV = 5, radius = 8,
+        fill = fill, onClick = onClickFn, onHover = "onGaze", tooltip = tooltip,
     }, children)
 end
 
@@ -342,6 +430,17 @@ end
 local function rail(s, now)
     local rows = {}
     local rev = 0
+    local searching = s and railQuery:match("%S") ~= nil and railQueryFor == s.id
+    if searching then
+        if railQueryResults == nil then
+            rows[1] = ui.label({ text = "Searching…", fontSize = 12, color = "on_surface_variant" })
+        elseif #railQueryResults == 0 then
+            rows[1] = ui.label({ text = "No steps match.", fontSize = 12, color = "on_surface_variant" })
+        else
+            for _, e in ipairs(railQueryResults) do rows[#rows + 1] = railRow(s, e, now, { searchResult = true }) end
+        end
+        return ui.scroll({ flexGrow = 1, gap = 1 }, rows)
+    end
     if s then
         local list = stepsOf(s)
         local a = s.activity or {}
@@ -450,6 +549,15 @@ local function leftColumn(s, now)
         ui.label({ text = "Sessions", fontSize = 11, color = "on_surface_variant" }),
         sessionList(s),
         ui.separator({ spacing = 2, color = "outline", opacity = 0.2 }),
+        ui.row({ gap = 6, align = "center" }, {
+            ui.input({ key = "rail-filter-" .. tostring(railFilterKey), placeholder = "Search this session's steps…", onChange = "onRailFilterChange", flexGrow = 1 }),
+            ui.button({
+                key = "export-session", glyph = "file-export", variant = "ghost", controlSize = "sm",
+                tooltip = "Export this session as markdown", onHover = "onGaze",
+                onClick = function() exportSession() end,
+            }),
+        }),
+        ui.label({ text = exportStatus or "", fontSize = 11, color = "on_surface_variant", maxLines = 1 }),
         rail(s, now),
     })
 end
@@ -661,6 +769,19 @@ local function liveContent(s, now)
     local nodes = {}
     if not s then
         nodes[1] = Viewer.render(nil, { empty = "No agent session yet. Start Claude Code, Codex, opencode or pi in a terminal and it shows up here." })
+    elseif railQuery:match("%S") and railQueryFor == s.id and searchSelectedId ~= nil then
+        -- A step picked from the full search results, not just the live last-8: shown as-is,
+        -- outside the live typewriter/follow machinery those are built around.
+        local picked = nil
+        for _, e in ipairs(railQueryResults or {}) do
+            if e.id == searchSelectedId then picked = e; break end
+        end
+        if picked then
+            nodes[#nodes + 1] = stepLine(picked, now)
+            nodes[#nodes + 1] = Viewer.render(picked.detail, { ok = picked.ok, maxRows = 34 })
+        else
+            nodes[1] = Viewer.render(nil, { empty = "That step is no longer in the results." })
+        end
     else
         local e, following = currentStep(s, now)
         if e then
@@ -782,22 +903,43 @@ local function limitBar(key, label, w, now)
     })
 end
 
+--- One model-scoped window's label: Claude's per-model weekly limit, Codex's named extra
+--- limits, Copilot's per-quota monthly usage, Antigravity's per-model-family windows.
+local function modelLabel(m)
+    if m.kind and m.kind ~= "" then return m.model .. " · " .. m.kind end
+    return m.model
+end
+
 local function limitsSection(now)
-    local lim = Fmt.limits(snapshot) or {}
-    local data = lim.data
-    if not data then
-        return ui.label({
-            text = "Plan limits unavailable" .. (lim.error and (": " .. tostring(lim.error)) or ""),
-            fontSize = 11, color = "on_surface_variant", maxLines = 2,
-        })
+    local all = Fmt.allLimits(snapshot)
+    if #all == 0 then
+        return ui.label({ text = "Plan limits unavailable", fontSize = 11, color = "on_surface_variant" })
     end
-    local bars = {}
-    if data.five_hour then bars[#bars + 1] = limitBar("l5h", "5-hour limit", data.five_hour, now) end
-    if data.seven_day then bars[#bars + 1] = limitBar("l7d", "Weekly limit", data.seven_day, now) end
-    for i, m in ipairs(data.models or {}) do
-        bars[#bars + 1] = limitBar("lm" .. i, m.model .. " weekly", m, now)
+    local multi = #all > 1
+    local sections = {}
+    for i, lim in ipairs(all) do
+        if not lim.data then
+            sections[#sections + 1] = ui.label({
+                text = lim.label .. ": " .. tostring(lim.error or "unavailable"),
+                fontSize = 11, color = "on_surface_variant", maxLines = 2,
+            })
+        else
+            local bars = {}
+            if lim.data.five_hour then bars[#bars + 1] = limitBar("l5h" .. i, "5-hour limit", lim.data.five_hour, now) end
+            if lim.data.seven_day then bars[#bars + 1] = limitBar("l7d" .. i, "Weekly limit", lim.data.seven_day, now) end
+            for j, m in ipairs(lim.data.models or {}) do
+                bars[#bars + 1] = limitBar("lm" .. i .. "_" .. j, modelLabel(m), m, now)
+            end
+            if not multi then
+                sections[#sections + 1] = ui.column({ gap = 8 }, bars)
+            else
+                local children = { ui.label({ text = lim.label, fontSize = 11, fontWeight = "semibold", color = "on_surface_variant" }) }
+                for _, b in ipairs(bars) do children[#children + 1] = b end
+                sections[#sections + 1] = ui.column({ gap = 6 }, children)
+            end
+        end
     end
-    return ui.column({ gap = 8 }, bars)
+    return ui.column({ gap = 12 }, sections)
 end
 
 local function contextTrend(s)
@@ -832,12 +974,95 @@ local function usageRow(label, data)
     })
 end
 
+--- A compact day-by-day bar row (see src/usage_history.rs): one mini-bar per day, scaled to the
+--- busiest day shown — reuses the same mini-bar look as careMeters rather than a new chart widget.
+local function usageHistoryChart()
+    local byDay = (snapshot.usage_history and snapshot.usage_history.by_day) or {}
+    local days = {}
+    for day in pairs(byDay) do days[#days + 1] = day end
+    table.sort(days)
+    local max = 14
+    if #days > max then
+        local trimmed = {}
+        for i = #days - max + 1, #days do trimmed[#trimmed + 1] = days[i] end
+        days = trimmed
+    end
+    if #days < 2 then return nil end
+    local maxCost = 0.01
+    for _, day in ipairs(days) do maxCost = math.max(maxCost, byDay[day].estimated_cost_usd or 0) end
+    local bars = {}
+    for _, day in ipairs(days) do
+        local d = byDay[day]
+        local cost = d.estimated_cost_usd or 0
+        local pct = math.max(0.02, cost / maxCost)
+        local tooltip = day .. ": " .. Fmt.cost(cost) .. " · " .. fmt(Fmt.tokenSum(d.tokens or {})) .. " tokens"
+        bars[#bars + 1] = ui.column({ key = "hday-" .. day, flexGrow = 1, height = 36, justify = "end", tooltip = tooltip }, {
+            ui.box({ height = math.max(2, math.floor(36 * pct)), radius = 2, fill = "primary" }),
+        })
+    end
+    return ui.column({ gap = 4 }, {
+        ui.label({ text = "Daily cost (estimated) · last " .. #days .. " days", fontSize = 11, color = "on_surface_variant" }),
+        ui.row({ gap = 3, align = "end" }, bars),
+    })
+end
+
+local function budgetBar(key, label, pct, detail)
+    pct = math.max(0, math.min(100, pct))
+    return ui.column({ key = key, gap = 3 }, {
+        ui.row({ align = "center", justify = "space_between" }, {
+            ui.label({ text = label, fontSize = 12, color = "on_surface" }),
+            ui.label({ text = detail, fontSize = 11, color = "on_surface_variant" }),
+        }),
+        ui.progress({ progress = pct / 100, fill = Fmt.percentColor(pct), track = "outline/0.25", height = 6, radius = 3, flexGrow = 1 }),
+    })
+end
+
+--- Cost/token bars for one budget scope (global, or one project — see Config::budget_alerts_by_cwd);
+--- only the metrics actually configured (0 = disabled, same convention as everywhere else).
+local function budgetRows(prefix, label, data)
+    local bars = {}
+    if (data.daily_cost_usd or 0) > 0 then
+        local pct = (data.cost_today_usd or 0) / data.daily_cost_usd * 100
+        bars[#bars + 1] = budgetBar(prefix .. "-cost", label .. " · cost", pct, Fmt.cost(data.cost_today_usd) .. " of " .. Fmt.cost(data.daily_cost_usd) .. " today")
+    end
+    if (data.daily_tokens or 0) > 0 then
+        local pct = (data.tokens_today or 0) / data.daily_tokens * 100
+        bars[#bars + 1] = budgetBar(prefix .. "-tokens", label .. " · tokens", pct, fmt(data.tokens_today) .. " of " .. fmt(data.daily_tokens) .. " today")
+    end
+    return bars
+end
+
+--- The global budget plus one row per configured per-project budget (basename shown, full path
+--- in the tooltip) — nil when nothing at all is configured, so it never adds empty clutter.
+local function budgetsSection()
+    local b = snapshot.budgets
+    if not b then return nil end
+    local rows = budgetRows("budget-global", "Global", b.global or {})
+    for cwd, data in pairs(b.by_cwd or {}) do
+        local basename = cwd:match("([^/\\]+)[/\\]*$") or cwd
+        local projectRows = budgetRows("budget-" .. cwd, basename, data)
+        if #projectRows > 0 then
+            rows[#rows + 1] = ui.column({ key = "budget-proj-" .. cwd, gap = 8, tooltip = cwd }, projectRows)
+        end
+    end
+    if #rows == 0 then return nil end
+    return ui.column({ gap = 8 }, rows)
+end
+
 local function usageContent(s, now)
     local a = (s and s.activity) or {}
     local nodes = {
         ui.label({ text = "Plan usage", fontSize = 12, fontWeight = "semibold", color = "on_surface" }),
         limitsSection(now),
     }
+    local chart = usageHistoryChart()
+    local budgets = budgetsSection()
+    if chart or budgets then
+        nodes[#nodes + 1] = ui.separator({ spacing = 4, color = "outline", opacity = 0.2 })
+        nodes[#nodes + 1] = ui.label({ text = "Budgets", fontSize = 12, fontWeight = "semibold", color = "on_surface" })
+        if chart then nodes[#nodes + 1] = chart end
+        if budgets then nodes[#nodes + 1] = budgets end
+    end
     if s then
         nodes[#nodes + 1] = ui.separator({ spacing = 4, color = "outline", opacity = 0.2 })
         nodes[#nodes + 1] = ui.label({ text = "This turn · " .. (s.name or ""), fontSize = 12, fontWeight = "semibold", color = "on_surface" })
@@ -1293,6 +1518,12 @@ function onFrameTick(_deltaMs)
     pet:setFocus(focusDim)
     pet:tick(now)
     tickPlay(now)
+    if railQueryPendingAt and now >= railQueryPendingAt then
+        railQueryPendingAt = nil
+        local s = currentSession()
+        if s then runRailQuery(s.id, railQuery) end
+    end
+    if exportStatus and now >= exportStatusUntil then exportStatus = nil end
     render()
 end
 

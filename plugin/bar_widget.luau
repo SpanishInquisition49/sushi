@@ -64,11 +64,6 @@ local STATUS_LABEL = { idle = "idle", working = "working", waiting = "waiting" }
 
 local function pendingCount() return Fmt.needsYou(snapshot) end
 
-local function planLimits()
-    local l = Fmt.limits(snapshot)
-    return l and l.data or nil
-end
-
 --- Most recently active session that reports a context size.
 local function activeContext()
     local best
@@ -80,11 +75,13 @@ end
 
 --- Text and color for the percentage next to the pet: nil when there is nothing to show.
 local function headline()
-    local lim = planLimits()
-    if lim and lim.five_hour then
-        local p = lim.five_hour.percent
-        return Fmt.round(p) .. "%", Fmt.percentColor(p)
+    local worst
+    for _, lim in ipairs(Fmt.allLimits(snapshot)) do
+        if lim.data and lim.data.five_hour and (not worst or lim.data.five_hour.percent > worst) then
+            worst = lim.data.five_hour.percent
+        end
     end
+    if worst then return Fmt.round(worst) .. "%", Fmt.percentColor(worst) end
     local s = activeContext()
     if s then return Fmt.round(s.context.percent) .. "%", Fmt.percentColor(s.context.percent) end
     return nil
@@ -98,18 +95,25 @@ local function tooltipRows()
     local now = noctalia.nowMs()
     local active = Fmt.activeSession(snapshot)
     for _, row in ipairs(Fmt.sessionRows(active, now)) do rows[#rows + 1] = row end
-    local lim = planLimits()
-    if lim then
-        for _, w in ipairs({ { "5-hour limit", lim.five_hour }, { "Weekly limit", lim.seven_day } }) do
-            if w[2] then
-                rows[#rows + 1] = { key = w[1], value = Fmt.round(w[2].percent) .. "% · resets in " .. Fmt.resetIn(w[2].resets_at_ms, now) }
+    local allLim = Fmt.allLimits(snapshot)
+    local multiLim = #allLim > 1
+    for _, lim in ipairs(allLim) do
+        if lim.data then
+            for _, w in ipairs({ { "5-hour limit", lim.data.five_hour }, { "Weekly limit", lim.data.seven_day } }) do
+                if w[2] then
+                    local key = multiLim and (lim.label .. " " .. w[1]) or w[1]
+                    rows[#rows + 1] = { key = key, value = Fmt.round(w[2].percent) .. "% · resets in " .. Fmt.resetIn(w[2].resets_at_ms, now) }
+                end
             end
+            for _, m in ipairs(lim.data.models or {}) do
+                local name = (m.kind and m.kind ~= "") and (m.model .. " · " .. m.kind) or m.model
+                local key = multiLim and (lim.label .. " " .. name) or name
+                rows[#rows + 1] = { key = key, value = Fmt.round(m.percent) .. "% · resets in " .. Fmt.resetIn(m.resets_at_ms, now) }
+            end
+        elseif lim.error then
+            local key = multiLim and (lim.label .. " limits") or "Plan limits"
+            rows[#rows + 1] = { key = key, value = tostring(lim.error) }
         end
-        for _, m in ipairs(lim.models or {}) do
-            rows[#rows + 1] = { key = m.model .. " weekly", value = Fmt.round(m.percent) .. "% · resets in " .. Fmt.resetIn(m.resets_at_ms, now) }
-        end
-    elseif Fmt.limits(snapshot) and Fmt.limits(snapshot).error then
-        rows[#rows + 1] = { key = "Plan limits", value = tostring(Fmt.limits(snapshot).error) }
     end
     for _, s in ipairs(snapshot.sessions or {}) do
         if s ~= active then -- the active session is described above

@@ -12,6 +12,14 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 
 const RECENT_MAX: usize = 8;
+
+/// A step's stable identity for annotations/history (see `history.rs`): the agent's own call id
+/// when it has one, else a fallback from when it was first seen (stable across `pre_tool`'s push
+/// and `post_tool`'s later update of the same event, since both read the same `ts_ms`).
+pub fn step_id(e: &Event) -> String {
+    if e.tool_use_id.is_empty() { format!("t{}", e.ts_ms) } else { e.tool_use_id.clone() }
+}
+
 const FILES_MAX: usize = 50;
 const RESULT_MAX_CHARS: usize = 320;
 
@@ -123,13 +131,27 @@ impl Activity {
         }
     }
 
+    /// Find the event a tool call refers to: by its id, or (for agents that give no call id,
+    /// e.g. Copilot) the most recent one with the same tool name — the same matching
+    /// `post_tool` already uses right before mutating it, so a caller mirroring that step into
+    /// durable storage (see `history.rs`) sees the exact entry that was just touched, whether it
+    /// was just pushed by `pre_tool` or just updated by `post_tool`.
+    pub fn find(&self, tool: &Tool) -> Option<&Event> {
+        let id = tool.id.as_str();
+        if id.is_empty() {
+            self.recent.iter().rev().find(|e| e.tool_use_id.is_empty() && e.tool == tool.name)
+        } else {
+            self.recent.iter().rev().find(|e| e.tool_use_id == id)
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         let recent: Vec<Value> = self
             .recent
             .iter()
             .map(|e| {
                 json!({
-                    "ts_ms": e.ts_ms, "tool": e.tool, "kind": e.kind, "label": e.label,
+                    "id": step_id(e), "ts_ms": e.ts_ms, "tool": e.tool, "kind": e.kind, "label": e.label,
                     "added": e.added, "removed": e.removed, "ok": e.ok, "detail": e.detail,
                     "policy": e.policy,
                 })

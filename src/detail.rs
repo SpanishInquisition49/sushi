@@ -5,7 +5,7 @@
 //! in `state.json`. With `show_code = false` only a title is kept, never code.
 
 use crate::agent::{Role, Tool};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_COLS: usize = 160;
@@ -25,14 +25,34 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Hand-written for the same reason as `Detail`'s own impl just above: a derived `Deserialize`
+/// for the `&'static str` field would force an impossible `'de: 'static` bound.
+impl<'de> Deserialize<'de> for DiffLine {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            n: u32,
+            kind: String,
+            text: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let kind = match raw.kind.as_str() {
+            "del" => "del",
+            "add" => "add",
+            _ => "ctx",
+        };
+        Ok(DiffLine { n: raw.n, kind, text: raw.text })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
 }
 
 /// One question Claude asks (the `AskUserQuestion` tool).
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {
     pub header: String,
     pub question: String,
@@ -48,6 +68,63 @@ pub enum Detail {
     Terminal { command: String, output: Vec<String> },
     File { file: String, lang: &'static str, start: u32, lines: Vec<String> },
     Text { title: String, body: String },
+}
+
+/// `lang_of` only ever runs forward (path → `&'static str`); matching the owned string back
+/// against the same fixed set of keys (an unrecognized one — old data, a typo — safely degrades
+/// to `"other"`, since this is only ever a display hint, never stored data of its own).
+fn static_lang(s: &str) -> &'static str {
+    match s {
+        "rust" => "rust",
+        "ts" => "ts",
+        "js" => "js",
+        "python" => "python",
+        "lua" => "lua",
+        "shell" => "shell",
+        "json" => "json",
+        "toml" => "toml",
+        "markdown" => "markdown",
+        "c" => "c",
+        "cpp" => "cpp",
+        "go" => "go",
+        "java" => "java",
+        "html" => "html",
+        "css" => "css",
+        "yaml" => "yaml",
+        "nix" => "nix",
+        _ => "other",
+    }
+}
+
+/// Hand-written, not derived: a derived `Deserialize` for a `&'static str` field forces an
+/// impossible `'de: 'static` bound on the whole enum. Pivoting through `serde_json::Value`
+/// mirrors the exact `#[serde(tag = "type", ...)]` shape `Serialize` produces above, and is the
+/// only place `Detail` is ever deserialized from (`history.rs`'s own JSON file).
+impl<'de> Deserialize<'de> for Detail {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = Value::deserialize(deserializer)?;
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string).unwrap_or_default();
+        let from = |k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+        let detail = match v.get("type").and_then(Value::as_str) {
+            Some("questions") => Detail::Questions { questions: serde_json::from_value(from("questions")).unwrap_or_default() },
+            Some("diff") => Detail::Diff {
+                file: s("file"),
+                lang: static_lang(&s("lang")),
+                lines: serde_json::from_value(from("lines")).unwrap_or_default(),
+                more: v.get("more").and_then(Value::as_u64).unwrap_or(0) as u32,
+            },
+            Some("terminal") => Detail::Terminal { command: s("command"), output: serde_json::from_value(from("output")).unwrap_or_default() },
+            Some("file") => Detail::File {
+                file: s("file"),
+                lang: static_lang(&s("lang")),
+                start: v.get("start").and_then(Value::as_u64).unwrap_or(1) as u32,
+                lines: serde_json::from_value(from("lines")).unwrap_or_default(),
+            },
+            Some("text") => Detail::Text { title: s("title"), body: s("body") },
+            other => return Err(serde::de::Error::custom(format!("unknown Detail type {other:?}"))),
+        };
+        Ok(detail)
+    }
 }
 
 /// Language key (used for the chip and the syntax colors) from a file name.

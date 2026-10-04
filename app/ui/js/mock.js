@@ -19,9 +19,9 @@ export function mockState() {
     ],
   };
   const steps = [
-    { tool: "Read", label: "src/paths.rs", ok: true, ts_ms: now - 30000, detail: { type: "file", lang: "rust", file: "src/paths.rs", start: 1, lines: ["use std::env;", "use std::path::PathBuf;", "", "pub fn socket_path() -> PathBuf {", "    runtime_dir().join(\"sushi.sock\")", "}"] } },
-    { tool: "Bash", label: "cargo test", ok: false, ts_ms: now - 20000, policy: { level: "ask", label: "example policy match" }, detail: { type: "terminal", command: "cargo test", output: ["running 77 tests", "test result: FAILED. 76 passed; 1 failed"] } },
-    { tool: "Edit", label: "src/paths.rs", ok: mode === "idle" ? true : null, ts_ms: now - 2000, added: 3, removed: 1, detail: diff },
+    { id: "t1", tool: "Read", label: "src/paths.rs", ok: true, ts_ms: now - 30000, detail: { type: "file", lang: "rust", file: "src/paths.rs", start: 1, lines: ["use std::env;", "use std::path::PathBuf;", "", "pub fn socket_path() -> PathBuf {", "    runtime_dir().join(\"sushi.sock\")", "}"] } },
+    { id: "t2", tool: "Bash", label: "cargo test", ok: false, ts_ms: now - 20000, flagged: true, policy: { level: "ask", label: "example policy match" }, detail: { type: "terminal", command: "cargo test", output: ["running 77 tests", "test result: FAILED. 76 passed; 1 failed"] } },
+    { id: "t3", tool: "Edit", label: "src/paths.rs", ok: mode === "idle" ? true : null, ts_ms: now - 2000, added: 3, removed: 1, detail: diff },
   ];
   const working = mode === "work";
   const sessions = [
@@ -48,13 +48,34 @@ export function mockState() {
     snapshot: {
       version: 2,
       agents: {
-        claude: { label: "Claude Code", capabilities: { chat: true, limits: true }, limits: { data: { five_hour: { percent: 44, resets_at_ms: now + 7200000 }, seven_day: { percent: 71, resets_at_ms: now + 3 * 86400000 }, models: [{ model: "Opus", percent: 18, resets_at_ms: now + 86400000 }] } } },
-        codex: { label: "Codex", capabilities: { chat: true } },
+        claude: { label: "Claude Code", capabilities: { chat: true, limits: true }, limits: { data: { five_hour: { percent: 44, resets_at_ms: now + 7200000 }, seven_day: { percent: 71, resets_at_ms: now + 3 * 86400000 }, models: [{ model: "Opus", kind: "weekly", percent: 18, resets_at_ms: now + 86400000 }] } } },
+        codex: {
+          label: "Codex", capabilities: { chat: true, limits: true },
+          limits: { data: { five_hour: { percent: 23, resets_at_ms: now + 5400000 }, seven_day: { percent: 61, resets_at_ms: now + 2 * 86400000 }, models: [] } },
+        },
+        copilot: {
+          label: "GitHub Copilot", capabilities: { chat: true, limits: true },
+          limits: { data: { models: [{ model: "Premium requests", kind: "monthly", percent: 25, resets_at_ms: now + 20 * 86400000 }] } },
+        },
+        antigravity: { label: "Antigravity", capabilities: { limits: true }, limits: { error: "token rejected (HTTP 401/403): log in with the agent's CLI once to refresh it" } },
       },
       sessions, pending,
       usage: {
         claude: { available: true, today: { input: 12400, output: 88000, cache_read: 2400000 }, total: { input: 340000, output: 1900000 }, estimated_cost_usd: 2.35 },
         codex: { available: false },
+      },
+      usage_history: {
+        by_day: Object.fromEntries(
+          [6, 5, 4, 3, 2, 1, 0].map((d) => {
+            const day = new Date(now - d * 86400000).toISOString().slice(0, 10);
+            const cost = [0.8, 1.4, 0.3, 2.1, 1.0, 0.6, 2.35][6 - d];
+            return [day, { tokens: { input: 50000 * (d + 1), output: 20000 * (d + 1), cache_read: 0, cache_write: 0 }, estimated_cost_usd: cost }];
+          }),
+        ),
+      },
+      budgets: {
+        global: { daily_tokens: 0, daily_cost_usd: 5, tokens_today: 1_430_000, cost_today_usd: 2.35 },
+        by_cwd: { "/home/me/proj": { daily_tokens: 0, daily_cost_usd: 2, tokens_today: 900000, cost_today_usd: 1.8 } },
       },
       stats: { streak_days: 5, total_sessions: 42, total_tool_calls: 1234, streak_badge: 3, steps_badge: 1000 },
       care: { hunger: 55, energy: 80, affection: 90, growth_tier: 2, xp: 180, currency: 37, owned: ["bow", "party_hat"], equipped: "bow" },

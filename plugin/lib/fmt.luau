@@ -131,12 +131,22 @@ function F.agentLabel(snap, id)
     return (a and a.label) or tostring(id or "agent")
 end
 
---- Plan limits ({ data, error }) of the agent that has them, or nil.
-function F.limits(snap)
-    for _, a in pairs((snap and snap.agents) or {}) do
-        if a.limits then return a.limits end
+--- Plan limits ({ id, label, data, error }) of every agent that reports them (Claude Code,
+--- Codex, Copilot, Antigravity today — see `agent::Capabilities::limits`).
+function F.allLimits(snap)
+    local out = {}
+    for id, a in pairs((snap and snap.agents) or {}) do
+        if a.limits then
+            out[#out + 1] = { id = id, label = a.label, data = a.limits.data, error = a.limits.error }
+        end
     end
-    return nil
+    return out
+end
+
+--- Plan limits ({ data, error }) of the first agent that has them, or nil — for spots that show
+--- a single number and don't need to tell agents apart.
+function F.limits(snap)
+    return F.allLimits(snap)[1]
 end
 
 --- Does any agent offer the built-in chat? (Assumed yes when the snapshot does not say.)

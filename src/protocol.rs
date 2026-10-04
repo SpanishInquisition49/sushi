@@ -55,6 +55,28 @@ pub enum Request {
     CareBuy { id: String },
     /// Equip `id`, or `""` to go bare.
     CareEquip { id: String },
+    /// The durable step history of one session (see `sushi::history`), beyond the last-8-steps
+    /// `Activity` publishes live — optionally filtered by a case-insensitive substring `query`.
+    History {
+        session_id: String,
+        #[serde(default)]
+        query: Option<String>,
+    },
+    /// Toggle a step's "needs review" flag (and optionally set/replace its note).
+    FlagStep {
+        session_id: String,
+        step_id: String,
+        flagged: bool,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Write a markdown export of a session's stored steps (optionally filtered by `query`) to
+    /// disk; the reply's `state` is the resulting file path as a JSON string.
+    Export {
+        session_id: String,
+        #[serde(default)]
+        query: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +137,22 @@ mod tests {
         }
         match serde_json::from_str::<Request>(r#"{"kind":"chat_send","text":"","model":null,"file":"/tmp/a.rs"}"#).unwrap() {
             Request::ChatSend { file, .. } => assert_eq!(file.as_deref(), Some("/tmp/a.rs")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_flag_and_export_requests_roundtrip() {
+        match serde_json::from_str::<Request>(r#"{"kind":"history","session_id":"claude:a"}"#).unwrap() {
+            Request::History { session_id, query } => assert_eq!((session_id.as_str(), query), ("claude:a", None)),
+            other => panic!("unexpected {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"kind":"flag_step","session_id":"claude:a","step_id":"t1","flagged":true}"#).unwrap() {
+            Request::FlagStep { session_id, step_id, flagged, note } => assert_eq!((session_id.as_str(), step_id.as_str(), flagged, note), ("claude:a", "t1", true, None)),
+            other => panic!("unexpected {other:?}"),
+        }
+        match serde_json::from_str::<Request>(r#"{"kind":"export","session_id":"claude:a","query":"cargo"}"#).unwrap() {
+            Request::Export { session_id, query } => assert_eq!((session_id.as_str(), query.as_deref()), ("claude:a", Some("cargo"))),
             other => panic!("unexpected {other:?}"),
         }
     }

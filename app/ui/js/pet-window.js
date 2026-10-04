@@ -35,11 +35,9 @@ const snap = () => store.snapshot;
 
 /** Text and color for the percentage next to the pet: null when there is nothing to show. */
 function headline() {
-  const lim = Fmt.limits(snap())?.data;
-  if (lim?.five_hour) {
-    const p = lim.five_hour.percent;
-    return [Fmt.round(p) + "%", Fmt.percentColor(p)];
-  }
+  let worst = null;
+  for (const { data } of Fmt.allLimits(snap())) if (data?.five_hour && (!worst || data.five_hour.percent > worst)) worst = data.five_hour.percent;
+  if (worst != null) return [Fmt.round(worst) + "%", Fmt.percentColor(worst)];
   let best = null;
   for (const s of snap().sessions) if (s.context && (!best || (s.last_event_ms || 0) > (best.last_event_ms || 0))) best = s;
   if (best) return [Fmt.round(best.context.percent) + "%", Fmt.percentColor(best.context.percent)];
@@ -54,13 +52,19 @@ function tooltipRows() {
   const rows = [];
   const active = Fmt.activeSession(snap());
   for (const r of Fmt.sessionRows(active, t)) rows.push([r.key, r.value]);
-  const lim = Fmt.limits(snap());
-  if (lim?.data) {
-    for (const [name, w] of [["5-hour limit", lim.data.five_hour], ["Weekly limit", lim.data.seven_day]]) {
-      if (w) rows.push([name, `${Fmt.round(w.percent)}% · resets in ${Fmt.resetIn(w.resets_at_ms, t)}`]);
-    }
-    for (const m of lim.data.models || []) rows.push([`${m.model} weekly`, `${Fmt.round(m.percent)}% · resets in ${Fmt.resetIn(m.resets_at_ms, t)}`]);
-  } else if (lim?.error) rows.push(["Plan limits", String(lim.error)]);
+  const allLim = Fmt.allLimits(snap());
+  const multiLim = allLim.length > 1;
+  for (const { label, data, error } of allLim) {
+    if (data) {
+      for (const [name, w] of [["5-hour limit", data.five_hour], ["Weekly limit", data.seven_day]]) {
+        if (w) rows.push([multiLim ? `${label} ${name}` : name, `${Fmt.round(w.percent)}% · resets in ${Fmt.resetIn(w.resets_at_ms, t)}`]);
+      }
+      for (const m of data.models || []) {
+        const name = m.kind ? `${m.model} · ${m.kind}` : m.model;
+        rows.push([multiLim ? `${label} ${name}` : name, `${Fmt.round(m.percent)}% · resets in ${Fmt.resetIn(m.resets_at_ms, t)}`]);
+      }
+    } else if (error) rows.push([multiLim ? `${label} limits` : "Plan limits", String(error)]);
+  }
   for (const s of snap().sessions) {
     if (s === active) continue; // the active session is described above
     let value = STATUS_LABEL[s.status] || String(s.status);

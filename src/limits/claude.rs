@@ -1,63 +1,20 @@
-//! Plan usage limits (the percentages `/usage` shows: 5-hour and weekly windows).
+//! Claude Code's plan usage (the percentages `/usage` shows: 5-hour and weekly windows).
 //!
 //! Source: Anthropic's OAuth usage endpoint, called with the access token Claude
 //! Code stores in `~/.claude/.credentials.json`. This is an undocumented API
 //! (the same one Claude Code and community plugins use), so every field is
 //! parsed defensively and failures just mean "no data".
 //!
-//! The token is handed to `curl` on stdin (never in argv, so it is not visible in
-//! `ps`) and is never logged or written to `state.json`. It is not refreshed
-//! here: when it has expired, Claude Code refreshes it on its next use.
+//! It is not refreshed here: when the token has expired, Claude Code refreshes it on its next use.
 
+use super::{http_get, FetchError, Limits, ModelWindow, Window};
 use crate::usage::parse_iso_ms;
-use serde::Serialize;
 use serde_json::Value;
-use std::io::Write;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
 const URL: &str = "https://api.anthropic.com/api/oauth/usage";
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Window {
-    pub percent: f64,
-    pub resets_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ModelWindow {
-    pub kind: String,
-    pub model: String,
-    pub percent: f64,
-    pub resets_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct Limits {
-    pub five_hour: Option<Window>,
-    pub seven_day: Option<Window>,
-    pub models: Vec<ModelWindow>,
-    pub fetched_ms: u64,
-}
-
-#[derive(Debug)]
-pub enum FetchError {
-    /// HTTP status and a short body excerpt.
-    Http(u16, String),
-    Other(String),
-}
-
-impl std::fmt::Display for FetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FetchError::Http(401 | 403, _) => {
-                write!(f, "token rejected (HTTP 401/403): use Claude Code once to refresh the login")
-            }
-            FetchError::Http(c, b) => write!(f, "HTTP {c}: {b}"),
-            FetchError::Other(m) => f.write_str(m),
-        }
-    }
-}
 
 fn window(v: &Value) -> Option<Window> {
     let percent = v.get("utilization")?.as_f64()?;
@@ -115,51 +72,25 @@ fn read_token(creds: &Path) -> Result<String, FetchError> {
     let text = match std::fs::read_to_string(creds) {
         Ok(t) => t,
         // On macOS Claude Code keeps its credentials in the Keychain, not in a file.
-        Err(e) => keychain_credentials()
-            .ok_or_else(|| FetchError::Other(format!("cannot read {}: {e}", creds.display())))?,
+        Err(e) => match keychain_credentials() {
+            Some(t) => t,
+            // No file and nothing in the Keychain: never installed / never logged in, not a
+            // real error (see `FetchError::NotConfigured`).
+            None if e.kind() == std::io::ErrorKind::NotFound => return Err(FetchError::NotConfigured),
+            None => return Err(FetchError::Other(format!("cannot read {}: {e}", creds.display()))),
+        },
     };
     let v: Value = serde_json::from_str(&text).map_err(|_| FetchError::Other("credentials file is not valid JSON".into()))?;
     v.pointer("/claudeAiOauth/accessToken")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| FetchError::Other("no OAuth token (not logged in with a Claude account)".into()))
+        .ok_or(FetchError::NotConfigured) // the file exists but has no token: logged out
 }
 
 pub fn fetch(creds: &Path) -> Result<Value, FetchError> {
     let token = read_token(creds)?;
-    let mut child = Command::new("curl")
-        .args([
-            "-sS", "--max-time", "8", "-w", "\n%{http_code}",
-            "-H", "Accept: application/json",
-            "-H", "anthropic-beta: oauth-2025-04-20",
-            "-H", "User-Agent: sushi/0.1",
-            "-H", "@-", // the Authorization header is read from stdin
-            URL,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| FetchError::Other(format!("cannot run curl: {e}")))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| FetchError::Other("curl stdin unavailable".into()))?
-        .write_all(format!("Authorization: Bearer {token}\n").as_bytes())
-        .map_err(|e| FetchError::Other(format!("curl stdin: {e}")))?;
-    let out = child.wait_with_output().map_err(|e| FetchError::Other(e.to_string()))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(FetchError::Other(format!("curl failed: {}", err.lines().next().unwrap_or(""))));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (body, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
-    let code: u16 = code.trim().parse().unwrap_or(0);
-    if code != 200 {
-        return Err(FetchError::Http(code, body.chars().take(160).collect()));
-    }
-    serde_json::from_str(body).map_err(|_| FetchError::Other("usage response is not JSON".into()))
+    http_get(URL, &format!("Bearer {token}"), &[("anthropic-beta", "oauth-2025-04-20".to_string())])
 }
 
 #[cfg(test)]
@@ -193,8 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_credentials_is_an_error_not_a_panic() {
+    fn missing_credentials_is_not_configured_not_a_panic() {
         let e = read_token(Path::new("/nonexistent/creds.json")).unwrap_err();
-        assert!(e.to_string().contains("cannot read"));
+        assert!(matches!(e, FetchError::NotConfigured));
     }
 }

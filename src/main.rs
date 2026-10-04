@@ -3,14 +3,16 @@ use sushi::care::{self, Care};
 use sushi::chat::{self, Chat};
 use sushi::install;
 use sushi::detail::{self, Detail};
-use sushi::limits::{self, FetchError, Limits};
-use sushi::paths::{claude_dir, config_path, socket_path, state_dir, state_path};
+use sushi::history::HistoryStore;
+use sushi::limits::{FetchError, Limits};
+use sushi::paths::{claude_dir, codex_dir, config_path, copilot_dir, gemini_dir, socket_path, state_dir, state_path};
 use sushi::protocol::{Decision, Reply, Request};
 use sushi::sessions::{Session, Sessions, Status, session_key};
 use sushi::stats::Stats;
-use sushi::usage::{Config, HookAction, UsageStore, utc_day};
+use sushi::usage::{BudgetAlerts, Config, HookAction, UsageStore, utc_day};
+use sushi::usage_history::{DaySummary, UsageHistory};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use sushi::ipc::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -89,8 +91,10 @@ struct State {
     last_published: String,
     last_write_ms: u64,
     config: Config,
-    limits: Option<Limits>,
-    limits_error: Option<String>,
+    /// Plan usage per agent (see `limits::`): only the agents with a known endpoint
+    /// (`Agent::capabilities().limits`) ever get an entry.
+    limits: HashMap<Agent, Limits>,
+    limits_error: HashMap<Agent, String>,
     chat: Chat,
     /// Connections that asked to watch the state: each change is written to them at once.
     watchers: Vec<UnixStream>,
@@ -101,6 +105,14 @@ struct State {
     /// Set after a change to `care` (a care action, or decay/currency in `housekeeping`), so it
     /// is saved to disk at most once per housekeeping tick.
     care_dirty: bool,
+    /// Durable step log beyond what `Activity` keeps live (see `sushi::history`): backs the Live
+    /// tab's search/filter and export, and manual step annotations.
+    history: HistoryStore,
+    history_dirty: bool,
+    /// Day-by-day token/cost ledger (see `sushi::usage_history`), unlike `usage` which is
+    /// rebuilt from transcripts and never persisted.
+    usage_history: UsageHistory,
+    usage_history_dirty: bool,
     /// Recent one-shot events (see `EVENTS_MAX`), newest last.
     events: Vec<Value>,
     next_event_id: u64,
@@ -144,7 +156,16 @@ impl State {
                         });
                     }
                 }
-                v["activity"] = s.activity.to_json();
+                let mut activity = s.activity.to_json();
+                // The durable flag (see `sushi::history`) shows up on the live rail immediately,
+                // not only inside a fetched/filtered `History` request.
+                if let Some(recent) = activity.get_mut("recent").and_then(Value::as_array_mut) {
+                    for step in recent.iter_mut() {
+                        let id = step.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        step["flagged"] = json!(self.history.is_flagged(&s.id, &id));
+                    }
+                }
+                v["activity"] = activity;
                 v
             })
             .collect();
@@ -164,8 +185,12 @@ impl State {
             .into_iter()
             .map(|a| {
                 let mut v = json!({ "label": a.label(), "capabilities": a.capabilities() });
-                if a.capabilities().limits {
-                    v["limits"] = json!({ "data": self.limits, "error": self.limits_error });
+                // Only published once there is something to say: data, or a real error. An agent
+                // that was simply never logged into (`FetchError::NotConfigured`, dropped below
+                // in `limits_loop`) never gets a `limits` key at all, so it is never shown as
+                // broken to someone who doesn't even use it.
+                if self.limits.contains_key(&a) || self.limits_error.contains_key(&a) {
+                    v["limits"] = json!({ "data": self.limits.get(&a), "error": self.limits_error.get(&a) });
                 }
                 (a.id().to_string(), v)
             })
@@ -189,12 +214,41 @@ impl State {
                 (a.id().to_string(), v)
             })
             .collect();
+        // The last 30 days only: the full retained history (`usage_history::RETENTION_DAYS`)
+        // stays on disk, a publish never carries all of it.
+        let recent_history: std::collections::BTreeMap<&String, &DaySummary> = self.usage_history.by_day.iter().rev().take(30).collect();
+        let cfg = &self.config.budget_alerts;
+        let global_cost_today = self.usage_history.by_day.get(&today).map(|d| d.estimated_cost_usd).unwrap_or(0.0);
+        let budgets_by_cwd: serde_json::Map<String, Value> = self
+            .config
+            .budget_alerts_by_cwd
+            .iter()
+            .map(|(cwd, rules)| {
+                let tokens_today = self.usage.summary_for_cwd(cwd, &today).today.total();
+                let cost_today = self.usage.day_cost(&today, Some(cwd), &self.config.model_prices);
+                (
+                    cwd.clone(),
+                    json!({
+                        "daily_tokens": rules.daily_tokens, "daily_cost_usd": rules.daily_cost_usd,
+                        "tokens_today": tokens_today, "cost_today_usd": cost_today,
+                    }),
+                )
+            })
+            .collect();
         json!({
             "version": 2,
             "agents": agents,
             "sessions": sessions,
             "pending": pending,
             "usage": usage,
+            "usage_history": { "by_day": recent_history },
+            "budgets": {
+                "global": {
+                    "daily_tokens": cfg.daily_tokens, "daily_cost_usd": cfg.daily_cost_usd,
+                    "tokens_today": claude_summary.today.total(), "cost_today_usd": global_cost_today,
+                },
+                "by_cwd": budgets_by_cwd,
+            },
             "stats": {
                 "streak_days": self.stats.streak(&today),
                 "total_sessions": self.stats.total_sessions,
@@ -237,18 +291,19 @@ impl State {
     }
 
     /// Raise a `budget_alert` event for every configured threshold crossed since the last check
-    /// (plan limits, and the daily token/cost budgets if configured), each at most once per period.
+    /// (plan limits, the global daily token/cost budget, and any per-project one — see
+    /// `Config::budget_alerts_by_cwd`), each at most once per period/scope.
     fn check_budget_alerts(&mut self, now_ms: u64) {
         let mut to_fire: Vec<(String, Value)> = Vec::new();
         let cfg = &self.config.budget_alerts;
-        if let Some(lim) = &self.limits {
+        for (agent, lim) in &self.limits {
             for (label, w) in [("five_hour", lim.five_hour.as_ref()), ("seven_day", lim.seven_day.as_ref())] {
                 if let Some(w) = w {
                     for &t in &cfg.plan_percent {
                         if w.percent >= t {
-                            let key = format!("{label}:{}:{}", t as i64, w.resets_at_ms.unwrap_or(0));
+                            let key = format!("{}:{label}:{}:{}", agent.id(), t as i64, w.resets_at_ms.unwrap_or(0));
                             if !self.alerted.contains(&key) {
-                                to_fire.push((key, json!({ "scope": label, "percent": w.percent, "threshold": t })));
+                                to_fire.push((key, json!({ "agent": agent, "scope": label, "percent": w.percent, "threshold": t })));
                             }
                         }
                     }
@@ -256,34 +311,15 @@ impl State {
             }
         }
         let today = utc_day(now_ms);
-        let summary = self.usage.summary(&today);
-        let today_tokens = summary.today.total();
-        if cfg.daily_tokens > 0 && today_tokens > 0 {
-            let pct = today_tokens as f64 / cfg.daily_tokens as f64 * 100.0;
-            for &t in &cfg.daily_percent {
-                if pct >= t {
-                    let key = format!("daily_tokens:{today}:{}", t as i64);
-                    if !self.alerted.contains(&key) {
-                        to_fire.push((key, json!({ "scope": "daily_tokens", "percent": pct, "threshold": t })));
-                    }
-                }
-            }
-        }
-        if cfg.daily_cost_usd > 0.0 {
-            let total_tokens = summary.total.total();
-            if total_tokens > 0 {
-                let blended = summary.estimated_cost(&self.config.model_prices) / total_tokens as f64;
-                let today_cost = blended * today_tokens as f64;
-                let pct = today_cost / cfg.daily_cost_usd * 100.0;
-                for &t in &cfg.daily_percent {
-                    if pct >= t {
-                        let key = format!("daily_cost:{today}:{}", t as i64);
-                        if !self.alerted.contains(&key) {
-                            to_fire.push((key, json!({ "scope": "daily_cost", "percent": pct, "threshold": t })));
-                        }
-                    }
-                }
-            }
+        let global_tokens = self.usage.summary(&today).today.total();
+        // Real per-day cost, not a blended all-time rate: `usage_history`'s housekeeping tick
+        // already computes it the same way `day_cost` does, so this just reads it back.
+        let global_cost = self.usage_history.by_day.get(&today).map(|d| d.estimated_cost_usd).unwrap_or(0.0);
+        check_daily_thresholds(&mut self.alerted, &mut to_fire, "global", &today, global_tokens, global_cost, cfg);
+        for (cwd, rules) in &self.config.budget_alerts_by_cwd {
+            let tokens = self.usage.summary_for_cwd(cwd, &today).today.total();
+            let cost = self.usage.day_cost(&today, Some(cwd), &self.config.model_prices);
+            check_daily_thresholds(&mut self.alerted, &mut to_fire, cwd, &today, tokens, cost, rules);
         }
         for (key, extra) in to_fire {
             self.alerted.insert(key);
@@ -366,6 +402,42 @@ impl State {
     /// A tool started: any plan that was waiting for the terminal has been dealt with.
     fn drop_plans_for(&mut self, session_id: &str) {
         self.pending.retain(|p| !(p.kind == Kind::Plan && p.session_id == session_id));
+    }
+}
+
+/// Daily token/cost thresholds for one scope (`"global"` or a configured cwd), folding `scope`
+/// into the one-shot key so each project's thresholds fire independently of the global ones and
+/// of each other.
+fn check_daily_thresholds(
+    alerted: &mut HashSet<String>,
+    to_fire: &mut Vec<(String, Value)>,
+    scope: &str,
+    today: &str,
+    today_tokens: u64,
+    today_cost: f64,
+    cfg: &BudgetAlerts,
+) {
+    if cfg.daily_tokens > 0 && today_tokens > 0 {
+        let pct = today_tokens as f64 / cfg.daily_tokens as f64 * 100.0;
+        for &t in &cfg.daily_percent {
+            if pct >= t {
+                let key = format!("daily_tokens:{scope}:{today}:{}", t as i64);
+                if !alerted.contains(&key) {
+                    to_fire.push((key, json!({ "scope": "daily_tokens", "project": scope, "percent": pct, "threshold": t })));
+                }
+            }
+        }
+    }
+    if cfg.daily_cost_usd > 0.0 && today_cost > 0.0 {
+        let pct = today_cost / cfg.daily_cost_usd * 100.0;
+        for &t in &cfg.daily_percent {
+            if pct >= t {
+                let key = format!("daily_cost:{scope}:{today}:{}", t as i64);
+                if !alerted.contains(&key) {
+                    to_fire.push((key, json!({ "scope": "daily_cost", "project": scope, "percent": pct, "threshold": t })));
+                }
+            }
+        }
     }
 }
 
@@ -470,6 +542,18 @@ fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: V
         let sid = st.sessions.apply_event(&ev, now, &policies);
         if let Some(path) = st.sessions.map.get(&sid).and_then(|s| s.transcript.clone()) {
             st.usage.refresh(&path);
+        }
+        // Mirror the step `apply_event` just pushed or updated into the durable history (see
+        // `sushi::history`): `Activity::find` uses the same id-or-name matching `post_tool`
+        // itself used, so this sees the exact entry that was just touched either way.
+        if matches!(ev.kind, EventKind::ToolStart | EventKind::ToolEnd { .. } | EventKind::PermissionRequest)
+            && let (Some(session), Some(tool)) = (st.sessions.map.get(&sid), ev.tool.as_ref())
+            && let Some(event) = session.activity.find(tool).cloned()
+        {
+            let id = sushi::activity::step_id(&event);
+            let (agent_id, cwd, name) = (session.agent.id().to_string(), session.cwd.clone(), session.name.clone());
+            st.history.record(&sid, &agent_id, &cwd, &name, now, &id, &event);
+            st.history_dirty = true;
         }
         match ev.kind {
             EventKind::ToolEnd { .. } | EventKind::Prompt | EventKind::Stop { .. } | EventKind::SessionEnd => st.drop_pending_for(&sid),
@@ -667,6 +751,51 @@ fn care_file() -> std::path::PathBuf {
     chat::cache_dir().join("care.json")
 }
 
+fn history_file() -> std::path::PathBuf {
+    chat::cache_dir().join("history.json")
+}
+
+fn usage_history_file() -> std::path::PathBuf {
+    chat::cache_dir().join("usage_history.json")
+}
+
+/// Where `sushi export` writes markdown files — a fixed, daemon-chosen location (not a path the
+/// user picks): the app has no file-save dialog wired up and the Noctalia plugin cannot write
+/// files from Lua at all, so both just show the path this returns.
+fn exports_dir() -> std::path::PathBuf {
+    chat::cache_dir().join("exports")
+}
+
+fn handle_flag_step(shared: &Shared, session_id: &str, step_id: &str, flagged: bool, note: Option<String>) -> Reply {
+    let mut st = lock(shared);
+    if !st.history.flag(session_id, step_id, flagged, note) {
+        return Reply::err(format!("no step {step_id} in session {session_id}"));
+    }
+    st.history_dirty = true;
+    st.publish();
+    Reply::ok()
+}
+
+fn handle_export(shared: &Shared, session_id: &str, query: Option<&str>) -> Reply {
+    let st = lock(shared);
+    let Some(session) = st.history.sessions.get(session_id) else {
+        return Reply::err(format!("no stored history for session {session_id}"));
+    };
+    let steps = st.history.filtered(session_id, query);
+    let markdown = sushi::history::export_markdown(session_id, session, &steps);
+    let dir = exports_dir();
+    drop(st);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Reply::err(format!("cannot create {}", dir.display()));
+    }
+    let short = session_id.replace([':', '/', '\\'], "-");
+    let path = dir.join(format!("{short}-{}.md", now_ms()));
+    match std::fs::write(&path, markdown) {
+        Ok(()) => Reply { state: Some(json!(path.to_string_lossy())), ..Reply::ok() },
+        Err(e) => Reply::err(format!("cannot write {}: {e}", path.display())),
+    }
+}
+
 /// Start a chat turn in the background; the answer streams into the shared state. `agent` and
 /// `model` override the configured ones; `file` is a file fed with the message, whose content goes
 /// into the prompt (the log only keeps its name).
@@ -814,6 +943,14 @@ fn handle_conn(mut stream: UnixStream, shared: Shared) {
         Ok(Request::CarePlay { score }) => write_reply(&mut stream, &handle_care_play(&shared, score)),
         Ok(Request::CareBuy { id }) => write_reply(&mut stream, &handle_care_buy(&shared, &id)),
         Ok(Request::CareEquip { id }) => write_reply(&mut stream, &handle_care_equip(&shared, &id)),
+        Ok(Request::History { session_id, query }) => {
+            let steps = lock(&shared).history.filtered(&session_id, query.as_deref());
+            write_reply(&mut stream, &Reply { state: Some(json!(steps)), ..Reply::ok() });
+        }
+        Ok(Request::FlagStep { session_id, step_id, flagged, note }) => {
+            write_reply(&mut stream, &handle_flag_step(&shared, &session_id, &step_id, flagged, note));
+        }
+        Ok(Request::Export { session_id, query }) => write_reply(&mut stream, &handle_export(&shared, &session_id, query.as_deref())),
         Err(e) => write_reply(&mut stream, &Reply::err(format!("bad request: {e}"))),
     }
 }
@@ -852,10 +989,28 @@ fn housekeeping(shared: Shared) {
             st.pending.retain(|p| {
                 live.contains(&p.session_id) && !(p.kind == Kind::Plan && now.saturating_sub(p.created_ms) > PLAN_TTL_MS)
             });
+            // Snapshot "today so far" into the durable ledger before `check_budget_alerts` reads
+            // it back for the real (non-blended) daily cost — see `usage_history.rs`.
+            let today = utc_day(now);
+            let today_tokens = st.usage.summary(&today).today;
+            let today_cost = st.usage.day_cost(&today, None, &st.config.model_prices);
+            let candidate = DaySummary { tokens: today_tokens, estimated_cost_usd: today_cost };
+            if st.usage_history.by_day.get(&today) != Some(&candidate) {
+                st.usage_history.by_day.insert(today, candidate);
+                st.usage_history_dirty = true;
+            }
             st.check_budget_alerts(now);
             if st.stats_dirty {
                 st.stats.save(&stats_file());
                 st.stats_dirty = false;
+            }
+            if st.history_dirty {
+                st.history.save(&history_file());
+                st.history_dirty = false;
+            }
+            if st.usage_history_dirty {
+                st.usage_history.save(&usage_history_file());
+                st.usage_history_dirty = false;
             }
             let decayed = st.care.decay(now);
             let total_tool_calls = st.stats.total_tool_calls;
@@ -873,21 +1028,26 @@ fn housekeeping(shared: Shared) {
     }
 }
 
-/// Keep plan limits (5h / weekly) fresh. Disabled with `SUSHI_NO_LIMITS=1`.
-fn limits_loop(shared: Shared) {
-    let creds = claude_dir().join(".credentials.json");
+/// Keep one agent's plan usage fresh, independently of every other agent (so a slow or
+/// rate-limited one never delays the others). Disabled with `SUSHI_NO_LIMITS=1`.
+fn limits_loop(shared: Shared, agent: Agent, fetch: impl Fn() -> Result<Value, FetchError>, parse: fn(&Value, u64) -> Limits) {
     loop {
-        let result = limits::fetch(&creds);
+        let result = fetch();
         let wait = {
             let mut st = lock(&shared);
             let wait = match result {
                 Ok(v) => {
-                    st.limits = Some(limits::parse(&v, now_ms()));
-                    st.limits_error = None;
+                    st.limits.insert(agent, parse(&v, now_ms()));
+                    st.limits_error.remove(&agent);
                     LIMITS_REFRESH
                 }
+                Err(FetchError::NotConfigured) => {
+                    // Never logged into this agent: say nothing rather than publish an error.
+                    st.limits_error.remove(&agent);
+                    LIMITS_RETRY
+                }
                 Err(e) => {
-                    st.limits_error = Some(e.to_string());
+                    st.limits_error.insert(agent, e.to_string());
                     if matches!(e, FetchError::Http(429, _)) { LIMITS_BACKOFF } else { LIMITS_RETRY }
                 }
             };
@@ -931,6 +1091,8 @@ fn run_daemon() -> Result<(), String> {
         chat: Chat::load(&chat_file()),
         stats: Stats::load(&stats_file()),
         care: Care::load(&care_file()),
+        history: HistoryStore::load(&history_file()),
+        usage_history: UsageHistory::load(&usage_history_file()),
         ..State::default()
     };
     state.sessions.hide_code = !state.config.show_code;
@@ -938,7 +1100,13 @@ fn run_daemon() -> Result<(), String> {
     let shared: Shared = Arc::new(Mutex::new(state));
     if std::env::var_os("SUSHI_NO_LIMITS").is_none() {
         let s = shared.clone();
-        thread::spawn(move || limits_loop(s));
+        thread::spawn(move || limits_loop(s, Agent::Claude, move || sushi::limits::claude::fetch(&claude_dir().join(".credentials.json")), sushi::limits::claude::parse));
+        let s = shared.clone();
+        thread::spawn(move || limits_loop(s, Agent::Codex, move || sushi::limits::codex::fetch(&codex_dir()), sushi::limits::codex::parse));
+        let s = shared.clone();
+        thread::spawn(move || limits_loop(s, Agent::Copilot, move || sushi::limits::copilot::fetch(&copilot_dir()), sushi::limits::copilot::parse));
+        let s = shared.clone();
+        thread::spawn(move || limits_loop(s, Agent::Antigravity, move || sushi::limits::antigravity::fetch(&gemini_dir()), sushi::limits::antigravity::parse));
     }
     {
         let s = shared.clone();
@@ -1003,7 +1171,7 @@ fn install_command(agents: &[Agent], write: bool) -> Result<(), String> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: sushi <daemon | state | approve ID [--accept-edits] | deny ID | answer ID JSON | chat [TEXT] [--file PATH] [--model M] [--agent A] | chat-stop | chat-clear | care feed|pet|nap | care play SCORE | care buy|equip ID | install [--agent claude|codex|opencode|pi|copilot|antigravity|gemini|all] [--write]>"
+        "usage: sushi <daemon | state | approve ID [--accept-edits] | deny ID | answer ID JSON | chat [TEXT] [--file PATH] [--model M] [--agent A] | chat-stop | chat-clear | care feed|pet|nap | care play SCORE | care buy|equip ID | history SESSION_ID [--query TEXT] | flag SESSION_ID STEP_ID on|off [--note TEXT] | export SESSION_ID [--query TEXT] | install [--agent claude|codex|opencode|pi|copilot|antigravity|gemini|all] [--write]>"
     );
     std::process::exit(2)
 }
@@ -1064,6 +1232,40 @@ fn main() {
         }
         ["care", "equip", id] => {
             client(&Request::CareEquip { id: id.to_string() }).and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
+        }
+        ["history", session_id, rest @ ..] => {
+            let query = match rest {
+                ["--query", q] => Some(q.to_string()),
+                [] => None,
+                _ => usage(),
+            };
+            client(&Request::History { session_id: session_id.to_string(), query }).map(|r| {
+                println!("{}", serde_json::to_string_pretty(&r.state).unwrap_or_default());
+            })
+        }
+        ["flag", session_id, step_id, state @ ("on" | "off"), rest @ ..] => {
+            let note = match rest {
+                ["--note", n] => Some(n.to_string()),
+                [] => None,
+                _ => usage(),
+            };
+            client(&Request::FlagStep { session_id: session_id.to_string(), step_id: step_id.to_string(), flagged: *state == "on", note })
+                .and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
+        }
+        ["export", session_id, rest @ ..] => {
+            let query = match rest {
+                ["--query", q] => Some(q.to_string()),
+                [] => None,
+                _ => usage(),
+            };
+            client(&Request::Export { session_id: session_id.to_string(), query }).and_then(|r| {
+                if r.ok {
+                    println!("{}", r.state.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default());
+                    Ok(())
+                } else {
+                    Err(r.error.unwrap_or_default())
+                }
+            })
         }
         [cmd @ ("approve" | "deny"), id, flags @ ..] if flags.is_empty() || (*cmd == "approve" && flags == ["--accept-edits"]) => match id.parse::<u64>() {
             Ok(id) => {

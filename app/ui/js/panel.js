@@ -63,6 +63,67 @@ let lastChatRev = "";
 let lastRailRev = ""; // see renderLeft: keeps the rail (now a short scroll box) pinned to the newest step
 const choices = new Map(); // pending id → question index → Set(labels)
 
+// Search over a session's full stored history (see src/history.rs), beyond the live rail's last
+// few steps. Empty query = the normal live rail; a non-empty one fetches from the daemon.
+let railQuery = "";
+let railQueryFor = null; // session id the fetched results below belong to
+let railQueryResults = null; // Array<step> | null while the fetch for `railQuery` is in flight
+let railQueryToken = 0; // guards a stale fetch from overwriting a newer one's results
+let searchSelectedId = null; // a step's `id` picked from the search results, shown in the viewer
+let railFilterTimer = null;
+let exportStatus = null; // a short status line next to the filter box ("Exported to …", an error)
+
+function runRailQuery(sessionId, query) {
+  railQueryFor = sessionId;
+  const q = query.trim();
+  if (!q) {
+    railQueryResults = null;
+    searchSelectedId = null;
+    return renderAll();
+  }
+  const token = ++railQueryToken;
+  invoke("get_history", { sessionId, query: q })
+    .then((steps) => {
+      if (token !== railQueryToken) return; // superseded by a newer query
+      railQueryResults = Array.isArray(steps) ? steps : [];
+      renderAll();
+    })
+    .catch(() => {
+      if (token === railQueryToken) {
+        railQueryResults = [];
+        renderAll();
+      }
+    });
+}
+
+function onRailFilterInput(e) {
+  railQuery = e.target.value;
+  const s = currentSession();
+  clearTimeout(railFilterTimer);
+  if (!s) return;
+  railFilterTimer = setTimeout(() => runRailQuery(s.id, railQuery), 200);
+}
+
+function exportSession() {
+  const s = currentSession();
+  if (!s) return;
+  exportStatus = "Exporting…";
+  renderLeft(now());
+  invoke("export_session", { sessionId: s.id, query: railQuery.trim() || null })
+    .then((path) => {
+      exportStatus = `Exported to ${path}`;
+      renderLeft(now());
+      setTimeout(() => {
+        exportStatus = null;
+        renderLeft(now());
+      }, 8000);
+    })
+    .catch((e) => {
+      exportStatus = `Export failed: ${e}`;
+      renderLeft(now());
+    });
+}
+
 /** Make the pet react here and in the pet window (events travel through Tauri). */
 function sendEvent(kind) {
   const ts = now();
@@ -446,6 +507,11 @@ function setTab(id) {
 function pinSession(id) {
   pinnedSession = pinnedSession === id ? null : id;
   pinnedStep = null;
+  railQuery = "";
+  railQueryResults = null;
+  searchSelectedId = null;
+  const input = $("railFilter");
+  if (input) input.value = "";
   mem.set("session", pinnedSession);
   renderAll();
 }
@@ -548,7 +614,7 @@ function titleBlock(s, nWorking, nPending, t) {
   ]);
 }
 
-function railRow(s, e, t) {
+function railRow(s, e, t, opts = {}) {
   const running = e.ok == null;
   let icon;
   if (e.ok === true) icon = ui.glyph({ name: "circle-check-filled", size: 18, color: Viewer.COLORS.ok });
@@ -558,10 +624,23 @@ function railRow(s, e, t) {
   // enforcement only exists for Claude Code's own permissions (see the README).
   const policyBadge = e.policy ? ui.glyph({ name: "alert-triangle", size: 14, color: e.policy.level === "deny" ? "error" : "#f59e0b" }) : null;
   const title = e.policy ? `${e.tool} ${e.label || ""} — policy: ${e.policy.label}` : `${e.tool} ${e.label || ""}`;
+  // Manual "needs review" annotation (see src/history.rs), durable across restarts; `e.id` is the
+  // same stable step id the daemon uses, whether this row came from the live rail or a search.
+  const flagged = !!e.flagged;
+  const flagBtn = e.id
+    ? btn("", {
+        act: "flag-step", data: { session: s.id, step: e.id, on: flagged ? "0" : "1" }, glyph: "flag", small: true,
+        variant: flagged ? "primary" : "ghost", tip: flagged ? "Flagged — click to clear" : "Flag: needs review",
+      })
+    : null;
+  const act = opts.searchResult ? "pick-search-step" : "pin-step";
+  const selected = opts.searchResult
+    ? searchSelectedId === e.id
+    : pinnedStep === e.ts_ms || (pinnedStep == null && follow.key === `${s.id}:${e.ts_ms}`);
   return ui.row(
     {
-      cls: "item" + (pinnedStep === e.ts_ms ? " selected" : pinnedStep == null && follow.key === `${s.id}:${e.ts_ms}` ? " shown" : ""),
-      data: { act: "pin-step", ts: e.ts_ms },
+      cls: "item" + (selected ? (opts.searchResult || pinnedStep === e.ts_ms ? " selected" : " shown") : ""),
+      data: { act, ts: e.ts_ms, id: e.id },
       align: "center", gap: 10, paddingH: 8, paddingV: 5, radius: 8, title,
     },
     [
@@ -569,6 +648,7 @@ function railRow(s, e, t) {
       ui.label({ text: e.tool, fontSize: 15, fontWeight: running ? "bold" : "semibold", color: running ? "on_surface" : "on_surface_variant" }),
       ui.label({ text: e.label || "", fontSize: 11, color: "on_surface_variant", maxLines: 1, flexGrow: 1 }),
       policyBadge,
+      flagBtn,
     ],
   );
 }
@@ -580,6 +660,13 @@ const sessionRowsShown = () => Math.max(1, Math.min(snap().sessions.length, SESS
 
 function rail(s, t) {
   const rows = [];
+  const searching = s && railQuery.trim() !== "" && railQueryFor === s.id;
+  if (searching) {
+    if (railQueryResults == null) rows.push(ui.label({ text: "Searching…", fontSize: 12, color: "on_surface_variant" }));
+    else if (!railQueryResults.length) rows.push(ui.label({ text: "No steps match.", fontSize: 12, color: "on_surface_variant" }));
+    else for (const e of railQueryResults) rows.push(railRow(s, e, t, { searchResult: true }));
+    return ui.column({ gap: 1 }, rows);
+  }
   if (s) {
     // Fewer steps when there are several sessions, so a long turn's step list doesn't dominate.
     const done = s.status === "idle" && !!s.activity?.finished_ms;
@@ -744,6 +831,12 @@ function liveContent(s, t) {
   typing = false;
   if (!s) {
     nodes.push(Viewer.render(null, { empty: "No agent session yet. Start Claude Code, Codex, opencode or pi in a terminal and it shows up here." }));
+  } else if (railQuery.trim() !== "" && railQueryFor === s.id && searchSelectedId != null) {
+    // A step picked from the full search results, not just the live last-8: shown as-is, outside
+    // the live typewriter/follow machinery those are built around.
+    const picked = (railQueryResults || []).find((x) => x.id === searchSelectedId);
+    if (picked) nodes.push(stepLine(picked, t), Viewer.render(picked.detail, { ok: picked.ok, maxRows: 34 }));
+    else nodes.push(Viewer.render(null, { empty: "That step is no longer in the results." }));
   } else {
     const [e, following] = currentStep(s, t);
     if (e) nodes.push(stepLine(e, t), viewerFor(s, e, t, following));
@@ -872,17 +965,30 @@ function limitBar(label, w, t) {
   ]);
 }
 
+/** Bars for one model-scoped window: Claude's per-model weekly limit, Codex's named extra
+ *  limits, Copilot's per-quota monthly usage, Antigravity's per-model-family windows. */
+function modelLabel(m) {
+  return m.kind ? `${m.model} · ${m.kind}` : m.model;
+}
+
 function limitsSection(t) {
-  const lim = Fmt.limits(snap()) || {};
-  const data = lim.data;
-  if (!data) {
-    return ui.label({ text: "Plan limits unavailable" + (lim.error ? ": " + lim.error : ""), fontSize: 11, color: "on_surface_variant", maxLines: 2 });
+  const all = Fmt.allLimits(snap());
+  if (!all.length) {
+    return ui.label({ text: "Plan limits unavailable", fontSize: 11, color: "on_surface_variant" });
   }
-  const bars = [];
-  if (data.five_hour) bars.push(limitBar("5-hour limit", data.five_hour, t));
-  if (data.seven_day) bars.push(limitBar("Weekly limit", data.seven_day, t));
-  for (const m of data.models || []) bars.push(limitBar(`${m.model} weekly`, m, t));
-  return ui.column({ gap: 8 }, bars);
+  const multi = all.length > 1;
+  const sections = all.map(({ label, data, error }) => {
+    if (!data) {
+      return ui.label({ text: `${label}: ${error || "unavailable"}`, fontSize: 11, color: "on_surface_variant", maxLines: 2 });
+    }
+    const bars = [];
+    if (data.five_hour) bars.push(limitBar("5-hour limit", data.five_hour, t));
+    if (data.seven_day) bars.push(limitBar("Weekly limit", data.seven_day, t));
+    for (const m of data.models || []) bars.push(limitBar(modelLabel(m), m, t));
+    if (!multi) return ui.column({ gap: 8 }, bars);
+    return ui.column({ gap: 6 }, [ui.label({ text: label, fontSize: 11, fontWeight: "semibold", color: "on_surface_variant" }), ...bars]);
+  });
+  return ui.column({ gap: 12 }, sections);
 }
 
 function contextTrend(s) {
@@ -917,9 +1023,75 @@ function usageRow(label, data) {
   return ui.row({ align: "center", justify: "space_between" }, [ui.label({ text: label, fontSize: 12, color: "on_surface" }), right]);
 }
 
+/** A compact day-by-day bar row (see src/usage_history.rs): one mini-bar per day, scaled to the
+ *  busiest day shown — reuses the mini-progress-bar look `careMeters` already established rather
+ *  than inventing a chart primitive. */
+function usageHistoryChart() {
+  const series = Fmt.byDaySeries(snap().usage_history);
+  if (series.length < 2) return null;
+  const max = Math.max(...series.map((d) => d.estimated_cost_usd || 0), 0.01);
+  const bars = series.map((d) => {
+    const pct = Math.max(2, Math.round(((d.estimated_cost_usd || 0) / max) * 100));
+    const title = `${d.day}: ${Fmt.cost(d.estimated_cost_usd)} · ${Fmt.tokens(Fmt.tokenSum(d.tokens))} tokens`;
+    return ui.column({ flexGrow: 1, gap: 0, title }, [
+      `<div style="height:36px;display:flex;align-items:flex-end;">` +
+        `<div style="width:100%;height:${pct}%;min-height:2px;border-radius:2px;background:${col("primary")};"></div></div>`,
+    ]);
+  });
+  return ui.column({ gap: 4 }, [
+    ui.label({ text: `Daily cost (estimated) · last ${series.length} days`, fontSize: 11, color: "on_surface_variant" }),
+    ui.row({ gap: 3, align: "end" }, bars),
+  ]);
+}
+
+function budgetBar(label, pct, detail) {
+  const p = Math.max(0, Math.min(100, pct));
+  return ui.column({ gap: 3 }, [
+    ui.row({ align: "center", justify: "space_between" }, [
+      ui.label({ text: label, fontSize: 12, color: "on_surface" }),
+      ui.label({ text: detail, fontSize: 11, color: "on_surface_variant" }),
+    ]),
+    `<div class="track"><div class="bar" style="width:${p}%;background:var(--${Fmt.percentColor(p).replace("_", "-")})"></div></div>`,
+  ]);
+}
+
+/** Cost/token bars for one budget scope (global, or one project — see Config::budget_alerts_by_cwd);
+ *  only the metrics actually configured (0 = disabled, same convention everywhere else). */
+function budgetRows(label, data) {
+  const bars = [];
+  if (data.daily_cost_usd > 0) {
+    bars.push(budgetBar(`${label} · cost`, (data.cost_today_usd / data.daily_cost_usd) * 100, `${Fmt.cost(data.cost_today_usd)} of ${Fmt.cost(data.daily_cost_usd)} today`));
+  }
+  if (data.daily_tokens > 0) {
+    bars.push(budgetBar(`${label} · tokens`, (data.tokens_today / data.daily_tokens) * 100, `${Fmt.tokens(data.tokens_today)} of ${Fmt.tokens(data.daily_tokens)} today`));
+  }
+  return bars;
+}
+
+/** The global budget plus one row per configured per-project budget (basename shown, full path
+ *  in the tooltip) — null when nothing at all is configured, so it never adds empty clutter. */
+function budgetsSection() {
+  const b = snap().budgets;
+  if (!b) return null;
+  const rows = budgetRows("Global", b.global || {});
+  for (const [cwd, data] of Object.entries(b.by_cwd || {})) {
+    const basename = cwd.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || cwd;
+    const projectRows = budgetRows(basename, data);
+    if (projectRows.length) rows.push(ui.column({ gap: 8, title: cwd }, projectRows));
+  }
+  return rows.length ? ui.column({ gap: 8 }, rows) : null;
+}
+
 function usageContent(s, t) {
   const a = s?.activity || {};
   const nodes = [ui.label({ text: "Plan usage", fontSize: 12, fontWeight: "semibold", color: "on_surface" }), limitsSection(t)];
+  const chart = usageHistoryChart();
+  const budgets = budgetsSection();
+  if (chart || budgets) {
+    nodes.push(ui.separator({ spacing: 4 }), ui.label({ text: "Budgets", fontSize: 12, fontWeight: "semibold", color: "on_surface" }));
+    if (chart) nodes.push(chart);
+    if (budgets) nodes.push(budgets);
+  }
   if (s) {
     nodes.push(
       ui.separator({ spacing: 4 }),
@@ -1036,6 +1208,7 @@ function renderLeft(t) {
   }
   setHtml($("sessions"), sessionList(s));
   $("sessions").style.maxHeight = `${SESSIONS_MAX_ROWS * SESSION_ROW_H}px`;
+  setHtml($("railStatus"), exportStatus ? esc(exportStatus) : "");
 }
 
 function renderRight() {
@@ -1158,6 +1331,18 @@ function onClick(e) {
       const step = s && stepsOf(s).find((x) => String(x.ts_ms) === d.ts);
       return step && pinStep(s, step);
     }
+    case "pick-search-step":
+      searchSelectedId = searchSelectedId === d.id ? null : d.id;
+      return renderAll();
+    case "flag-step": {
+      const flagged = d.on === "1";
+      invoke("flag_step", { sessionId: d.session, stepId: d.step, flagged }).then(() => {
+        // The live rail picks it up on the next snapshot; a search result needs its own refresh.
+        if (railQuery.trim() && railQueryFor === d.session) runRailQuery(d.session, railQuery);
+      }).catch((e) => console.warn("sushi: flag failed:", e));
+      return;
+    }
+    case "export-session": return exportSession();
     case "chat-send": return submitChat();
     case "chat-stop": return void invoke("chat_stop");
     case "feed-discard":
@@ -1214,6 +1399,11 @@ const SKELETON = `
     <div class="muted small">Sessions</div>
     <div id="sessions" class="scroll"></div>
     ${ui.separator({ spacing: 2 })}
+    <div class="rail-tools">
+      <input id="railFilter" type="text" autocomplete="off" placeholder="Search this session's steps…">
+      ${btn("", { act: "export-session", glyph: "file-export", tip: "Export this session as markdown", small: true })}
+    </div>
+    <div id="railStatus" class="muted small"></div>
     <div id="rail" class="scroll grow"></div>
   </aside>
   <div class="vsep"></div>
@@ -1245,6 +1435,7 @@ export function mount(root) {
     }
   });
   $("chatInput").addEventListener("input", renderChat);
+  $("railFilter").addEventListener("input", onRailFilterInput);
 
   listen("petEvent", (ev) => ev && pet.onEvent(ev.kind, ev.ts, now()));
   // A file dropped on either window (the Rust side sends it): attach it to the next message and show the chat.

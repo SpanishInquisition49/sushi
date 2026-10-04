@@ -17,6 +17,14 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
   been running), or the file it read. Steps come faster than you can read them, so the viewer lets each edit
   be typed out and each command be seen before moving on, skips the reads in between, and never falls more
   than three steps behind. When a turn finishes the pet does a happy little jump.
+- **Search, flag, export**: the live rail only ever shows a session's last few steps, but a search
+  box above it queries that session's full stored history (hundreds of steps, kept beyond the
+  current turn and beyond the session ending — see `sushi::history`) by tool name, label, diff or
+  command text. Any step, live or found by search, can be **flagged "needs review"** (with an
+  optional note), which persists across restarts and shows up on the live rail too. The export
+  button (or `sushi export SESSION_ID`) writes the session's steps as a markdown file — the same
+  bounded diffs/output the viewer already shows, never a complete/git-applyable patch — to
+  `~/.cache/sushi/exports/`, and prints/shows the resulting path.
 - **Approve from the notch**: permission requests pop up with a preview of what the agent wants to do and
   **Allow / Deny** buttons. One click, back to work. With Claude Code, when it **asks you a question**
   (`AskUserQuestion`) its options show up as buttons and your choice goes straight back; a
@@ -29,11 +37,16 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
   next question is about it. An audio file (wav, mp3, flac, ogg, m4a, aac, opus, wma) is transcribed first, with
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) running fully offline — set `transcribe_model_path` to a
   GGML/GGUF model to turn this on; the transcript is also kept next to the audio file as a `.txt`.
-- **Usage**: Claude Code's plan limits (5-hour and weekly) and context window trend, plus a token/estimated-cost
-  comparison across every agent — "not tracked yet" for the agents nothing reads transcripts for today, never a
-  fabricated number. **Budget alerts** (`budget_alerts` in `config.json`) raise a one-shot pet reaction (a
-  distinct sound and a worried blip) the moment a plan window or a daily token/cost budget crosses a configured
-  threshold.
+- **Usage**: plan limits for every agent that has them — Claude Code's 5-hour/weekly windows, Codex's same shape
+  when logged in with a ChatGPT account, Copilot's monthly quotas and Antigravity's per-model windows, each
+  fetched straight from that agent's own account, side by side — plus Claude's context window trend and a
+  token/estimated-cost comparison across every agent ("not tracked yet" for the agents nothing reads transcripts
+  for today, never a fabricated number), and a **day-by-day cost chart** (`usage_history`, persisted so it
+  survives a restart, unlike the rest of `usage` which is rebuilt from transcripts). **Budget alerts**
+  (`budget_alerts` in `config.json`) raise a one-shot pet reaction (a distinct sound and a worried blip) the
+  moment a plan window or a daily token/cost budget crosses a configured threshold — `budget_alerts_by_cwd`
+  adds the same check **per project** (keyed by a session's exact `cwd`), shown as its own row in the Usage
+  tab, for when different repos have very different costs.
 - **External hooks**: run a command and/or POST a small JSON body to a URL (`hooks` in `config.json`) when a
   session starts or ends, starts waiting for you, or a turn finishes — e.g. kick off a build, a staging deploy,
   or update an internal dashboard. Fire-and-forget: a slow or failing script never blocks the daemon.
@@ -64,7 +77,7 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
 | Allow / Deny from the notch | ✓ | ✓ | ✓ | – | ✓ (unverified) | ✓ | opt-in (`SUSHI_PI_APPROVE=1`) |
 | Questions and plans | ✓ | – | – | – | – | – | – |
 | Context size and tokens | ✓ | – | – | – | – | – | – |
-| Plan limits (5 h / weekly) | ✓ | – | – | – | – | – | – |
+| Plan limits (5 h / weekly or monthly quota) | ✓ | ✓ (ChatGPT login) | ✓ (undocumented) | ✓ (unverified) | – | – | – |
 | Built-in chat | ✓ | ✓ (read-only sandbox, not tool-free) | ✓ | – | – | – | ✓ |
 | Connected through | hooks in `~/.claude/settings.json` | hooks in `~/.codex/hooks.json` | hook file `~/.copilot/hooks/sushi.json` | group in `~/.gemini/config/hooks.json` | hooks in `~/.gemini/settings.json` | plugin in `~/.config/opencode/plugins/` | extension in `~/.pi/agent/extensions/` |
 
@@ -90,6 +103,29 @@ What has been checked against the real thing:
   `docs/hooks/reference.md`; whether `BeforeTool`'s `"allow"` really skips its own confirmation
   prompt is unverified, unlike Antigravity's confirmed bug — see `src/agent/gemini.rs`) have only
   been tested against their documented payloads.
+
+Plan limits (`src/limits/`) are a separate, undocumented-API-per-agent problem from the hook payloads above, so
+their own confidence levels, from most to least certain:
+
+- **Claude Code** (`limits/claude.rs`): Anthropic's own OAuth usage endpoint, the same one Claude Code itself
+  calls — the reference, like everywhere else in this list.
+- **Codex** (`limits/codex.rs`): verified by reading the open-source `codex-rs` client's own source
+  (`backend-client/src/client.rs`, `client/rate_limit_resets.rs`, the `codex-backend-openapi-models` crate) for
+  the endpoint and every field name, and cross-checked against `steipete/CodexBar`'s independent notes — but
+  never run against a real ChatGPT-login account. Only works when logged in with a ChatGPT account, not an API
+  key (which has no plan window at all).
+- **GitHub Copilot** (`limits/copilot.rs`): GitHub documents none of this. The endpoint and field names come
+  from cross-checking a public quota-tracking gist against `steipete/CodexBar`'s notes, not from anything
+  GitHub ships. The bigger uncertainty is the token: Copilot CLI's own OAuth token usually lives in the OS
+  keychain, not a file Sushi can read portably, so it is taken from (in order) `COPILOT_GITHUB_TOKEN` /
+  `GH_TOKEN` / `GITHUB_TOKEN`, the `gh` CLI's `hosts.yml`, the macOS Keychain entry `copilot-cli`, and finally
+  Copilot CLI's own plaintext fallback (`~/.copilot/config.json`, used when no keychain is available). If none
+  of those holds a usable token, it is just unavailable.
+- **Antigravity** (`limits/antigravity.rs`): the least certain of the four. Antigravity reuses Google's internal
+  Cloud Code Assist backend, and everything here — endpoint, request body, field names, credentials file —
+  comes from `steipete/CodexBar`'s reverse-engineered provider notes, whose own issue tracker shows this has
+  broken across `agy` versions before (a required client header changed, a local CSRF token got enforced).
+  Untested against a live account.
 
 Expect to adjust a field or two if a version differs: please open an issue with what it sent.
 
@@ -222,8 +258,8 @@ cargo install tauri-cli --locked        # once, to make an installer
 cd app/src-tauri && cargo tauri build   # .app / .dmg, .msi / .exe, .deb / .AppImage (just bundle)
 ```
 
-- **Linux** needs the web view libraries (Debian/Ubuntu: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev`;
-  Arch: `webkit2gtk-4.1 libayatana-appindicator`). The always-on-top pet window and a transparent background need
+- **Linux** needs the web view libraries (Debian/Ubuntu: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev libgtk-layer-shell-dev`;
+  Arch: `webkit2gtk-4.1 libayatana-appindicator gtk-layer-shell`). The always-on-top pet window and a transparent background need
   X11 or a compositor that allows them; on GNOME / Wayland the window behaves like a normal one, and the tray
   icon needs the AppIndicator extension.
 - **Tiling compositors** (niri and the like): the pet window is sized for what it can show before it opens and
@@ -268,11 +304,11 @@ then `enable` (Noctalia caches the scripts), or `just plugin-reload`.
 | Where | What |
 |---|---|
 | Bar widget (Noctalia) / pet window (app) | the pet, the turn timer, files changed, the 5-hour plan usage; the tooltip has the full progress of the active session. Left click opens the panel, right click pets it; in the app, double click also naps or wakes it, and holding the right click longer gives it a bigger cuddle. **Feeding a file:** in the app, drop it on the pet window (or on the panel), or copy it in the file manager and **middle-click** the pet. Noctalia cannot take a file dragged from a file manager onto the bar at all, so there copying it and **middle-clicking** (or "Feed a file" in the panel) is the only way. |
-| Panel · Live | steps on the left, viewer on the right. Click a step to look at it, click a session to pin it. |
+| Panel · Live | steps on the left, viewer on the right. Click a step to look at it, click a session to pin it. The search box above the rail queries that session's full stored history, not just the last few steps; the flag glyph on a step marks it "needs review" (sticks around after a restart); the export glyph writes the session (or the current search results) as markdown. |
 | Panel · Chat | type and press Enter. Stop and "new conversation" buttons at the bottom. A file fed to the pet shows above the field (✕ to drop it) and goes with the next message; the "Feed a file" button next to the emotes takes the file copied in the file manager. |
-| Panel · Usage | limits, context trend, tokens. |
+| Panel · Usage | limits, context trend, tokens, a day-by-day cost chart, and a budget bar per configured project (`budget_alerts_by_cwd`). |
 | Keybinding | `noctalia msg plugin scanna/sushi:state all tab chat` then `noctalia msg panel-open scanna/sushi:panel` opens the panel on a tab (`live`, `chat`, `usage`). `noctalia msg plugin scanna/sushi:state all feed /path/to/file` feeds the pet a file (handy as a file manager action). |
-| CLI | `sushi chat "what does it do?" --file src/main.rs` asks the chat about a file. |
+| CLI | `sushi chat "what does it do?" --file src/main.rs` asks the chat about a file; `sushi history SESSION_ID [--query TEXT]`, `sushi flag SESSION_ID STEP_ID on\|off [--note TEXT]`, `sushi export SESSION_ID [--query TEXT]` work the same steps the panel does. |
 
 ## Settings
 
@@ -298,6 +334,7 @@ The daemon reads an optional `~/.config/sushi/config.json`:
   "whisper_path": "whisper-cli",
   "model_prices": { "claude-sonnet": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 } },
   "budget_alerts": { "plan_percent": [80, 95], "daily_tokens": 0, "daily_cost_usd": 0, "daily_percent": [80, 95] },
+  "budget_alerts_by_cwd": { "/home/me/big-repo": { "daily_cost_usd": 5, "daily_percent": [80, 95] } },
   "hooks": {
     "on_session_start": { "cmd": "", "url": "" },
     "on_session_end": { "cmd": "", "url": "" },
@@ -324,7 +361,11 @@ shown in the Usage tab — Anthropic's published list prices by default, overrid
 is always an estimate, never a billed amount. `budget_alerts` raises a one-shot event (a distinct sound, a
 worried blip) the first time a threshold is crossed: `plan_percent` against Claude's 5-hour/weekly windows,
 `daily_tokens` / `daily_cost_usd` (0 = disabled) against everything tracked today, checked against
-`daily_percent`.
+`daily_percent`. `budget_alerts_by_cwd` repeats the daily checks **per project**, keyed by the exact `cwd` a
+session reports (no entry = no check for that project, never silently falling back to the global one); the
+real per-day cost behind both (no more blending an all-time rate against today's token count) is kept in
+`usage_history` (`~/.cache/sushi/usage_history.json`), which is also where the Usage tab's day-by-day chart
+reads from.
 
 `hooks` runs `cmd` (with `SUSHI_EVENT`, `SUSHI_AGENT`, `SUSHI_SESSION_ID`, `SUSHI_SESSION_NAME`, `SUSHI_CWD`,
 `SUSHI_STATUS` in its environment) and/or POSTs a small JSON body to `url`, fire-and-forget in their own
@@ -361,6 +402,11 @@ you will see the flag in the Live tab, but the tool call already ran.
 - **Code in the viewer**: diffs, command output and file excerpts are published in
   `$XDG_RUNTIME_DIR/sushi/state.json`, readable only by you and cleared on logout. Set
   `"show_code": false` to publish titles only.
+- **The durable step history** (search, flags, export — `~/.cache/sushi/history.json`) keeps the
+  same bounded diffs/output as the viewer, just for longer: beyond the current turn and beyond
+  the session ending, capped at 500 steps per session and 200 sessions. It respects `show_code`
+  the same way (nothing but titles when it's off), and an export writes a markdown file of it to
+  `~/.cache/sushi/exports/` — both readable only by you, neither ever sent anywhere.
 - **Plan limits** use the OAuth token Claude Code stores in `~/.claude/.credentials.json`, sent only to
   `api.anthropic.com` (through `curl`, never on a command line). The endpoint is undocumented and may change.
 - **The chat** runs the chosen agent headless with no tools (Claude Code: `--tools ""` and no MCP servers;

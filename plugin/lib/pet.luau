@@ -607,12 +607,15 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
             self.equipped = care.equipped
         end
 
-        local lim
+        local high = false
         for _, a in pairs((snap and snap.agents) or {}) do
-            if a.limits and a.limits.data then lim = a.limits.data end
+            local lim = a.limits and a.limits.data
+            if lim and ((lim.five_hour and lim.five_hour.percent or 0) >= 90
+                or (lim.seven_day and lim.seven_day.percent or 0) >= 90) then
+                high = true
+                break
+            end
         end
-        local high = lim and ((lim.five_hour and lim.five_hour.percent or 0) >= 90
-            or (lim.seven_day and lim.seven_day.percent or 0) >= 90)
         local full = active and active.context and (active.context.percent or 0) >= 90
         local chatBusy = (snap and snap.chat and snap.chat.busy) == true
         if pending > 0 then mood = "alert"

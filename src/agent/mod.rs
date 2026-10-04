@@ -84,14 +84,19 @@ impl Agent {
         match self {
             Agent::Claude => Capabilities { approve: true, questions: true, plans: true, context: true, limits: true, chat: true },
             // The chat needs a way to run the agent headless without tools (see `chat.rs`).
-            Agent::Codex | Agent::Pi | Agent::Copilot => Capabilities { chat: true, ..basic },
+            // Codex and Copilot also get plan usage (see `limits::codex` / `limits::copilot`);
+            // pi has no known usage endpoint.
+            Agent::Codex | Agent::Copilot => Capabilities { chat: true, limits: true, ..basic },
+            Agent::Pi => Capabilities { chat: true, ..basic },
             // Antigravity is watched only: a hook cannot approve (see `antigravity.rs`), and its
-            // headless mode has no tool-free option for the chat.
+            // headless mode has no tool-free option for the chat. Plan usage (`limits::antigravity`)
+            // is the one thing it does get, reusing Google's Cloud Code Assist backend.
             Agent::Opencode => basic,
-            Agent::Antigravity => Capabilities { approve: antigravity::ASK_FROM_NOTCH, ..basic },
+            Agent::Antigravity => Capabilities { approve: antigravity::ASK_FROM_NOTCH, limits: true, ..basic },
             // Gemini CLI: see `gemini.rs` for why `approve` is a documentation-only reading (no
             // real install was tested, unlike Antigravity's confirmed bug) and `context`/`chat`
-            // stay off (no confirmed transcript schema, no tool-free headless mode).
+            // stay off (no confirmed transcript schema, no tool-free headless mode). No known
+            // usage endpoint either.
             Agent::Gemini => basic,
         }
     }
@@ -401,15 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_has_the_extras() {
+    fn only_claude_has_questions_and_plans() {
         assert!(Agent::Claude.capabilities().chat && Agent::Claude.capabilities().limits);
         assert!(!Agent::Antigravity.capabilities().approve, "watched only");
         for a in [Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot, Agent::Gemini] {
             let c = a.capabilities();
-            assert!(c.approve && !c.limits && !c.context && !c.questions && !c.plans);
+            assert!(c.approve && !c.context && !c.questions && !c.plans);
         }
         assert!(!Agent::Opencode.capabilities().chat && Agent::Copilot.capabilities().chat);
         assert!(!Agent::Antigravity.capabilities().chat && !Agent::Gemini.capabilities().chat);
+    }
+
+    #[test]
+    fn limits_are_reported_only_for_agents_with_a_known_usage_endpoint() {
+        for a in [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Antigravity] {
+            assert!(a.capabilities().limits, "{a:?} should report plan usage");
+        }
+        for a in [Agent::Opencode, Agent::Pi, Agent::Gemini] {
+            assert!(!a.capabilities().limits, "{a:?} has no known usage endpoint");
+        }
     }
 
     #[test]

@@ -107,10 +107,18 @@ export function activeSession(snap) {
 /** Label of an agent ("Claude Code", "pi"...) from the snapshot's `agents`. */
 export const agentLabel = (snap, id) => snap?.agents?.[id]?.label || String(id ?? "agent");
 
-/** Plan limits ({ data, error }) of the agent that has them, or null. */
+/** Plan limits ({ id, label, data, error }) of every agent that reports them (Claude Code,
+ *  Codex, Copilot, Antigravity today — see `agent::Capabilities::limits`). */
+export function allLimits(snap) {
+  const out = [];
+  for (const [id, a] of Object.entries(snap?.agents || {})) if (a.limits) out.push({ id, label: a.label, ...a.limits });
+  return out;
+}
+
+/** Plan limits ({ data, error }) of the first agent that has them, or null — for spots that show
+ *  a single number and don't need to tell agents apart. */
 export function limits(snap) {
-  for (const a of Object.values(snap?.agents || {})) if (a.limits) return a.limits;
-  return null;
+  return allLimits(snap)[0] || null;
 }
 
 /** Does any agent offer the built-in chat? (Assumed yes when the snapshot does not say.) */
@@ -195,6 +203,13 @@ export function changesText(a) {
 export function commandsText(a) {
   if (!a || !(a.commands > 0)) return null;
   return `${a.commands} run` + (a.failures > 0 ? ` · ${a.failures} failed` : "");
+}
+
+/** `{ day, tokens, estimated_cost_usd }` entries of `usage_history.by_day`, oldest first, capped
+ *  to the most recent `max` days — for the Usage tab's day-by-day bar row (see src/usage_history.rs). */
+export function byDaySeries(usageHistory, max = 14) {
+  const byDay = usageHistory?.by_day || {};
+  return Object.keys(byDay).sort().slice(-max).map((day) => ({ day, ...byDay[day] }));
 }
 
 /** Tooltip rows describing the active session's progress: [{key, value}]. */

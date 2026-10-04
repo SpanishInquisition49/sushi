@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Tokens {
     pub input: u64,
     pub output: u64,
@@ -53,6 +53,11 @@ struct FileUsage {
     last_context: Option<Context>,
     /// Prompt size of each main-thread request, oldest first (one point per request).
     ctx_history: Vec<(String, u64)>,
+    /// The project directory this transcript belongs to, read straight off its own lines (the
+    /// same `cwd` field the hook payloads carry) — not threaded in from a live `Session`, so
+    /// per-project budgets (see `Config::budget_alerts_by_cwd`) work the same whether the
+    /// session is still open or this file was only found by the startup scan.
+    cwd: Option<String>,
 }
 
 const CTX_HISTORY_MAX: usize = 400;
@@ -74,6 +79,8 @@ struct Parsed {
     key: String,
     entry: Entry,
     sidechain: bool,
+    /// The transcript's own `cwd` field, when this line carries one (not every line does).
+    cwd: Option<String>,
 }
 
 fn parse_line(line: &str) -> Option<Parsed> {
@@ -93,6 +100,7 @@ fn parse_line(line: &str) -> Option<Parsed> {
     Some(Parsed {
         key,
         sidechain: v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false),
+        cwd: v.get("cwd").and_then(Value::as_str).map(str::to_string),
         entry: Entry {
             day,
             model: msg.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string(),
@@ -127,6 +135,9 @@ impl UsageStore {
         let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return };
         for line in buf[..end].split(|&b| b == b'\n') {
             if let Some(p) = std::str::from_utf8(line).ok().and_then(parse_line) {
+                if let Some(cwd) = p.cwd {
+                    fu.cwd = Some(cwd);
+                }
                 if !p.sidechain {
                     let t = &p.entry.tokens;
                     let tokens = t.input + t.cache_read + t.cache_write;
@@ -173,16 +184,52 @@ impl UsageStore {
     }
 
     pub fn summary(&self, today: &str) -> UsageSummary {
+        self.summary_filtered(today, None)
+    }
+
+    /// Same as `summary`, scoped to transcripts whose captured `cwd` matches exactly (see
+    /// `Config::budget_alerts_by_cwd`) — a project with no matching transcript yet gets an
+    /// all-zero summary, not an error.
+    pub fn summary_for_cwd(&self, cwd: &str, today: &str) -> UsageSummary {
+        self.summary_filtered(today, Some(cwd))
+    }
+
+    fn summary_filtered(&self, today: &str, cwd: Option<&str>) -> UsageSummary {
         let mut s = UsageSummary::default();
-        for e in self.files.values().flat_map(|fu| fu.requests.values()) {
-            s.total.add(&e.tokens);
-            s.by_day.entry(e.day.clone()).or_default().add(&e.tokens);
-            s.by_model.entry(e.model.clone()).or_default().add(&e.tokens);
-            if e.day == today {
-                s.today.add(&e.tokens);
+        for fu in self.files.values() {
+            if let Some(want) = cwd
+                && fu.cwd.as_deref() != Some(want)
+            {
+                continue;
+            }
+            for e in fu.requests.values() {
+                s.total.add(&e.tokens);
+                s.by_day.entry(e.day.clone()).or_default().add(&e.tokens);
+                s.by_model.entry(e.model.clone()).or_default().add(&e.tokens);
+                if e.day == today {
+                    s.today.add(&e.tokens);
+                }
             }
         }
         s
+    }
+
+    /// The real cost of one day (optionally scoped to `cwd`), bucketing that day's tokens by
+    /// model instead of blending an all-time cost-per-token rate against today's token count —
+    /// see `main.rs`'s `check_budget_alerts` and `usage_history.rs`.
+    pub fn day_cost(&self, day: &str, cwd: Option<&str>, prices: &HashMap<String, ModelPrice>) -> f64 {
+        let mut by_model: HashMap<String, Tokens> = HashMap::new();
+        for fu in self.files.values() {
+            if let Some(want) = cwd
+                && fu.cwd.as_deref() != Some(want)
+            {
+                continue;
+            }
+            for e in fu.requests.values().filter(|e| e.day == day) {
+                by_model.entry(e.model.clone()).or_default().add(&e.tokens);
+            }
+        }
+        by_model.iter().map(|(model, tokens)| prices.iter().find(|(p, _)| model.starts_with(p.as_str())).map(|(_, p)| p.cost(tokens)).unwrap_or(0.0)).sum()
     }
 }
 
@@ -305,6 +352,12 @@ pub struct Config {
     /// USD / 1M tokens per model, for the estimated cost shown in the Usage tab.
     pub model_prices: HashMap<String, ModelPrice>,
     pub budget_alerts: BudgetAlerts,
+    /// Per-project budgets, keyed by the exact `cwd` a session reports (see `sushi::sessions`):
+    /// same shape and "0 = disabled" convention as `budget_alerts`, but scoped to transcripts
+    /// whose own `cwd` matches that key — useful when working across several repos with very
+    /// different costs. A project not listed here has no budget check at all (not silently the
+    /// global one).
+    pub budget_alerts_by_cwd: HashMap<String, BudgetAlerts>,
     pub hooks: Hooks,
     pub claude_permissions: ClaudePermissions,
     /// Cross-agent visibility rules (see `policy.rs`): flag a matching tool call in the live
@@ -327,6 +380,7 @@ impl Default for Config {
             whisper_path: "whisper-cli".into(),
             model_prices: default_model_prices(),
             budget_alerts: BudgetAlerts::default(),
+            budget_alerts_by_cwd: HashMap::new(),
             hooks: Hooks::default(),
             claude_permissions: ClaudePermissions::default(),
             policies: Vec::new(),
@@ -496,6 +550,28 @@ mod tests {
         assert_eq!(small.len(), 10);
         assert_eq!((small[0], small[9]), (0, 990));
         assert!(small.windows(2).all(|w| w[0] <= w[1]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cwd_is_captured_from_the_transcript_lines_and_scopes_summary_and_day_cost() {
+        let dir = std::env::temp_dir().join(format!("sushi-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","cwd":"/home/u/proj-a","requestId":"r1","timestamp":"2026-10-01T10:00:00Z","message":{{"model":"claude-sonnet-5","usage":{{"input_tokens":1000000,"output_tokens":0}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+        let mut store = UsageStore::default();
+        store.refresh(&path);
+        assert_eq!(store.summary_for_cwd("/home/u/proj-a", "2026-10-01").today.input, 1_000_000);
+        assert_eq!(store.summary_for_cwd("/home/u/other", "2026-10-01").today.total(), 0, "no transcript tagged with that cwd");
+        let prices = default_model_prices();
+        assert!((store.day_cost("2026-10-01", Some("/home/u/proj-a"), &prices) - 3.0).abs() < 1e-9);
+        assert_eq!(store.day_cost("2026-10-01", Some("/home/u/other"), &prices), 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

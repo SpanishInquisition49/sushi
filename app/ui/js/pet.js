@@ -473,9 +473,11 @@ export class Pet {
         this.equipped = snap.care.equipped || null;
       }
 
-      let lim = null;
-      for (const a of Object.values(snap?.agents || {})) if (a.limits?.data) lim = a.limits.data;
-      const high = lim && ((lim.five_hour?.percent || 0) >= 90 || (lim.seven_day?.percent || 0) >= 90);
+      let high = false;
+      for (const a of Object.values(snap?.agents || {})) {
+        const lim = a.limits?.data;
+        if (lim && ((lim.five_hour?.percent || 0) >= 90 || (lim.seven_day?.percent || 0) >= 90)) { high = true; break; }
+      }
       const full = active?.context && (active.context.percent || 0) >= 90;
       const chatBusy = snap?.chat?.busy === true;
       if (pending > 0) mood = "alert";
