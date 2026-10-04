@@ -45,6 +45,16 @@ pub enum Request {
     ChatClear,
     /// Answer a question: `answers` maps each question text to the chosen label.
     Answer { id: u64, answers: Value },
+    /// Tamagotchi care actions (see `sushi::care::Care`): feed raises hunger, pet raises
+    /// affection, nap is a one-shot "sent for a nap" energy boost.
+    CareFeed,
+    CarePet,
+    CareNap,
+    /// A finished mini-game round; `score` is 0..=100.
+    CarePlay { score: u32 },
+    CareBuy { id: String },
+    /// Equip `id`, or `""` to go bare.
+    CareEquip { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

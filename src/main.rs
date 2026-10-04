@@ -1,16 +1,20 @@
-use sushi::agent::{Agent, EventKind, Role};
+use sushi::agent::{Agent, AgentEvent, EventKind, Role};
+use sushi::care::{self, Care};
 use sushi::chat::{self, Chat};
 use sushi::install;
 use sushi::detail::{self, Detail};
 use sushi::limits::{self, FetchError, Limits};
 use sushi::paths::{claude_dir, config_path, socket_path, state_dir, state_path};
 use sushi::protocol::{Decision, Reply, Request};
-use sushi::sessions::{Sessions, Status};
-use sushi::usage::{Config, UsageStore, utc_day};
+use sushi::sessions::{Session, Sessions, Status, session_key};
+use sushi::stats::Stats;
+use sushi::usage::{Config, HookAction, UsageStore, utc_day};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use sushi::ipc::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -72,6 +76,10 @@ struct Pending {
 /// Plans left to the terminal are dropped after this long (no hook is waiting to give up).
 const PLAN_TTL_MS: u64 = 30 * 60 * 1000;
 
+/// One-shot events the pet should notice once (not a continuous state like `status`):
+/// `budget_alert`, `milestone`, `grew_up`. Capped so `state.json` cannot grow without bound.
+const EVENTS_MAX: usize = 20;
+
 #[derive(Default)]
 struct State {
     sessions: Sessions,
@@ -86,6 +94,18 @@ struct State {
     chat: Chat,
     /// Connections that asked to watch the state: each change is written to them at once.
     watchers: Vec<UnixStream>,
+    stats: Stats,
+    /// Set after a change to `stats`, so it is saved to disk at most once per housekeeping tick.
+    stats_dirty: bool,
+    care: Care,
+    /// Set after a change to `care` (a care action, or decay/currency in `housekeeping`), so it
+    /// is saved to disk at most once per housekeeping tick.
+    care_dirty: bool,
+    /// Recent one-shot events (see `EVENTS_MAX`), newest last.
+    events: Vec<Value>,
+    next_event_id: u64,
+    /// Budget thresholds already raised, so each one fires only once (see `check_budget_alerts`).
+    alerted: HashSet<String>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -150,14 +170,166 @@ impl State {
                 (a.id().to_string(), v)
             })
             .collect();
+        // Token usage, comparative across agents: only Claude's transcripts are ever read today (see
+        // `agent::Capabilities::context`), so every other agent is honestly "not available yet"
+        // rather than fabricated.
+        let today = utc_day(now_ms());
+        let claude_summary = self.usage.summary(&today);
+        let usage: serde_json::Map<String, Value> = Agent::ALL
+            .into_iter()
+            .map(|a| {
+                let v = if a.capabilities().context {
+                    let mut sv = serde_json::to_value(&claude_summary).unwrap_or(Value::Null);
+                    sv["estimated_cost_usd"] = json!(claude_summary.estimated_cost(&self.config.model_prices));
+                    sv["available"] = json!(true);
+                    sv
+                } else {
+                    json!({ "available": false })
+                };
+                (a.id().to_string(), v)
+            })
+            .collect();
         json!({
             "version": 2,
             "agents": agents,
             "sessions": sessions,
             "pending": pending,
-            "usage": { "claude": self.usage.summary(&utc_day(now_ms())) },
+            "usage": usage,
+            "stats": {
+                "streak_days": self.stats.streak(&today),
+                "total_sessions": self.stats.total_sessions,
+                "total_tool_calls": self.stats.total_tool_calls,
+                // The highest milestone ever reached under each track: an earned badge (see
+                // `Stats::highest_unlocked`), not a live gauge — it survives e.g. a broken streak.
+                "streak_badge": self.stats.highest_unlocked("streak:"),
+                "steps_badge": self.stats.highest_unlocked("tool_calls:"),
+            },
+            "care": {
+                "hunger": self.care.hunger, "energy": self.care.energy, "affection": self.care.affection,
+                "growth_tier": self.care.growth_tier(), "xp": self.care.xp, "currency": self.care.currency,
+                "owned": self.care.owned, "equipped": self.care.equipped,
+                // When each action next becomes available again (0 = available now), so the UI can
+                // grey out a button and count down instead of letting a spammed click do nothing
+                // silently (see `care::CARE_COOLDOWN_MS` / `PLAY_COOLDOWN_MS`).
+                "next_feed_ms": self.care.last_feed_ms.saturating_add(care::CARE_COOLDOWN_MS),
+                "next_pet_ms": self.care.last_pet_ms.saturating_add(care::CARE_COOLDOWN_MS),
+                "next_nap_ms": self.care.last_nap_ms.saturating_add(care::CARE_COOLDOWN_MS),
+                "next_play_ms": self.care.last_play_ms.saturating_add(care::PLAY_COOLDOWN_MS),
+            },
+            "events": self.events,
             "chat": self.chat.to_json(),
         })
+    }
+
+    /// Append a one-shot event (see `EVENTS_MAX`): `kind` plus whatever `extra` carries, stamped
+    /// with a fresh id and `now_ms`.
+    fn push_event(&mut self, kind: &str, now_ms: u64, mut extra: Value) {
+        self.next_event_id += 1;
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert("id".into(), json!(self.next_event_id));
+            obj.insert("kind".into(), json!(kind));
+            obj.insert("ts_ms".into(), json!(now_ms));
+        }
+        self.events.push(extra);
+        if self.events.len() > EVENTS_MAX {
+            self.events.remove(0);
+        }
+    }
+
+    /// Raise a `budget_alert` event for every configured threshold crossed since the last check
+    /// (plan limits, and the daily token/cost budgets if configured), each at most once per period.
+    fn check_budget_alerts(&mut self, now_ms: u64) {
+        let mut to_fire: Vec<(String, Value)> = Vec::new();
+        let cfg = &self.config.budget_alerts;
+        if let Some(lim) = &self.limits {
+            for (label, w) in [("five_hour", lim.five_hour.as_ref()), ("seven_day", lim.seven_day.as_ref())] {
+                if let Some(w) = w {
+                    for &t in &cfg.plan_percent {
+                        if w.percent >= t {
+                            let key = format!("{label}:{}:{}", t as i64, w.resets_at_ms.unwrap_or(0));
+                            if !self.alerted.contains(&key) {
+                                to_fire.push((key, json!({ "scope": label, "percent": w.percent, "threshold": t })));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let today = utc_day(now_ms);
+        let summary = self.usage.summary(&today);
+        let today_tokens = summary.today.total();
+        if cfg.daily_tokens > 0 && today_tokens > 0 {
+            let pct = today_tokens as f64 / cfg.daily_tokens as f64 * 100.0;
+            for &t in &cfg.daily_percent {
+                if pct >= t {
+                    let key = format!("daily_tokens:{today}:{}", t as i64);
+                    if !self.alerted.contains(&key) {
+                        to_fire.push((key, json!({ "scope": "daily_tokens", "percent": pct, "threshold": t })));
+                    }
+                }
+            }
+        }
+        if cfg.daily_cost_usd > 0.0 {
+            let total_tokens = summary.total.total();
+            if total_tokens > 0 {
+                let blended = summary.estimated_cost(&self.config.model_prices) / total_tokens as f64;
+                let today_cost = blended * today_tokens as f64;
+                let pct = today_cost / cfg.daily_cost_usd * 100.0;
+                for &t in &cfg.daily_percent {
+                    if pct >= t {
+                        let key = format!("daily_cost:{today}:{}", t as i64);
+                        if !self.alerted.contains(&key) {
+                            to_fire.push((key, json!({ "scope": "daily_cost", "percent": pct, "threshold": t })));
+                        }
+                    }
+                }
+            }
+        }
+        for (key, extra) in to_fire {
+            self.alerted.insert(key);
+            self.push_event("budget_alert", now_ms, extra);
+        }
+    }
+
+    /// Stats, external hooks and milestones triggered by `ev`. `prev` is the session as it was
+    /// just before `ev` was applied (so `SessionEnd`, which removes it, and the waiting-edge
+    /// check below still have something to read). Hooks are fire-and-forget: see `fire_hook`.
+    fn handle_side_effects(&mut self, agent: Agent, ev: &AgentEvent, prev: Option<&Session>, sid: &str, now_ms: u64) {
+        let today = utc_day(now_ms);
+        let mut milestones = Vec::new();
+        match &ev.kind {
+            EventKind::SessionStart => {
+                self.stats.total_sessions += 1;
+                self.stats.mark_day(&today);
+                self.stats_dirty = true;
+                milestones = self.stats.check_milestones(&today);
+                let hook = self.config.hooks.on_session_start.clone();
+                fire_hook(&hook, "session_start", agent, self.sessions.map.get(sid));
+            }
+            EventKind::SessionEnd => {
+                let hook = self.config.hooks.on_session_end.clone();
+                fire_hook(&hook, "session_end", agent, prev);
+            }
+            EventKind::ToolEnd { ok: true } => {
+                self.stats.total_tool_calls += 1;
+                self.stats_dirty = true;
+                milestones = self.stats.check_milestones(&today);
+            }
+            EventKind::Stop { .. } => {
+                let hook = self.config.hooks.on_turn_end.clone();
+                fire_hook(&hook, "turn_end", agent, self.sessions.map.get(sid));
+            }
+            _ => {}
+        }
+        let now_waiting = self.sessions.map.get(sid).map(|s| s.status) == Some(Status::Waiting);
+        let was_waiting = prev.map(|s| s.status) == Some(Status::Waiting);
+        if now_waiting && !was_waiting {
+            let hook = self.config.hooks.on_waiting.clone();
+            fire_hook(&hook, "waiting", agent, self.sessions.map.get(sid));
+        }
+        for (kind, value) in milestones {
+            self.push_event("milestone", now_ms, json!({ "type": kind, "value": value }));
+        }
     }
 
     /// Write `state.json` atomically when something changed, and at least every
@@ -208,6 +380,64 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
+/// A shell invocation of `cmd`, portable the same way `install::hook_command` already needs to be.
+fn shell_command(cmd: &str) -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    }
+}
+
+/// Run an external hook (see `usage::Hooks`): `action.cmd` with `SUSHI_*` env vars, and/or
+/// `action.url` posted a small JSON body via `curl`. Both fire-and-forget in their own thread —
+/// this never blocks the daemon, and a slow or failing script/endpoint is simply ignored.
+fn fire_hook(action: &HookAction, event: &'static str, agent: Agent, session: Option<&Session>) {
+    if action.cmd.is_empty() && action.url.is_empty() {
+        return;
+    }
+    let (sid, name, cwd, status) = session
+        .map(|s| (s.native_id.clone(), s.name.clone(), s.cwd.clone(), format!("{:?}", s.status).to_lowercase()))
+        .unwrap_or_default();
+    let agent_id = agent.id().to_string();
+    let cmd = action.cmd.clone();
+    let url = action.url.clone();
+    thread::spawn(move || {
+        if !cmd.is_empty() {
+            let mut c = shell_command(&cmd);
+            c.env("SUSHI_EVENT", event)
+                .env("SUSHI_AGENT", &agent_id)
+                .env("SUSHI_SESSION_ID", &sid)
+                .env("SUSHI_SESSION_NAME", &name)
+                .env("SUSHI_CWD", &cwd)
+                .env("SUSHI_STATUS", &status)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let _ = c.spawn();
+        }
+        if !url.is_empty() {
+            let body = json!({ "event": event, "agent": agent_id, "session_id": sid, "session_name": name, "cwd": cwd, "status": status }).to_string();
+            if let Ok(mut child) = Command::new("curl")
+                .args(["-sS", "--max-time", "5", "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", url.as_str()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(body.as_bytes());
+                }
+                let _ = child.wait();
+            }
+        }
+    });
+}
+
 fn peer_closed(stream: &mut UnixStream) -> bool {
     let _ = stream.set_nonblocking(true);
     let mut b = [0u8; 1];
@@ -235,7 +465,9 @@ fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: V
     let rx = {
         let mut st = lock(shared);
         let now = now_ms();
-        let sid = st.sessions.apply_event(&ev, now);
+        let prev = st.sessions.map.get(&session_key(agent, &ev.session_id)).cloned();
+        let policies = st.config.policies.clone();
+        let sid = st.sessions.apply_event(&ev, now, &policies);
         if let Some(path) = st.sessions.map.get(&sid).and_then(|s| s.transcript.clone()) {
             st.usage.refresh(&path);
         }
@@ -244,6 +476,7 @@ fn handle_hook(mut stream: UnixStream, shared: &Shared, agent: Agent, payload: V
             EventKind::ToolStart => st.drop_plans_for(&sid),
             _ => {}
         }
+        st.handle_side_effects(agent, &ev, prev.as_ref(), &sid, now);
         let rx = match (&ev.kind, &ev.tool) {
             (EventKind::PermissionRequest, tool) if st.sessions.map.contains_key(&sid) => {
                 st.next_id += 1;
@@ -355,6 +588,69 @@ fn resolve(shared: &Shared, id: u64, decide: impl FnOnce(&Pending) -> Result<Ver
     Reply::ok()
 }
 
+/// Run a care action that bumps a need + xp, saving the result and celebrating a growth tier
+/// crossing (if any) the same way a milestone is celebrated. `act` itself enforces the
+/// per-action cooldown (see `Care::CARE_COOLDOWN_MS`), so a too-soon click is refused here too.
+fn care_action(shared: &Shared, act: impl FnOnce(&mut Care, u64) -> Result<Option<u64>, &'static str>) -> Reply {
+    let mut st = lock(shared);
+    let now = now_ms();
+    st.care.decay(now);
+    match act(&mut st.care, now) {
+        Ok(tier) => {
+            st.care_dirty = true;
+            if let Some(t) = tier {
+                st.push_event("grew_up", now, json!({ "tier": t }));
+            }
+            st.publish();
+            Reply::ok()
+        }
+        Err(e) => Reply::err(e),
+    }
+}
+
+fn handle_care_play(shared: &Shared, score: u32) -> Reply {
+    let mut st = lock(shared);
+    let decayed = st.care.decay(now_ms());
+    if decayed {
+        st.care_dirty = true;
+    }
+    match st.care.play(score, now_ms()) {
+        Ok(tier) => {
+            st.care_dirty = true;
+            if let Some(t) = tier {
+                st.push_event("grew_up", now_ms(), json!({ "tier": t }));
+            }
+            st.publish();
+            Reply::ok()
+        }
+        Err(e) => Reply::err(e),
+    }
+}
+
+fn handle_care_buy(shared: &Shared, id: &str) -> Reply {
+    let mut st = lock(shared);
+    match st.care.buy(id) {
+        Ok(()) => {
+            st.care_dirty = true;
+            st.publish();
+            Reply::ok()
+        }
+        Err(e) => Reply::err(e),
+    }
+}
+
+fn handle_care_equip(shared: &Shared, id: &str) -> Reply {
+    let mut st = lock(shared);
+    match st.care.equip(id) {
+        Ok(()) => {
+            st.care_dirty = true;
+            st.publish();
+            Reply::ok()
+        }
+        Err(e) => Reply::err(e),
+    }
+}
+
 fn chat_dir() -> std::path::PathBuf {
     chat::cache_dir().join("chat")
 }
@@ -363,13 +659,25 @@ fn chat_file() -> std::path::PathBuf {
     chat::cache_dir().join("chat.json")
 }
 
+fn stats_file() -> std::path::PathBuf {
+    chat::cache_dir().join("stats.json")
+}
+
+fn care_file() -> std::path::PathBuf {
+    chat::cache_dir().join("care.json")
+}
+
 /// Start a chat turn in the background; the answer streams into the shared state. `agent` and
 /// `model` override the configured ones; `file` is a file fed with the message, whose content goes
 /// into the prompt (the log only keeps its name).
 fn chat_send(shared: &Shared, text: &str, model: Option<String>, agent: Option<String>, file: Option<String>) -> Reply {
     let text: String = text.trim().chars().take(chat::MAX_INPUT_CHARS).collect();
+    let (transcribe_model, whisper) = {
+        let st = lock(shared);
+        (st.config.transcribe_model_path.clone(), st.config.whisper_path.clone())
+    };
     let attachment = match file.filter(|f| !f.trim().is_empty()) {
-        Some(f) => match chat::read_attachment(std::path::Path::new(&f)) {
+        Some(f) => match chat::read_attachment(std::path::Path::new(&f), &transcribe_model, &whisper) {
             Ok(a) => Some(a),
             Err(e) => return Reply::err(e),
         },
@@ -500,6 +808,12 @@ fn handle_conn(mut stream: UnixStream, shared: Shared) {
             chat::stop(&slot); // the old turn, if any, ends on its own and is ignored
             write_reply(&mut stream, &Reply::ok());
         }
+        Ok(Request::CareFeed) => write_reply(&mut stream, &care_action(&shared, Care::feed)),
+        Ok(Request::CarePet) => write_reply(&mut stream, &care_action(&shared, Care::pet)),
+        Ok(Request::CareNap) => write_reply(&mut stream, &care_action(&shared, Care::nap_boost)),
+        Ok(Request::CarePlay { score }) => write_reply(&mut stream, &handle_care_play(&shared, score)),
+        Ok(Request::CareBuy { id }) => write_reply(&mut stream, &handle_care_buy(&shared, &id)),
+        Ok(Request::CareEquip { id }) => write_reply(&mut stream, &handle_care_equip(&shared, &id)),
         Err(e) => write_reply(&mut stream, &Reply::err(format!("bad request: {e}"))),
     }
 }
@@ -538,6 +852,21 @@ fn housekeeping(shared: Shared) {
             st.pending.retain(|p| {
                 live.contains(&p.session_id) && !(p.kind == Kind::Plan && now.saturating_sub(p.created_ms) > PLAN_TTL_MS)
             });
+            st.check_budget_alerts(now);
+            if st.stats_dirty {
+                st.stats.save(&stats_file());
+                st.stats_dirty = false;
+            }
+            let decayed = st.care.decay(now);
+            let total_tool_calls = st.stats.total_tool_calls;
+            let coins = st.care.accrue_currency(total_tool_calls);
+            if decayed || coins > 0 {
+                st.care_dirty = true;
+            }
+            if st.care_dirty {
+                st.care.save(&care_file());
+                st.care_dirty = false;
+            }
             st.publish();
         }
         thread::sleep(Duration::from_secs(2));
@@ -597,7 +926,13 @@ fn run_daemon() -> Result<(), String> {
     std::fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(|e| e.to_string())?;
 
     let config = Config::load(&config_path());
-    let mut state = State { config, chat: Chat::load(&chat_file()), ..State::default() };
+    let mut state = State {
+        config,
+        chat: Chat::load(&chat_file()),
+        stats: Stats::load(&stats_file()),
+        care: Care::load(&care_file()),
+        ..State::default()
+    };
     state.sessions.hide_code = !state.config.show_code;
     state.sessions.ignore_cwd = Some(chat_dir().to_string_lossy().into_owned());
     let shared: Shared = Arc::new(Mutex::new(state));
@@ -650,12 +985,26 @@ fn install_command(agents: &[Agent], write: bool) -> Result<(), String> {
             }
             println!("  Sessions that are already open pick it up after a restart.");
         }
+        // Claude Code is the only agent whose own permissions can really force a confirmation or a
+        // refusal (see policy.rs): merge `claude_permissions` from config.json alongside its hooks.
+        if agent == Agent::Claude {
+            let perms = Config::load(&config_path()).claude_permissions;
+            match install::install_permissions(&install::settings_path(), &perms, now) {
+                Ok((changed, _)) if !changed.is_empty() => {
+                    println!("  policy: merged {} into {}", changed.join(", "), install::settings_path().display());
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("  policy: {e}"),
+            }
+        }
     }
     Ok(())
 }
 
 fn usage() -> ! {
-    eprintln!("usage: sushi <daemon | state | approve ID [--accept-edits] | deny ID | answer ID JSON | chat [TEXT] [--file PATH] [--model M] [--agent A] | chat-stop | chat-clear | install [--agent claude|codex|opencode|pi|copilot|antigravity|all] [--write]>");
+    eprintln!(
+        "usage: sushi <daemon | state | approve ID [--accept-edits] | deny ID | answer ID JSON | chat [TEXT] [--file PATH] [--model M] [--agent A] | chat-stop | chat-clear | care feed|pet|nap | care play SCORE | care buy|equip ID | install [--agent claude|codex|opencode|pi|copilot|antigravity|gemini|all] [--write]>"
+    );
     std::process::exit(2)
 }
 
@@ -697,6 +1046,25 @@ fn main() {
         },
         ["chat-stop"] => client(&Request::ChatStop).map(|_| ()),
         ["chat-clear"] => client(&Request::ChatClear).map(|_| ()),
+        ["care", cmd @ ("feed" | "pet" | "nap")] => {
+            let req = match *cmd {
+                "feed" => Request::CareFeed,
+                "pet" => Request::CarePet,
+                _ => Request::CareNap,
+            };
+            client(&req).and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
+        }
+        ["care", "play", score] => match score.parse::<u32>() {
+            Ok(score) => client(&Request::CarePlay { score })
+                .and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) }),
+            Err(_) => usage(),
+        },
+        ["care", "buy", id] => {
+            client(&Request::CareBuy { id: id.to_string() }).and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
+        }
+        ["care", "equip", id] => {
+            client(&Request::CareEquip { id: id.to_string() }).and_then(|r| if r.ok { Ok(()) } else { Err(r.error.unwrap_or_default()) })
+        }
         [cmd @ ("approve" | "deny"), id, flags @ ..] if flags.is_empty() || (*cmd == "approve" && flags == ["--accept-edits"]) => match id.parse::<u64>() {
             Ok(id) => {
                 let req = if *cmd == "approve" { Request::Approve { id, accept_edits: !flags.is_empty() } } else { Request::Deny { id } };

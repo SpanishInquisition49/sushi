@@ -1,5 +1,5 @@
 --!nonstrict
--- lib/sounds.luau — loads the pet's 28 sounds (plugin/sounds/*.wav, made by
+-- lib/sounds.luau — loads the pet's sounds (plugin/sounds/*.wav, made by
 -- tools/make_sounds.py) and plays them by name. Noctalia allows at most 8 pending
 -- loads and one playback per name, and applies the user's global sound settings
 -- ([audio].enable_sounds / sound_volume) itself.
@@ -9,7 +9,8 @@ local S = {}
 S.NAMES = {
     "greeting", "hello", "happy", "love", "sad", "startled", "annoyed", "dizzy", "poke", "hop",
     "bounce", "wiggle", "squish", "yawn", "sneeze", "hiccup", "hum", "think", "wink", "blush",
-    "spin", "eat", "dance", "nap", "wake", "alert", "approve", "deny",
+    "spin", "eat", "dance", "nap", "wake", "alert", "approve", "deny", "budget", "milestone", "policy",
+    "coin", "levelup", "purchase",
 }
 
 local MAX_IN_FLIGHT = 4

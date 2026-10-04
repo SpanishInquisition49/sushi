@@ -3,6 +3,7 @@
 
 use crate::activity::Activity;
 use crate::agent::{Agent, AgentEvent, EventKind, Tool, antigravity};
+use crate::policy::{self, PolicyRule};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -65,6 +66,15 @@ pub struct Sessions {
     pub ignore_cwd: Option<String>,
 }
 
+/// Mark the step just pushed by `pre_tool` if `tool` matches a configured policy rule.
+fn tag_last_step(activity: &mut Activity, policies: &[PolicyRule], tool: &Tool) {
+    if let Some(tag) = policy::evaluate(policies, tool)
+        && let Some(last) = activity.recent.back_mut()
+    {
+        last.policy = Some(tag);
+    }
+}
+
 fn basename(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
@@ -111,8 +121,9 @@ impl Sessions {
         s
     }
 
-    /// Apply an event. Returns the key of the session it concerned.
-    pub fn apply_event(&mut self, ev: &AgentEvent, now_ms: u64) -> String {
+    /// Apply an event. Returns the key of the session it concerned. `policies` flags a matching
+    /// tool call for the live viewer (see `policy.rs`); pass `&[]` where this does not matter.
+    pub fn apply_event(&mut self, ev: &AgentEvent, now_ms: u64, policies: &[PolicyRule]) -> String {
         if ev.kind == EventKind::SessionEnd {
             let key = session_key(ev.agent, &ev.session_id);
             self.map.remove(&key);
@@ -148,15 +159,18 @@ impl Sessions {
                 if let Some(tool) = tool {
                     s.last_tool = Some(LastTool::of(tool));
                     s.activity.pre_tool(tool, now_ms, &cwd, show_code);
+                    tag_last_step(&mut s.activity, policies, tool);
                 }
             }
             (EventKind::PermissionRequest, tool) => {
                 s.status = Status::Waiting;
                 if let Some(tool) = tool {
                     s.last_tool = Some(LastTool::of(tool));
-                    // Antigravity has no separate "tool starts" event for the tools it asks about.
-                    if ev.agent == Agent::Antigravity {
+                    // Antigravity and Gemini have no separate "tool starts" event for the tools
+                    // they ask about: `PermissionRequest` is the only sighting of the call.
+                    if matches!(ev.agent, Agent::Antigravity | Agent::Gemini) {
                         s.activity.pre_tool(tool, now_ms, &cwd, show_code);
+                        tag_last_step(&mut s.activity, policies, tool);
                     }
                 }
             }
@@ -235,7 +249,7 @@ mod tests {
 
     /// Feed a Claude-style payload, as the hook would.
     fn feed(s: &mut Sessions, agent: Agent, v: &Value, now: u64) -> Option<String> {
-        agent.normalize(v).map(|ev| s.apply_event(&ev, now))
+        agent.normalize(v).map(|ev| s.apply_event(&ev, now, &[]))
     }
 
     #[test]
@@ -299,6 +313,23 @@ mod tests {
         n["notification_type"] = json!("idle_prompt");
         feed(&mut s, Agent::Claude, &n, 2);
         assert_eq!(s.map["claude:a"].status, Status::Idle);
+    }
+
+    #[test]
+    fn a_matching_policy_tags_the_step() {
+        let mut s = Sessions::default();
+        let rules = vec![PolicyRule { tool: "Bash".into(), contains: "rm -rf".into(), level: "ask".into(), label: "destructive delete".into() }];
+        let v = json!({"session_id": "a", "cwd": "/p", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}});
+        let ev = Agent::Claude.normalize(&v).unwrap();
+        s.apply_event(&ev, 1, &rules);
+        let tag = s.map["claude:a"].activity.recent.back().unwrap().policy.as_ref().unwrap();
+        assert_eq!((tag.level.as_str(), tag.label.as_str()), ("ask", "destructive delete"));
+
+        // A harmless command is not tagged.
+        let v2 = json!({"session_id": "a", "cwd": "/p", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}});
+        let ev2 = Agent::Claude.normalize(&v2).unwrap();
+        s.apply_event(&ev2, 2, &rules);
+        assert!(s.map["claude:a"].activity.recent.back().unwrap().policy.is_none());
     }
 
     #[test]

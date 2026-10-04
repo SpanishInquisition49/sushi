@@ -9,7 +9,7 @@
 
 An animated pet that keeps an eye on your coding agents inspired by [coucou](https://github.com/Louis-CFM/coucou). It runs as a **desktop app on macOS, Windows
 and Linux** (any desktop environment) and as a plugin for the [Noctalia](https://docs.noctalia.dev) shell (v5).
-It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity CLI**, **opencode** and **pi**, side by side.
+It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity CLI**, **Gemini CLI**, **opencode** and **pi**, side by side.
 
 - **Live**: every session, step by step. What the agent reads, edits and runs, as a rail of steps
   (✓ done, ◌ running, ✗ failed) and a viewer with the **diff of the file being edited** (line numbers,
@@ -26,23 +26,47 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
 - **Ask anything**: a built-in chat tab that runs one of your agents headless with no tools (Claude Code, Copilot, pi or
   Codex, your choice in the plugin settings).
 - **Feed it a file**: drop a file on the pet and it swallows it; the chat opens with the file attached, so the
-  next question is about it.
-- **Usage** (Claude Code only): plan limits (5-hour and weekly), context window trend, tokens today.
+  next question is about it. An audio file (wav, mp3, flac, ogg, m4a, aac, opus, wma) is transcribed first, with
+  [whisper.cpp](https://github.com/ggml-org/whisper.cpp) running fully offline — set `transcribe_model_path` to a
+  GGML/GGUF model to turn this on; the transcript is also kept next to the audio file as a `.txt`.
+- **Usage**: Claude Code's plan limits (5-hour and weekly) and context window trend, plus a token/estimated-cost
+  comparison across every agent — "not tracked yet" for the agents nothing reads transcripts for today, never a
+  fabricated number. **Budget alerts** (`budget_alerts` in `config.json`) raise a one-shot pet reaction (a
+  distinct sound and a worried blip) the moment a plan window or a daily token/cost budget crosses a configured
+  threshold.
+- **External hooks**: run a command and/or POST a small JSON body to a URL (`hooks` in `config.json`) when a
+  session starts or ends, starts waiting for you, or a turn finishes — e.g. kick off a build, a staging deploy,
+  or update an internal dashboard. Fire-and-forget: a slow or failing script never blocks the daemon.
+- **Policy flags**: configured rules (`policies` in `config.json`) flag a matching tool call (e.g. a `Bash`
+  command containing `rm -rf`) in the live viewer for every agent, even one it auto-approved. Real
+  enforcement — genuinely forcing Claude Code to ask or refuse — uses its own native `permissions.ask` /
+  `permissions.deny` instead (`claude_permissions` in `config.json`, merged in by `sushi install --agent claude
+  --write`): see [Policy flags vs. real enforcement](#policy-flags-vs-real-enforcement) for why the other agents
+  only get the flag, not the block.
+- **Focus mode**: a quiet, compact pet (no sounds, no idle fidgets, but the status badge stays visible) during
+  configured hours, or forced on/off with the moon button next to the pet's emotes (app only; the Noctalia
+  plugin follows the configured schedule).
 - **A pet with a personality**: 30 characters (nigiri, maki, ramen, bao, dango, sake, taiyaki, ramune…), breathing, blinking,
   eyes that glance at whatever you hover, 30+ emotes and idle quirks, a nap after a while, a greeting
-  on launch and 28 little sounds.
+  on launch and 31 little sounds. Each character also has its own temperament (energetic, calm, shy, fancy,
+  sleepy, cozy, feisty, classic…): it fidgets more or less often, leans toward a few favorite quirks, and
+  flavors a handful of lines ("Ha! Done!" for the feisty wasabi, "Finished, calmly." for the calm tofu).
+- **Milestones with accessories**: if you leave it on, a quiet day-streak counter and a step-watched counter
+  in the Usage tab, and the pet wears small permanent pins for the highest tier it has ever earned on each
+  track (bronze → silver → gold → platinum → diamond) — a flame for the streak, an award for steps watched.
+  They are earned badges, not a live gauge: breaking a streak does not take the pin away.
 
 ## Supported agents
 
-| | Claude Code | Codex CLI | GitHub Copilot | Antigravity CLI | opencode | pi |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|
-| Sessions, steps, diffs, command output | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Allow / Deny from the notch | ✓ | ✓ | ✓ | – | ✓ | opt-in (`SUSHI_PI_APPROVE=1`) |
-| Questions and plans | ✓ | – | – | – | – | – |
-| Context size and tokens | ✓ | – | – | – | – | – |
-| Plan limits (5 h / weekly) | ✓ | – | – | – | – | – |
-| Built-in chat | ✓ | ✓ (read-only sandbox, not tool-free) | ✓ | – | – | ✓ |
-| Connected through | hooks in `~/.claude/settings.json` | hooks in `~/.codex/hooks.json` | hook file `~/.copilot/hooks/sushi.json` | group in `~/.gemini/config/hooks.json` | plugin in `~/.config/opencode/plugins/` | extension in `~/.pi/agent/extensions/` |
+| | Claude Code | Codex CLI | GitHub Copilot | Antigravity CLI | Gemini CLI | opencode | pi |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Sessions, steps, diffs, command output | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Allow / Deny from the notch | ✓ | ✓ | ✓ | – | ✓ (unverified) | ✓ | opt-in (`SUSHI_PI_APPROVE=1`) |
+| Questions and plans | ✓ | – | – | – | – | – | – |
+| Context size and tokens | ✓ | – | – | – | – | – | – |
+| Plan limits (5 h / weekly) | ✓ | – | – | – | – | – | – |
+| Built-in chat | ✓ | ✓ (read-only sandbox, not tool-free) | ✓ | – | – | – | ✓ |
+| Connected through | hooks in `~/.claude/settings.json` | hooks in `~/.codex/hooks.json` | hook file `~/.copilot/hooks/sushi.json` | group in `~/.gemini/config/hooks.json` | hooks in `~/.gemini/settings.json` | plugin in `~/.config/opencode/plugins/` | extension in `~/.pi/agent/extensions/` |
 
 What has been checked against the real thing:
 
@@ -61,8 +85,11 @@ What has been checked against the real thing:
   `view_file`, the replace tools and the searches come from its documentation. No chat.
 - **pi**: the extension follows the docs shipped with pi 0.85 and was exercised against a stand-in for pi's API,
   not inside pi. The chat parser follows pi's JSON mode docs (the model configured here was offline).
-- **Codex** (hooks and `codex exec --json` as documented; the `apply_patch` shape is a best reading of the docs)
-  and **opencode** (plugin API as documented) have only been tested against their documented payloads.
+- **Codex** (hooks and `codex exec --json` as documented; the `apply_patch` shape is a best reading of the docs),
+  **opencode** (plugin API as documented) and **Gemini CLI** (hooks as documented in
+  `docs/hooks/reference.md`; whether `BeforeTool`'s `"allow"` really skips its own confirmation
+  prompt is unverified, unlike Antigravity's confirmed bug — see `src/agent/gemini.rs`) have only
+  been tested against their documented payloads.
 
 Expect to adjust a field or two if a version differs: please open an issue with what it sent.
 
@@ -106,7 +133,7 @@ by an older Sushi give `PermissionRequest` 40 s: run `sushi install --write` aga
   launchd), or on Windows `schtasks /Create /SC ONLOGON /TN Sushi /TR "%USERPROFILE%\.cargo\bin\sushi.exe daemon"`.
 - At least one of: [Claude Code](https://claude.com/claude-code), [Codex CLI](https://github.com/openai/codex),
   [GitHub Copilot CLI](https://github.com/features/copilot/cli), [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) (`agy`),
-  [opencode](https://opencode.ai), [pi](https://pi.dev)
+  [Gemini CLI](https://github.com/google-gemini/gemini-cli), [opencode](https://opencode.ai), [pi](https://pi.dev)
 - Rust (`cargo`) to build the tool; `curl` (plan limits) and `systemd` (optional, for the user service)
 - [`just`](https://just.systems) (optional) for the shortcuts below
 
@@ -146,6 +173,7 @@ sushi install --agent claude --write     # hooks in ~/.claude/settings.json
 sushi install --agent codex --write      # hooks in ~/.codex/hooks.json
 sushi install --agent copilot --write    # hook file ~/.copilot/hooks/sushi.json
 sushi install --agent antigravity --write # group in ~/.gemini/config/hooks.json
+sushi install --agent gemini --write     # hooks in ~/.gemini/settings.json
 sushi install --agent opencode --write   # plugin in ~/.config/opencode/plugins/sushi.ts
 sushi install --agent pi --write         # extension in ~/.pi/agent/extensions/sushi.ts
 sushi install --agent all --write        # all of the above
@@ -180,8 +208,10 @@ the running one keeps the old code.
 
 ### 3. The desktop app (macOS, Windows, Linux)
 
-`app/` is a [Tauri](https://tauri.app) app: a small always-on-top **pet window** (click it to open the
-**panel**, drag it to move it, right click to pet it) and a **tray icon** to show or hide things and quit. It is
+`app/` is a [Tauri](https://tauri.app) app: a small always-on-top **pet window** (click it to poke it and open
+the **panel**, double click to nap or wake it up, drag it to move it, right click to pet it — hold it down
+longer for a bigger cuddle — middle click to feed it whatever a file manager's "Copy" put on the clipboard)
+and a **tray icon** to show or hide things and quit. It is
 the same pet and panel as the Noctalia plugin (Live, Chat, Usage, Allow / Deny, sounds), plus a Settings tab.
 It starts the daemon for you if none is running, so steps 1 and 2 are all it needs.
 
@@ -237,7 +267,7 @@ then `enable` (Noctalia caches the scripts), or `just plugin-reload`.
 
 | Where | What |
 |---|---|
-| Bar widget (Noctalia) / pet window (app) | the pet, the turn timer, files changed, the 5-hour plan usage; the tooltip has the full progress of the active session. Left click opens the panel, right click pets it. **Feeding a file:** in the app, drop it on the pet window (or on the panel). Noctalia cannot take a file dragged from a file manager onto the bar, so copy the file there and **middle-click** the pet. |
+| Bar widget (Noctalia) / pet window (app) | the pet, the turn timer, files changed, the 5-hour plan usage; the tooltip has the full progress of the active session. Left click opens the panel, right click pets it; in the app, double click also naps or wakes it, and holding the right click longer gives it a bigger cuddle. **Feeding a file:** in the app, drop it on the pet window (or on the panel), or copy it in the file manager and **middle-click** the pet. Noctalia cannot take a file dragged from a file manager onto the bar at all, so there copying it and **middle-clicking** (or "Feed a file" in the panel) is the only way. |
 | Panel · Live | steps on the left, viewer on the right. Click a step to look at it, click a session to pin it. |
 | Panel · Chat | type and press Enter. Stop and "new conversation" buttons at the bottom. A file fed to the pet shows above the field (✕ to drop it) and goes with the next message; the "Feed a file" button next to the emotes takes the file copied in the file manager. |
 | Panel · Usage | limits, context trend, tokens. |
@@ -247,7 +277,10 @@ then `enable` (Noctalia caches the scripts), or `just plugin-reload`.
 ## Settings
 
 In Noctalia's plugin settings: **character**, idle quirks, nap delay, **sounds**, widget details,
-close the panel after Allow / Deny, **chat agent** and chat model, and the path to the `sushi` binary.
+close the panel after Allow / Deny, **chat agent** and chat model, the path to the `sushi` binary,
+**focus mode** (enable it and set its hours/days) and whether **milestones** celebrate. The app has the
+same settings in its own Settings tab, plus a quick "Focus now" toggle next to the pet's emotes (the
+Noctalia plugin has no equivalent write-back, so there it only follows the configured schedule).
 
 The daemon reads an optional `~/.config/sushi/config.json`:
 
@@ -260,16 +293,68 @@ The daemon reads an optional `~/.config/sushi/config.json`:
   "chat_model": "sonnet",
   "chat_models": { "copilot": "auto" },
   "claude_path": "claude",
-  "agent_paths": { "pi": "/opt/pi/bin/pi" }
+  "agent_paths": { "pi": "/opt/pi/bin/pi" },
+  "transcribe_model_path": "/opt/whisper/ggml-base.en.bin",
+  "whisper_path": "whisper-cli",
+  "model_prices": { "claude-sonnet": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 } },
+  "budget_alerts": { "plan_percent": [80, 95], "daily_tokens": 0, "daily_cost_usd": 0, "daily_percent": [80, 95] },
+  "hooks": {
+    "on_session_start": { "cmd": "", "url": "" },
+    "on_session_end": { "cmd": "", "url": "" },
+    "on_waiting": { "cmd": "", "url": "" },
+    "on_turn_end": { "cmd": "notify-send Sushi 'turn finished'", "url": "https://example.com/hook" }
+  },
+  "policies": [
+    { "tool": "Bash", "contains": "rm -rf", "level": "ask", "label": "destructive delete" }
+  ],
+  "claude_permissions": { "ask": ["Bash(rm -rf*)"], "deny": [] }
 }
 ```
 
 `chat_agent` is the agent the chat talks to (`claude`, `copilot`, `pi` or `codex`; the plugin setting wins),
 `chat_model` is the model for Claude Code and `chat_models` the one per other agent (empty: the agent's default).
 `agent_paths` says where an executable is when it is not on the `PATH`. A conversation is with one agent:
-switching starts a new one.
+switching starts a new one. `transcribe_model_path` (empty by default: feeding audio is then refused like any
+other binary file) points `whisper-cli` at a [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+GGML/GGUF model to transcribe a fed audio file automatically; `whisper_path` says where that executable is
+when it is not on the `PATH` under its own name.
+
+`model_prices` (USD per million tokens, keyed by a prefix of the model id) drives the **estimated cost**
+shown in the Usage tab — Anthropic's published list prices by default, override a model if they drift; this
+is always an estimate, never a billed amount. `budget_alerts` raises a one-shot event (a distinct sound, a
+worried blip) the first time a threshold is crossed: `plan_percent` against Claude's 5-hour/weekly windows,
+`daily_tokens` / `daily_cost_usd` (0 = disabled) against everything tracked today, checked against
+`daily_percent`.
+
+`hooks` runs `cmd` (with `SUSHI_EVENT`, `SUSHI_AGENT`, `SUSHI_SESSION_ID`, `SUSHI_SESSION_NAME`, `SUSHI_CWD`,
+`SUSHI_STATUS` in its environment) and/or POSTs a small JSON body to `url`, fire-and-forget in their own
+thread: useful for triggering a build, a staging deploy, or updating an internal dashboard when an agent
+finishes or starts waiting for you. Neither ever blocks the daemon, and there is still no inbound listener
+besides the Unix socket.
+
+`policies` flags a matching tool call (`tool`: an exact name or `*`; `contains`: a case-insensitive substring
+of its command/path/url) in the live viewer, for every agent, with `level` ("ask" or "deny", display only
+here) and `label` shown as its tooltip. See [Policy flags vs. real enforcement](#policy-flags-vs-real-enforcement)
+for `claude_permissions`, the only way Sushi can make an agent genuinely ask or refuse something it would
+otherwise have auto-approved.
 
 Set `SUSHI_NO_LIMITS=1` to stop the daemon from asking for your plan limits.
+
+### Policy flags vs. real enforcement
+
+`policies` (above) only flags a step for you to notice — it changes nothing about what the agent does, for
+any agent. Actually forcing a confirmation or a refusal needs the agent's own permission engine, and today
+only Claude Code has one Sushi can reliably drive: its `permissions.ask` / `permissions.deny` lists (native
+syntax, e.g. `Bash(rm -rf*)`), which make Claude ask or refuse even when it would otherwise have
+auto-approved. `sushi install --agent claude --write` merges `claude_permissions.ask` / `.deny` from
+`config.json` into `~/.claude/settings.json`'s `permissions` block (existing entries are kept, nothing is
+ever removed) — run it again after changing `claude_permissions`.
+
+There is no equivalent for the other agents: inventing one would mean racing every single tool call against
+the daemon over the hook (new latency on every call, for a rule that might never match), and it still
+would not be reliable for Antigravity, whose hook already cannot force a decision either way (see its own
+note below). So for Codex, Copilot, Antigravity, opencode, pi and Gemini CLI, `policies` is visibility only:
+you will see the flag in the Live tab, but the tool call already ran.
 
 ## Privacy and costs
 
@@ -282,12 +367,13 @@ Set `SUSHI_NO_LIMITS=1` to stop the daemon from asking for your plan limits.
   Copilot: no tools available; pi: `--no-tools` and no extensions), using that agent's own login. It counts
   against its plan like any other session (a Copilot chat message is one premium request) and keeps its
   history in `~/.cache/sushi/`. Codex has no tool-free mode: its chat runs in a read-only sandbox, so it could
-  still read files. A fed file must be text: its content (up to 60,000 characters, 20,000 on Windows) goes into
-  the message, and the log keeps only its name.
+  still read files. A fed file must be text, or audio transcribed by `whisper-cli` running locally (see
+  `transcribe_model_path` above — nothing audio ever leaves the machine): its content (up to 60,000 characters,
+  20,000 on Windows) goes into the message, and the log keeps only its name.
 
 ## Sounds
 
-The 28 sounds in `plugin/sounds/` are synthesized by `tools/make_sounds.py` (standard library only).
+The 31 sounds in `plugin/sounds/` are synthesized by `tools/make_sounds.py` (standard library only).
 Run it again to regenerate them; `--check` only verifies them.
 
 ## Development

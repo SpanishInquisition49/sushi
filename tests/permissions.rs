@@ -454,6 +454,8 @@ fn the_state_declares_what_each_agent_can_do() {
     assert_eq!(s["agents"]["pi"]["capabilities"]["chat"], true);
     assert_eq!(s["agents"]["opencode"]["capabilities"]["chat"], false);
     assert_eq!(s["agents"]["antigravity"]["capabilities"]["approve"], false);
+    assert_eq!(s["agents"]["gemini"]["capabilities"]["approve"], true);
+    assert_eq!(s["agents"]["gemini"]["capabilities"]["chat"], false);
     assert!(s["agents"]["claude"].get("limits").is_some() && s["agents"]["codex"].get("limits").is_none());
 }
 
@@ -553,6 +555,53 @@ fn antigravity_is_watched_and_waits_only_in_the_pet() {
     assert_eq!(d.state()["sessions"][0]["status"], "working");
     assert!(a["recent"].as_array().unwrap().iter().any(|s| s["ok"] == true), "{a}");
     d.hook_for("antigravity", json!({"conversationId": "ag1", "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true})).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "idle");
+}
+
+/// Gemini CLI payloads, shaped as documented in `docs/hooks/reference.md`: snake_case, already
+/// close to Claude Code's (see `src/agent/gemini.rs`).
+fn gemini_event(name: &str, extra: Value) -> Value {
+    let mut v = json!({"hook_event_name": name, "session_id": "g1", "cwd": "/tmp/proj"});
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[test]
+fn gemini_only_waits_for_tools_that_ask_and_steps_are_followed_by_name() {
+    let d = Daemon::start("gemini");
+    d.hook_for("gemini", gemini_event("BeforeAgent", json!({}))).finish();
+    assert_eq!(d.state()["sessions"][0]["status"], "working");
+
+    // a read is just a step: `BeforeTool` never waits for it
+    let read = json!({"tool_name": "read_file", "tool_input": {"file_path": "/tmp/proj/a.rs"}});
+    let (out, took) = d.hook_for("gemini", gemini_event("BeforeTool", read.clone())).finish();
+    assert!(out.is_empty() && took < Duration::from_secs(2));
+    assert!(d.state()["pending"].as_array().unwrap().is_empty());
+    let mut read_done = read;
+    read_done["tool_response"] = json!({"llmContent": "hi"});
+    d.hook_for("gemini", gemini_event("AfterTool", read_done)).finish();
+
+    // a shell command is one Gemini's default approval mode asks about: it waits in the notch
+    let run = json!({"tool_name": "run_shell_command", "tool_input": {"command": "echo hi"}});
+    let hook = d.hook_for("gemini", gemini_event("BeforeTool", run.clone()));
+    let p = d.wait_for_pending();
+    assert_eq!(
+        (p["agent"].as_str(), p["tool_name"].as_str(), p["detail"]["type"].as_str()),
+        (Some("gemini"), Some("run_shell_command"), Some("terminal"))
+    );
+    assert!(d.cli(&["approve", &p["id"].to_string()]).0);
+    let (out, _) = hook.finish();
+    assert_eq!(serde_json::from_str::<Value>(out.trim()).unwrap(), json!({"decision": "allow"}));
+
+    let mut run_failed = run;
+    run_failed["tool_response"] = json!({"error": "exit 1"});
+    d.hook_for("gemini", gemini_event("AfterTool", run_failed)).finish();
+    let a = d.state()["sessions"][0]["activity"].clone();
+    assert_eq!((a["tool_calls"].as_u64(), a["failures"].as_u64()), (Some(2), Some(1)), "{a}");
+
+    d.hook_for("gemini", gemini_event("AfterAgent", json!({"response": "All done"}))).finish();
     assert_eq!(d.state()["sessions"][0]["status"], "idle");
 }
 

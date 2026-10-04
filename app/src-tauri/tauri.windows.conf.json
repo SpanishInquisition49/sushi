@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "windows-bin/sushi.exe": "./",
+      "windows-bin/sushi-hook.exe": "./"
+    }
+  }
+}

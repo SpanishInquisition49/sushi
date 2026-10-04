@@ -44,7 +44,7 @@ end
 do
     local moods = { "idle", "working", "alert", "sleep", "nap", "worried", "stuffed", "happy", "love", "sad", "annoyed", "dizzy", "startled",
         "wave", "greeting", "eat", "dance", "hop", "wiggle", "yawn", "peek", "squish", "wink", "blush", "sneeze", "hum", "think",
-        "spin", "bounce", "sip", "hiccup", "jiggle" }
+        "spin", "bounce", "sip", "hiccup", "jiggle", "budget_alert", "milestone", "policy_match", "grew_up" }
     local frames = 0
     for _, c in ipairs(Pet.CHARACTER_IDS) do
         for _, m in ipairs(moods) do
@@ -83,6 +83,22 @@ do
     assert(work.p.key == "badge" and none.p.key == "badge", "the badge slot is keyed")
     assert(work.p.width == none.p.width, "the badge slot keeps its width")
     print("badge slot: same kind, key and width with and without the bubble")
+end
+
+-- ── gamification accessories: pins stack in the same keyed slot, sizes stay sane ───────────
+do
+    local pet = new({ character = "ikura", fidgets = false, napAfterSec = 0, gamification = true })
+    pet.streakBadge, pet.stepsBadge = 3, 5 -- gold streak, diamond steps
+    pet.growthTier, pet.equipped = 2, "bow" -- tamagotchi care: a growth pin and an equipped accessory
+    local tree = pet:build(92, { room = 20, maxHeight = 124, margin = 20, badge = "work", badgeSlot = true, accessories = true })
+    check(tree, "accessories")
+    local slot = tree.c[2].c[1]
+    assert(slot.p.key == "badge" and #slot.c == 5, "status bubble + streak + steps + growth + accessory pins: " .. #slot.c)
+    -- Without opts.accessories the same pet shows no pins, same key and width.
+    local plain = pet:build(92, { room = 20, maxHeight = 124, margin = 20, badge = "work", badgeSlot = true })
+    local plainSlot = plain.c[2].c[1]
+    assert(plainSlot.p.key == "badge" and #plainSlot.c == 1 and plainSlot.p.width == slot.p.width, "accessories are opt-in, the slot stays the same size")
+    print("accessories: gamification + growth + equipped-accessory pins stack in the badge slot, sizes stay sane")
 end
 
 -- ── height budgets: the bar and the panel hero never overflow ──────────────────────────────
@@ -184,6 +200,98 @@ do
     print("mood: tool kinds, priorities, wave, eat chain, nap, events, chat, failures")
 end
 
+-- ── the daemon's one-shot event bus (budget alerts, milestones, policy flags) ───────────────
+do
+    local function snapWithEvents(events)
+        return { sessions = { { id = "a", status = "idle" } }, pending = {}, events = events }
+    end
+    local p = new()
+    -- Events already in the capped list on the very first snapshot are not replayed.
+    p:onSnapshot(snapWithEvents({ { id = 1, kind = "budget_alert" } }), true, 1e6)
+    assert(not p.override or p.override.mood ~= "budget_alert", "no replay on the first snapshot")
+    assert(p.lastSeenEventId == 1)
+    -- The same event seen again (unchanged list) does not retrigger.
+    p:onSnapshot(snapWithEvents({ { id = 1, kind = "budget_alert" } }), true, 1e6 + 100)
+    assert(not p.override or p.override.mood ~= "budget_alert", "an already-seen event id does not retrigger")
+    -- A genuinely new event triggers its mood once.
+    p:onSnapshot(snapWithEvents({ { id = 1, kind = "budget_alert" }, { id = 2, kind = "milestone" } }), true, 1e6 + 200)
+    assert(p.override and p.override.mood == "milestone", "a new event id triggers its mood")
+    assert(p.lastSeenEventId == 2)
+    p:onSnapshot(snapWithEvents({ { id = 3, kind = "policy_match" } }), true, 1e6 + 300)
+    assert(p.override and p.override.mood == "policy_match", "policy_match reacts too")
+    -- A growth tier crossed (src/care.rs's "grew_up") is the same kind of one-shot event.
+    p:onSnapshot(snapWithEvents({ { id = 4, kind = "grew_up" } }), true, 1e6 + 400)
+    assert(p.override and p.override.mood == "grew_up", "grew_up reacts too")
+    print("events: one-shot daemon events (budget_alert, milestone, policy_match, grew_up) fire once per id")
+end
+
+-- ── tamagotchi care: needs read from the snapshot, droopy fidgets when one runs low ─────────
+do
+    local function snapWithCare(care)
+        return { sessions = { { id = "a", status = "idle" } }, pending = {}, care = care }
+    end
+    local p = new()
+    p:onSnapshot(snapWithCare({ hunger = 80, energy = 60, affection = 90, growth_tier = 1, currency = 12, owned = { "bow" }, equipped = "bow" }), true, 1e6)
+    assert(p.hunger == 80 and p.energy == 60 and p.affection == 90, "needs are read from the snapshot")
+    assert(p.growthTier == 1 and p.currency == 12 and p.equipped == "bow", "growth/currency/equipped are read from the snapshot")
+
+    -- Low hunger biases idle fidgets toward "yawn"/"think" (a visual cue only — never a punishment:
+    -- the pet still idles normally, it just leans droopy more often).
+    local needy = new({ character = "tofu", fidgets = true, napAfterSec = 0 }, 1e6)
+    needy:onSnapshot(snapWithCare({ hunger = 10, energy = 100, affection = 100 }), true, 1e6)
+    local full = new({ character = "tofu", fidgets = true, napAfterSec = 0 }, 2e6)
+    full:onSnapshot(snapWithCare({ hunger = 100, energy = 100, affection = 100 }), true, 2e6)
+    local needyDroopy, fullDroopy, now = 0, 0, 1e6
+    for _ = 1, 400 do
+        now = now + 50
+        needy.nextFidget, full.nextFidget = now, now -- force a fidget pick on every tick
+        needy:tick(now); full:tick(now)
+        if needy.cur == "yawn" or needy.cur == "think" then needyDroopy = needyDroopy + 1 end
+        if full.cur == "yawn" or full.cur == "think" then fullDroopy = fullDroopy + 1 end
+    end
+    assert(needyDroopy > fullDroopy * 1.3, "low hunger leans the fidget pool droopy: " .. needyDroopy .. " vs " .. fullDroopy)
+    print("care: needs/growth/currency/equipped read from the snapshot; low needs lean fidgets droopy")
+end
+
+-- ── focus mode: sounds and fidgets are suppressed while focused ────────────────────────────
+do
+    local pet = new({ character = "tofu", fidgets = true, napAfterSec = 0 })
+    pet:enableSounds(true)
+    pet:setFocus(true)
+    pet:onEvent("sad", 1, 1e6) -- a mood change is needed to re-evaluate the sound cue
+    pet:tick(1e6 + 10)
+    assert(#pet:drainSounds() == 0, "no sound while focused")
+    pet:setFocus(false)
+    pet:onEvent("love", 2, 2e6)
+    pet:tick(2e6 + 10)
+    assert(#pet:drainSounds() > 0, "sounds resume once focus ends")
+    print("focus: mutes sounds while active")
+end
+
+-- ── personality: a few caption lines are flavored by character, the rest stays shared ──────
+do
+    local feisty = new({ character = "wasabi", fidgets = false, napAfterSec = 0 })
+    feisty.cur = "happy"
+    assert(feisty:caption(1, 0, 0) == "Ha! Done!", "wasabi (feisty) has its own happy line")
+
+    local calm = new({ character = "tofu", fidgets = false, napAfterSec = 0 })
+    calm.cur = "happy"
+    assert(calm:caption(1, 0, 0) == "Finished, calmly.", "tofu (calm) has a different happy line")
+
+    local classic = new({ character = "nigiri_salmon", fidgets = false, napAfterSec = 0 })
+    classic.cur = "idle"
+    assert(classic:caption(1, 0, 0) == "All quiet", "classic keeps the plain idle line")
+
+    local sleepy = new({ character = "bao", fidgets = false, napAfterSec = 0 })
+    sleepy.cur = "idle"
+    assert(sleepy:caption(1, 0, 0) == "All quiet, zzz-ish", "bao (sleepy) flavors the idle line too")
+
+    -- Moods outside the flavored set stay identical across personalities.
+    feisty.cur, calm.cur = "worried", "worried"
+    assert(feisty:caption(1, 0, 0) == calm:caption(1, 0, 0), "unflavored moods are shared verbatim")
+    print("personality: flavored lines differ by character, everything else is shared")
+end
+
 -- ── idle quirks ────────────────────────────────────────────────────────────────────────────
 do
     local function fidgets(char, on)
@@ -215,7 +323,7 @@ end
 do
     local names = {}
     for _, n in ipairs(Sounds.NAMES) do names[n] = true end
-    assert(#Sounds.NAMES == 28)
+    assert(#Sounds.NAMES == 34)
     for n in pairs(names) do
         local f = io.open(H.PLUGIN .. "sounds/" .. n .. ".wav", "rb"); assert(f, "missing " .. n)
         assert(f:read(4) == "RIFF", n .. " is not a wav"); f:close()
@@ -277,11 +385,11 @@ do
     assert(#loads == 4, "loads in small groups")
     Sounds.play("hello"); assert(#plays == 0, "asked for before it is loaded")
     while #waiting > 0 do local cb = table.remove(waiting, 1); inFlight = inFlight - 1; cb(true) end
-    assert(#loads == 28 and maxInFlight <= 4, "all 28 loaded, at most 4 at a time")
+    assert(#loads == 34 and maxInFlight <= 4, "all 34 loaded, at most 4 at a time")
     assert(plays[1] == "hello", "the early request plays once loaded")
     Sounds.play("poke"); assert(plays[#plays] == "poke" and Sounds.isReady("poke"))
     assert(Sounds.init({}, "/x") == false, "no sound API: nothing happens")
-    print("sounds: 28 files, cues for every moment, one source, capped queue, grouped loading")
+    print("sounds: 34 files, cues for every moment, one source, capped queue, grouped loading")
 end
 
 -- ── syntax colors ──────────────────────────────────────────────────────────────────────────

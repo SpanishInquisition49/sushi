@@ -11,6 +11,11 @@ export function tokens(n) {
   return String(Math.floor(n));
 }
 
+/** Compact in-game currency count: "0", "42", "1.2k" (see src/care.rs's `currency`). */
+export function coins(n) {
+  return tokens(n);
+}
+
 /** Palette role for a usage percentage: calm, warning, critical. */
 export function percentColor(p) {
   p = Number(p) || 0;
@@ -36,6 +41,49 @@ export function duration(ms) {
   const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
   const two = (n) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+
+/** Sum of a `Tokens` object's 4 fields (input/output/cache_read/cache_write). */
+export const tokenSum = (t) => (t?.input || 0) + (t?.output || 0) + (t?.cache_read || 0) + (t?.cache_write || 0);
+
+/** "$0.42", "<$0.01", "$0": an estimated cost, never a billed amount. */
+export function cost(usd) {
+  const n = Number(usd) || 0;
+  if (n <= 0) return "$0";
+  if (n < 0.01) return "<$0.01";
+  return "$" + n.toFixed(2);
+}
+
+/** Monday-first day index (0=Mon..6=Sun) from JS's Sunday-first `Date#getDay`. */
+const mondayFirst = (jsDay) => (jsDay + 6) % 7;
+
+/** "HH:MM" to minutes since midnight, or null if not a valid time. */
+function minutesOf(hhmm) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || "").trim());
+  if (!m) return null;
+  const h = Number(m[1]), mi = Number(m[2]);
+  return Number.isFinite(h) && Number.isFinite(mi) ? (h % 24) * 60 + (mi % 60) : null;
+}
+
+/** Whether "focus mode" (a quiet, compact pet) is active right now: `settings.focusManual`
+ *  ("on"/"off") overrides everything; otherwise a configured schedule — `focusDays` (7 chars,
+ *  '1'/'0', Monday first) and `focusStart`/`focusEnd` ("HH:MM", which may wrap past midnight,
+ *  e.g. 22:00–06:00). All client-local settings; no daemon involved. */
+export function isFocusActive(settings, now = new Date()) {
+  const manual = settings?.focusManual || "auto";
+  if (manual === "on") return true;
+  if (manual === "off") return false;
+  if (!settings?.focusEnabled) return false;
+  const days = String(settings.focusDays || "1111100");
+  const start = minutesOf(settings.focusStart);
+  const end = minutesOf(settings.focusEnd);
+  if (start == null || end == null || start === end) return false;
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const day = mondayFirst(now.getDay());
+  if (start < end) return days[day] === "1" && nowMin >= start && nowMin < end;
+  if (nowMin >= start) return days[day] === "1";
+  const previousDay = (day + 6) % 7;
+  return nowMin < end && days[previousDay] === "1";
 }
 
 /** Shorten `text` to at most `n` characters, adding an ellipsis. */

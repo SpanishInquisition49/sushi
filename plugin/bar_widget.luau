@@ -39,6 +39,27 @@ if soundsOn then Sounds.init(noctalia, noctalia.pluginDir()) end
 local widgetInfo = noctalia.getConfig("widgetInfo")
 if widgetInfo ~= "usage" and widgetInfo ~= "detailed" then widgetInfo = "session" end
 
+--- Focus mode has no quick toggle here (unlike the app): set `focusEnabled` and the hours/days in
+--- Noctalia's own settings for this plugin. `focusManual` stays "auto" — nothing writes it back.
+local function focusSettings()
+    return {
+        focusEnabled = noctalia.getConfig("focusEnabled"),
+        focusStart = noctalia.getConfig("focusStart"),
+        focusEnd = noctalia.getConfig("focusEnd"),
+        focusDays = noctalia.getConfig("focusDays"),
+        focusManual = "auto",
+    }
+end
+local focusDim = false
+
+--- Tamagotchi care (see src/care.rs): the widget shells out to the `sushi` CLI, the same way
+--- panel.luau does for every daemon-mutating action.
+local function binPath()
+    local p = noctalia.getConfig("binPath")
+    if type(p) ~= "string" or p == "" then p = "~/.cargo/bin/sushi" end
+    return noctalia.expandPath(p)
+end
+
 local STATUS_LABEL = { idle = "idle", working = "working", waiting = "waiting" }
 
 local function pendingCount() return Fmt.needsYou(snapshot) end
@@ -136,7 +157,7 @@ local function sessionChips()
 end
 
 local function render()
-    local children = { pet:build(PET_SIZE, { room = 4, margin = 3, mouth = true, maxHeight = 30 }) }
+    local children = { pet:build(PET_SIZE, { room = 4, margin = 3, mouth = true, maxHeight = 30, focusDim = focusDim }) }
     if daemonUp then
         local pending = pendingCount()
         if pending > 0 then
@@ -172,7 +193,13 @@ local function sendEvent(kind)
 end
 
 function onRightClick()
+    -- Petting it here counts the same as the panel's heart button, including its cooldown
+    -- (snapshot.care.next_pet_ms): a right click while it is still cooling down is a no-op,
+    -- instead of letting a flurry of clicks max affection out in one burst.
+    local c = snapshot.care or {}
+    if (c.next_pet_ms or 0) > noctalia.nowMs() then return end
     sendEvent("love")
+    noctalia.runAsync({ binPath(), "care", "pet" }, function() end)
 end
 
 function onMiddleClick()
@@ -206,6 +233,8 @@ function update()
         lastTooltipMs = now
         barWidget.setTooltip(tooltipRows())
     end
+    focusDim = Fmt.isFocusActive(focusSettings(), now)
+    pet:setFocus(focusDim)
     pet:tick(now)
     for _, name in ipairs(pet:drainSounds()) do Sounds.play(name) end
     render()

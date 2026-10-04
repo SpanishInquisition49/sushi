@@ -21,7 +21,7 @@ build:
 install:
     cargo install --path . --force
 
-# Connect an agent: claude, codex, copilot, antigravity, opencode, pi or all (`just connect claude no` only shows it)
+# Connect an agent: claude, codex, copilot, antigravity, gemini, opencode, pi or all (`just connect claude no` only shows it)
 connect agent="claude" write="yes":
     sushi install --agent {{agent}} {{ if write == "yes" { "--write" } else { "" } }}
 
@@ -58,6 +58,25 @@ app-run:
 # Make the installers (.deb / .AppImage, .dmg, .msi): needs `cargo install tauri-cli --locked`
 bundle:
     cd app/src-tauri && cargo tauri build
+
+# Cross-compile the app + CLI .exe for Windows (not an installer — see `bundle-windows`)
+app-windows:
+    # Needs: rustup target add x86_64-pc-windows-gnu, and mingw-w64-gcc (pacman -S mingw-w64-gcc
+    # / apt install mingw-w64).
+    cargo build --release --target x86_64-pc-windows-gnu -p sushi-app
+    cargo build --release --target x86_64-pc-windows-gnu --bin sushi --bin sushi-hook
+    @echo "→ target/x86_64-pc-windows-gnu/release/{sushi-app,sushi,sushi-hook}.exe"
+    @echo "  copy all three into the same folder on Windows and run sushi-app.exe"
+
+# Cross-compile a real Windows installer (NSIS .exe) from here, CLI included
+bundle-windows: app-windows
+    # Needs everything app-windows does, plus `nsis` (`yay -S nsis` on Arch, `apt install nsis`
+    # on Debian/Ubuntu): Tauri only auto-downloads its own NSIS toolchain when it is itself
+    # running on Windows, so cross-compiling needs a system `makensis` on PATH instead.
+    mkdir -p app/src-tauri/windows-bin
+    cp target/x86_64-pc-windows-gnu/release/sushi.exe target/x86_64-pc-windows-gnu/release/sushi-hook.exe app/src-tauri/windows-bin/
+    cd app/src-tauri && cargo tauri build --target x86_64-pc-windows-gnu --bundles nsis
+    @echo "→ target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe"
 
 # Serve the interface with sample data, no Tauri or daemon (open /index.html?view=panel&mock=work)
 ui-mock port="8000":

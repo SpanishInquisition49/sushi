@@ -20,7 +20,7 @@ export function mockState() {
   };
   const steps = [
     { tool: "Read", label: "src/paths.rs", ok: true, ts_ms: now - 30000, detail: { type: "file", lang: "rust", file: "src/paths.rs", start: 1, lines: ["use std::env;", "use std::path::PathBuf;", "", "pub fn socket_path() -> PathBuf {", "    runtime_dir().join(\"sushi.sock\")", "}"] } },
-    { tool: "Bash", label: "cargo test", ok: false, ts_ms: now - 20000, detail: { type: "terminal", command: "cargo test", output: ["running 77 tests", "test result: FAILED. 76 passed; 1 failed"] } },
+    { tool: "Bash", label: "cargo test", ok: false, ts_ms: now - 20000, policy: { level: "ask", label: "example policy match" }, detail: { type: "terminal", command: "cargo test", output: ["running 77 tests", "test result: FAILED. 76 passed; 1 failed"] } },
     { tool: "Edit", label: "src/paths.rs", ok: mode === "idle" ? true : null, ts_ms: now - 2000, added: 3, removed: 1, detail: diff },
   ];
   const working = mode === "work";
@@ -52,7 +52,13 @@ export function mockState() {
         codex: { label: "Codex", capabilities: { chat: true } },
       },
       sessions, pending,
-      usage: { claude: { today: { input: 12400, output: 88000, cache_read: 2400000 }, total: { input: 340000, output: 1900000 } } },
+      usage: {
+        claude: { available: true, today: { input: 12400, output: 88000, cache_read: 2400000 }, total: { input: 340000, output: 1900000 }, estimated_cost_usd: 2.35 },
+        codex: { available: false },
+      },
+      stats: { streak_days: 5, total_sessions: 42, total_tool_calls: 1234, streak_badge: 3, steps_badge: 1000 },
+      care: { hunger: 55, energy: 80, affection: 90, growth_tier: 2, xp: 180, currency: 37, owned: ["bow", "party_hat"], equipped: "bow" },
+      events: [],
       chat: { busy: false, error: null, agent: "claude", messages: [{ role: "user", text: "What does SIGKILL do?" }, { role: "assistant", text: "SIGKILL ends a process immediately; it cannot be caught or ignored." }] },
     },
   };

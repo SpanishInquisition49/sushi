@@ -1,6 +1,6 @@
 //! The hook every agent calls: forwards its event JSON to the daemon.
 //!
-//! `sushi-hook [--agent claude|codex|opencode|pi|copilot|antigravity]` (Claude Code if omitted).
+//! `sushi-hook [--agent claude|codex|opencode|pi|copilot|antigravity|gemini]` (Claude Code if omitted).
 //!
 //! Never blocks the agent: if the daemon is not running (or anything fails) it exits 0
 //! without output. Only `PermissionRequest` waits for an answer, up to

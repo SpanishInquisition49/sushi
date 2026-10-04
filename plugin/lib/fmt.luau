@@ -41,6 +41,63 @@ function F.duration(ms)
     return string.format("%d:%02d", m, sec)
 end
 
+--- Sum of a Tokens table's 4 fields (input/output/cache_read/cache_write).
+function F.tokenSum(t)
+    t = t or {}
+    return (t.input or 0) + (t.output or 0) + (t.cache_read or 0) + (t.cache_write or 0)
+end
+
+--- "$0.42", "<$0.01", "$0": an estimated cost, never a billed amount.
+function F.cost(usd)
+    local n = tonumber(usd) or 0
+    if n <= 0 then return "$0" end
+    if n < 0.01 then return "<$0.01" end
+    return string.format("$%.2f", n)
+end
+
+--- "HH:MM" to minutes since midnight, or nil if not a valid time.
+local function minutesOf(hhmm)
+    local h, m = tostring(hhmm or ""):match("^(%d%d?):(%d%d)$")
+    if not h then return nil end
+    h, m = tonumber(h), tonumber(m)
+    return (h % 24) * 60 + (m % 60)
+end
+
+--- Monday-first day index (0=Mon..6=Sun) and minutes since midnight, local time, for `epochMs` —
+--- nil if the runtime's `os.date` is unavailable (some plugin sandboxes do not expose it: the
+--- manual focus override in `F.isFocusActive` still works then, only the schedule cannot be
+--- computed — see the README).
+local function localClock(epochMs)
+    if type(os) ~= "table" or type(os.date) ~= "function" then return nil end
+    local ok, t = pcall(os.date, "*t", math.floor((tonumber(epochMs) or 0) / 1000))
+    if not ok or type(t) ~= "table" or not t.wday then return nil end
+    return (t.wday + 5) % 7, t.hour * 60 + t.min
+end
+
+--- Whether "focus mode" (a quiet, compact pet) is active right now: `settings.focusManual`
+--- ("on"/"off") overrides everything; otherwise a configured schedule — `focusDays` (7 chars,
+--- '1'/'0', Monday first) and `focusStart`/`focusEnd` ("HH:MM", which may wrap past midnight,
+--- e.g. 22:00-06:00).
+function F.isFocusActive(settings, nowMs)
+    settings = settings or {}
+    local manual = settings.focusManual or "auto"
+    if manual == "on" then return true end
+    if manual == "off" then return false end
+    if not settings.focusEnabled then return false end
+    local dayIdx, nowMin = localClock(nowMs)
+    if not dayIdx then return false end
+    local days = tostring(settings.focusDays or "1111100")
+    local start = minutesOf(settings.focusStart)
+    local stop = minutesOf(settings.focusEnd)
+    if not start or not stop or start == stop then return false end
+    if start < stop then
+        return days:sub(dayIdx + 1, dayIdx + 1) == "1" and nowMin >= start and nowMin < stop
+    end
+    if nowMin >= start then return days:sub(dayIdx + 1, dayIdx + 1) == "1" end
+    local previousDay = (dayIdx + 6) % 7
+    return nowMin < stop and days:sub(previousDay + 1, previousDay + 1) == "1"
+end
+
 --- Shorten `text` to at most `n` characters, adding an ellipsis.
 function F.clip(text, n)
     text = tostring(text or "")

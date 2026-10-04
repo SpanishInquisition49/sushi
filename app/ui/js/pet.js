@@ -17,6 +17,11 @@
 // While "working" the eyes and a small icon follow the tool the agent is using
 // (read, write, run, search, think). Hot dishes steam; the sake bottle is tipsy.
 // The caller advances time with pet.tick(nowMs) and renders pet.build(width, opts) each frame.
+//
+// Tamagotchi care (see src/care.rs): hunger/energy/affection decay over real time and never drop
+// below a floor — no punishment, just droopier idle fidgets. Feeding/petting/napping, a mini-game
+// and a cosmetic shop (ACCESSORIES) are driven from the panel; the pet only shows the growth-tier
+// and equipped-accessory pins (build()'s opts.accessories) and the one-shot "grew_up" celebration.
 
 import { ui } from "./ui.js";
 
@@ -33,37 +38,68 @@ const INK = "#2b2023", SHINE = "#ffffff", CHEEK = "#ff9aa6", RICE = "#fbf6ec", R
   ICE = "#eef6fb", ICE_SHADE = "#cfe9f5", WASABI_GREEN = "#7fae3a", WASABI_RED = "#d23c3c",
   MATCHA_GREEN = "#6fae52", MATCHA_FOAM = "#bfe3a8";
 
+// `personality` picks fidget cadence/favorites and a few flavored lines (see PERSONALITIES below);
+// it is a vibe call, not a simulation — traditional nigiri stay composed, fried/fizzy things are
+// energetic, delicate things are shy, imports are fancy, soups and buns are cozy.
 const CHARACTERS = {
-  nigiri_salmon: { kind: "nigiri", ratio: 0.8, top: "#ff8a6b", fat: "#ffc9b5" },
-  nigiri_tuna: { kind: "nigiri", ratio: 0.8, top: "#d8454f", fat: "#f0868c" },
-  nigiri_tamago: { kind: "nigiri", ratio: 0.8, top: "#ffcf4d", fat: "#ffe79a" },
-  maki: { kind: "maki", ratio: 1.0, filling: "#ff8a6b", filling2: "#8cc76f" },
-  uramaki: { kind: "uramaki", ratio: 1.0, filling: "#ff8a6b", filling2: "#8cc76f", filling3: "#ffd24a" },
-  unagi_nigiri: { kind: "nigiri", ratio: 0.8, top: "#6a3a22", fat: "#b36b34" },
-  ebi_nigiri: { kind: "nigiri", ratio: 0.8, top: "#ff9c66", fat: "#fff0e6", bands: "#fff0e6" },
-  ebi_tempura: { kind: "tempura", ratio: 0.7, steam: true },
-  ikura: { kind: "ikura", ratio: 1.0, roe: "#ff7a3d" },
-  inari: { kind: "inari", ratio: 0.85 },
-  ravioli: { kind: "ravioli", ratio: 0.8, steam: true },
-  bao: { kind: "bao", ratio: 0.9, steam: true },
-  takoyaki: { kind: "takoyaki", ratio: 1.0, steam: true },
-  ramen: { kind: "ramen", ratio: 0.95, steam: true },
-  miso_soup: { kind: "miso", ratio: 0.85, steam: true },
-  edamame: { kind: "edamame", ratio: 0.8 },
-  onigiri: { kind: "onigiri", ratio: 0.92 },
-  mochi: { kind: "mochi", ratio: 0.88 },
-  bubble_tea: { kind: "boba", ratio: 1.35 },
-  sake: { kind: "sake", ratio: 1.15, tipsy: true },
-  dorayaki: { kind: "dorayaki", ratio: 0.86 },
-  dango: { kind: "dango", ratio: 1.6, top: "#ff9eb5", mid: "#f6f1ea", bottom: "#a8d58b" },
-  tofu: { kind: "tofu", ratio: 1.0 },
-  taiyaki: { kind: "taiyaki", ratio: 0.72, batter: WAFFLE, batterDark: WAFFLE_DARK },
-  ramune: { kind: "ramune", ratio: 1.3, glass: GLASS, glassDark: GLASS_DARK },
-  kakigori: { kind: "kakigori", ratio: 1.05, syrup: BERRY },
-  wasabi: { kind: "wasabi", ratio: 0.9 },
-  temaki: { kind: "temaki", ratio: 1.42, filling: "#ff8a6b" },
-  matcha: { kind: "matcha", ratio: 0.88, steam: true },
-  tamagoyaki: { kind: "tamagoyaki", ratio: 0.95 },
+  nigiri_salmon: { kind: "nigiri", ratio: 0.8, top: "#ff8a6b", fat: "#ffc9b5", personality: "classic" },
+  nigiri_tuna: { kind: "nigiri", ratio: 0.8, top: "#d8454f", fat: "#f0868c", personality: "classic" },
+  nigiri_tamago: { kind: "nigiri", ratio: 0.8, top: "#ffcf4d", fat: "#ffe79a", personality: "cozy" },
+  maki: { kind: "maki", ratio: 1.0, filling: "#ff8a6b", filling2: "#8cc76f", personality: "playful" },
+  uramaki: { kind: "uramaki", ratio: 1.0, filling: "#ff8a6b", filling2: "#8cc76f", filling3: "#ffd24a", personality: "fancy" },
+  unagi_nigiri: { kind: "nigiri", ratio: 0.8, top: "#6a3a22", fat: "#b36b34", personality: "classic" },
+  ebi_nigiri: { kind: "nigiri", ratio: 0.8, top: "#ff9c66", fat: "#fff0e6", bands: "#fff0e6", personality: "classic" },
+  ebi_tempura: { kind: "tempura", ratio: 0.7, steam: true, personality: "energetic" },
+  ikura: { kind: "ikura", ratio: 1.0, roe: "#ff7a3d", personality: "shy" },
+  inari: { kind: "inari", ratio: 0.85, personality: "cozy" },
+  ravioli: { kind: "ravioli", ratio: 0.8, steam: true, personality: "fancy" },
+  bao: { kind: "bao", ratio: 0.9, steam: true, personality: "sleepy" },
+  takoyaki: { kind: "takoyaki", ratio: 1.0, steam: true, personality: "energetic" },
+  ramen: { kind: "ramen", ratio: 0.95, steam: true, personality: "cozy" },
+  miso_soup: { kind: "miso", ratio: 0.85, steam: true, personality: "cozy" },
+  edamame: { kind: "edamame", ratio: 0.8, personality: "playful" },
+  onigiri: { kind: "onigiri", ratio: 0.92, personality: "classic" },
+  mochi: { kind: "mochi", ratio: 0.88, personality: "playful" },
+  bubble_tea: { kind: "boba", ratio: 1.35, personality: "energetic" },
+  sake: { kind: "sake", ratio: 1.15, tipsy: true, personality: "playful" },
+  dorayaki: { kind: "dorayaki", ratio: 0.86, personality: "cozy" },
+  dango: { kind: "dango", ratio: 1.6, top: "#ff9eb5", mid: "#f6f1ea", bottom: "#a8d58b", personality: "playful" },
+  tofu: { kind: "tofu", ratio: 1.0, personality: "calm" },
+  taiyaki: { kind: "taiyaki", ratio: 0.72, batter: WAFFLE, batterDark: WAFFLE_DARK, personality: "playful" },
+  ramune: { kind: "ramune", ratio: 1.3, glass: GLASS, glassDark: GLASS_DARK, personality: "energetic" },
+  kakigori: { kind: "kakigori", ratio: 1.05, syrup: BERRY, personality: "energetic" },
+  wasabi: { kind: "wasabi", ratio: 0.9, personality: "feisty" },
+  temaki: { kind: "temaki", ratio: 1.42, filling: "#ff8a6b", personality: "playful" },
+  matcha: { kind: "matcha", ratio: 0.88, steam: true, personality: "calm" },
+  tamagoyaki: { kind: "tamagoyaki", ratio: 0.95, personality: "classic" },
+};
+
+// A personality picks the pace and flavor of idle quirks (fidgetMult: lower = fidgets more often;
+// favor: fidgets picked more often from the shared pool) and a few flavored lines (see `caption()`);
+// everything else (breathing, mood logic, animation) is shared.
+const PERSONALITIES = {
+  classic: { fidgetMult: 1.0, favor: ["think", "wink"] },
+  energetic: { fidgetMult: 0.6, favor: ["hop", "bounce", "wiggle"] },
+  playful: { fidgetMult: 0.8, favor: ["wink", "spin", "bounce"] },
+  shy: { fidgetMult: 1.5, favor: ["blush", "peek"] },
+  fancy: { fidgetMult: 1.1, favor: ["wink", "think"] },
+  sleepy: { fidgetMult: 1.6, favor: ["yawn"] },
+  cozy: { fidgetMult: 1.2, favor: ["hum", "yawn"] },
+  calm: { fidgetMult: 1.4, favor: ["think", "blush"] },
+  feisty: { fidgetMult: 0.7, favor: ["sneeze", "squish"] },
+};
+const DEFAULT_PERSONALITY = "classic";
+
+const PERSONALITY_LINES = {
+  classic: { happy: "Done!", love: "Thank you!", sad: "Aww...", idle: "All quiet" },
+  energetic: { happy: "Woohoo, nailed it!", love: "Yes! More of that!", sad: "Aw, c'mon!", idle: "All quiet... for now!" },
+  playful: { happy: "Tada! Done~", love: "Hehe, thank you~", sad: "Noooo...", idle: "All quiet, hehe" },
+  shy: { happy: "Oh! ...it's done.", love: "O-oh, thank you...", sad: "...oh no.", idle: "All quiet (psst, hi)" },
+  fancy: { happy: "Finished, as expected.", love: "How delightful.", sad: "How unfortunate.", idle: "All quiet, splendidly" },
+  sleepy: { happy: "Mm, all done...", love: "Mm, thank you...", sad: "Aww, okay...", idle: "All quiet, zzz-ish" },
+  cozy: { happy: "All done, nice and warm.", love: "So warm, thank you.", sad: "Aww, that's a shame.", idle: "All quiet and cozy" },
+  calm: { happy: "Finished, calmly.", love: "That was lovely.", sad: "Oh well.", idle: "All quiet" },
+  feisty: { happy: "Ha! Done!", love: "Hmph... thanks, I guess.", sad: "Ugh, seriously?", idle: "All quiet. Good." },
 };
 
 export const CHARACTER_IDS = [
@@ -89,6 +125,9 @@ const MOOD_PARAMS = {
   peek: [2600, 1.1, 1.05], squish: [1200, 1.0, 1.0], wink: [3200, 1.0, 1.0], blush: [1600, 0.9, 1.0],
   sneeze: [1500, 0.3, 1.05], hum: [1800, 0.45, 1.05], think: [3000, 1.0, 1.0], spin: [1400, 1.0, 1.0],
   bounce: [1100, 1.0, 1.0], sip: [2200, 0.5, 1.05], hiccup: [900, 0.8, 1.0], jiggle: [1200, 1.0, 1.0],
+  // One-shot reactions to events from the daemon (see `onSnapshot`'s event bus handling).
+  budget_alert: [1100, 1.1, 0.9], milestone: [700, 0.38, 1.1], policy_match: [900, 1.2, 1.15],
+  grew_up: [700, 0.38, 1.1],
 };
 const params = (mood) => {
   const [period, eyeH, eyeW] = MOOD_PARAMS[mood] || MOOD_PARAMS.idle;
@@ -96,7 +135,7 @@ const params = (mood) => {
 };
 
 // Eyes drawn as thin happy bars (no shine).
-const SQUINT = new Set(["sleep", "nap", "happy", "love", "yawn", "hum", "eat", "dance", "sip", "stuffed", "sneeze"]);
+const SQUINT = new Set(["sleep", "nap", "happy", "love", "yawn", "hum", "eat", "dance", "sip", "stuffed", "sneeze", "grew_up"]);
 
 // Random idle quirks: [mood, duration ms].
 const FIDGETS = [
@@ -117,7 +156,135 @@ const SOUND_FOR = {
   annoyed: "annoyed", dizzy: "dizzy", hop: "hop", bounce: "bounce", wiggle: "wiggle", squish: "squish",
   jiggle: "squish", yawn: "yawn", sneeze: "sneeze", hiccup: "hiccup", hum: "hum", think: "think", wink: "wink",
   blush: "blush", spin: "spin", eat: "eat", dance: "dance", nap: "nap", alert: "alert",
+  budget_alert: "budget", milestone: "milestone", policy_match: "policy", grew_up: "levelup",
 };
+
+// How long each one-shot daemon event's reaction lasts (see `onSnapshot`'s event bus handling).
+const EVENT_DURATION = { budget_alert: 1300, milestone: 1800, policy_match: 1100, grew_up: 1800 };
+
+// ── Gamification accessories: small permanent pins for the highest milestone ever earned ──────
+// (see `src/stats.rs`'s `highest_unlocked` — an earned badge, not a live gauge: it stays even if
+// e.g. the streak itself later resets to 0). One track for the day streak, one for steps watched.
+const STREAK_TIERS = [3, 7, 14, 30, 100];
+const STEP_TIERS = [100, 500, 1000, 5000, 10000];
+const TIER_COLORS = ["#b08d57", "#c7c7cf", "#e8b64c", "#8fd3e8", "#c9a6ff"]; // bronze, silver, gold, platinum, diamond
+const TIER_NAMES = ["Bronze", "Silver", "Gold", "Platinum", "Diamond"];
+
+// ── Tamagotchi care (see src/care.rs, the single source of truth): hunger/energy/affection decay
+// over real wall-clock time and never drop below a floor (no punishment — just a visibly needy
+// pet), a monotonic xp track unlocks growth tiers, and a small fixed cosmetic shop. The meters and
+// shop grid are drawn by the panel; the pet itself only shows the growth aura and the equipped
+// accessory, both as extra pins in the same reserved slot the streak/steps badges already use
+// (see `badge()`) — never as a new body shape.
+const GROWTH_TIERS = [50, 150, 400, 900, 2000];
+// Below this, idle fidgets lean droopy (see `tick`'s fidget pool) — a visual cue only.
+const NEED_LOW = 35;
+// id -> { cost, label }. Mirrors `ACCESSORIES` in src/care.rs (the daemon validates cost). The art
+// itself lives in ACCESSORY_ART below (no emoji — this repo's font-rendered emoji looked different
+// per platform and didn't match the accessory's actual shape half the time).
+export const ACCESSORIES = {
+  party_hat: { cost: 20, label: "Party hat" },
+  bow: { cost: 20, label: "Bow" },
+  sunglasses: { cost: 30, label: "Sunglasses" },
+  scarf: { cost: 30, label: "Scarf" },
+  headphones: { cost: 40, label: "Headphones" },
+  monocle: { cost: 45, label: "Monocle" },
+  flower_crown: { cost: 50, label: "Flower crown" },
+  chef_hat: { cost: 50, label: "Chef hat" },
+  wizard_hat: { cost: 60, label: "Wizard hat" },
+  top_hat: { cost: 65, label: "Top hat" },
+  crown: { cost: 70, label: "Crown" },
+};
+
+// ── Accessory art: small flat pictograms built from the same box/row/column primitives as the
+// character bodies (see BODIES below) — a drawn shop icon for each accessory instead of an emoji
+// glyph, so it reads the same everywhere and actually looks like the thing it's named after.
+const ACC_RED = "#e05a52", ACC_PINK = "#ff9ab0", ACC_GOLD = "#e8b64c", ACC_BLUE = "#2f6fed",
+  ACC_DARK = "#2b2023", ACC_GREEN = "#6fae52", ACC_PURPLE = "#6a4c93", ACC_CREAM = "#fbf6ec";
+
+const aCircle = (d, fill, border) => ui.box({ width: d, height: d, radius: round(d / 2), fill, border, borderWidth: border ? 1.5 : undefined });
+const aBar = (w, h, fill, radius = 2) => ui.box({ width: w, height: h, radius, fill });
+
+const ACCESSORY_ART = {
+  party_hat: (s) => ui.column({ align: "center", gap: 1 }, [
+    aCircle(round(s * 0.16), ACC_CREAM),
+    aBar(round(s * 0.18), round(s * 0.14), ACC_BLUE),
+    aBar(round(s * 0.4), round(s * 0.14), ACC_RED),
+    aBar(round(s * 0.62), round(s * 0.14), ACC_GOLD),
+    aBar(round(s * 0.84), round(s * 0.14), ACC_BLUE),
+  ]),
+  bow: (s) => ui.row({ align: "center", gap: round(s * 0.03) }, [
+    aBar(round(s * 0.14), round(s * 0.7), ACC_PINK, round(s * 0.07)),
+    aBar(round(s * 0.14), round(s * 0.42), ACC_PINK, round(s * 0.07)),
+    aCircle(round(s * 0.18), ACC_GOLD),
+    aBar(round(s * 0.14), round(s * 0.42), ACC_PINK, round(s * 0.07)),
+    aBar(round(s * 0.14), round(s * 0.7), ACC_PINK, round(s * 0.07)),
+  ]),
+  sunglasses: (s) => ui.row({ align: "center", gap: round(s * 0.04) }, [
+    aCircle(round(s * 0.42), ACC_DARK),
+    aBar(round(s * 0.16), round(s * 0.08), ACC_DARK, round(s * 0.04)),
+    aCircle(round(s * 0.42), ACC_DARK),
+  ]),
+  scarf: (s) => ui.column({ align: "center", gap: round(s * 0.04) }, [
+    aBar(round(s * 0.82), round(s * 0.2), ACC_RED, round(s * 0.1)),
+    aBar(round(s * 0.42), round(s * 0.38), "#8f2a22", round(s * 0.08)),
+    ui.row({ gap: round(s * 0.04) }, [aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1), aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1), aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1)]),
+  ]),
+  headphones: (s) => ui.column({ align: "center", gap: round(s * 0.08) }, [
+    aBar(round(s * 0.78), round(s * 0.16), ACC_DARK, round(s * 0.08)),
+    ui.row({ width: round(s * 0.84), justify: "space_between", align: "center" }, [aCircle(round(s * 0.32), ACC_DARK), aCircle(round(s * 0.32), ACC_DARK)]),
+  ]),
+  monocle: (s) => ui.column({ align: "end", gap: round(s * 0.03) }, [
+    ui.box({ width: round(s * 0.5), height: round(s * 0.5), radius: round(s * 0.25), border: ACC_GOLD, borderWidth: 2 }),
+    ui.row({ gap: round(s * 0.04) }, [aCircle(round(s * 0.08), ACC_GOLD), aCircle(round(s * 0.08), ACC_GOLD)]),
+  ]),
+  flower_crown: (s) => ui.column({ align: "center", gap: round(s * 0.04) }, [
+    ui.row({ gap: round(s * 0.05) }, [aCircle(round(s * 0.24), ACC_PINK), aCircle(round(s * 0.24), ACC_GOLD), aCircle(round(s * 0.24), ACC_PINK)]),
+    aBar(round(s * 0.78), round(s * 0.12), ACC_GREEN, round(s * 0.06)),
+  ]),
+  chef_hat: (s) => ui.column({ align: "center", gap: 1 }, [
+    ui.box({ width: round(s * 0.7), height: round(s * 0.42), radius: round(s * 0.18), fill: "#ffffff", border: ACC_DARK, borderWidth: 1 }),
+    aBar(round(s * 0.5), round(s * 0.16), ACC_DARK),
+  ]),
+  wizard_hat: (s) => ui.column({ align: "center", gap: 1 }, [
+    aCircle(round(s * 0.12), ACC_GOLD),
+    aBar(round(s * 0.18), round(s * 0.14), ACC_PURPLE),
+    aBar(round(s * 0.34), round(s * 0.14), ACC_PURPLE),
+    aBar(round(s * 0.5), round(s * 0.14), ACC_PURPLE),
+    aBar(round(s * 0.66), round(s * 0.12), ACC_PURPLE),
+    aBar(round(s * 0.84), round(s * 0.1), "#4a3569"),
+  ]),
+  top_hat: (s) => ui.column({ align: "center", gap: 1 }, [
+    aBar(round(s * 0.5), round(s * 0.34), ACC_DARK, round(s * 0.05)),
+    aBar(round(s * 0.5), round(s * 0.1), ACC_GOLD, 2),
+    aBar(round(s * 0.82), round(s * 0.1), ACC_DARK, round(s * 0.05)),
+  ]),
+  crown: (s) => ui.column({ align: "center", gap: round(s * 0.02) }, [
+    ui.row({ align: "end", gap: round(s * 0.02) }, [
+      aBar(round(s * 0.12), round(s * 0.42), ACC_GOLD),
+      aBar(round(s * 0.12), round(s * 0.74), ACC_GOLD),
+      aBar(round(s * 0.12), round(s * 0.5), ACC_GOLD),
+      aBar(round(s * 0.12), round(s * 0.74), ACC_GOLD),
+      aBar(round(s * 0.12), round(s * 0.42), ACC_GOLD),
+    ]),
+    ui.row({ width: round(s * 0.74), height: round(s * 0.16), fill: "#c99a3e", radius: 2, align: "center", justify: "space_between" }, [
+      aCircle(round(s * 0.09), ACC_RED), aCircle(round(s * 0.09), ACC_GREEN), aCircle(round(s * 0.09), ACC_BLUE),
+    ]),
+  ]),
+};
+
+/** The drawn icon for accessory `id` at roughly `s` px wide, or null for an unknown id. */
+export function accessoryArt(id, s) {
+  const build = ACCESSORY_ART[id];
+  return build ? build(s) : null;
+}
+
+/** Index (1-based) of the highest tier `value` reaches in `tiers`, 0 if none. */
+function tierOf(value, tiers) {
+  let n = 0;
+  for (const t of tiers) if (value >= t) n++;
+  return n;
+}
 
 /** Read the pet settings from the app's settings object. */
 export function configFrom(settings = {}) {
@@ -127,6 +294,7 @@ export function configFrom(settings = {}) {
     character,
     fidgets: settings.fidgets !== false,
     napAfterSec: Number.isFinite(nap) && settings.napAfterSec !== undefined && settings.napAfterSec !== "" ? clamp(nap, 0, 3600) : 120, // 0 = never
+    gamification: settings.gamificationEnabled !== false,
   };
 }
 
@@ -161,6 +329,16 @@ export class Pet {
     this.cheek = 0; // 0..1, how flushed the cheeks are
     this.workKind = "read"; // read / write / run / search / think
     this.contextPct = 0; // the active session's context window, last seen (0..100)
+    this.streakBadge = 0; // highest streak milestone tier ever earned (0..5, see TIER_COLORS)
+    this.stepsBadge = 0; // highest step-count milestone tier ever earned (0..5)
+    // Tamagotchi care, read from the daemon's snapshot each time (never cached), same as the
+    // badges above: hunger/energy/affection (0..100), growthTier (0..5), currency, owned
+    // accessory ids and the one currently equipped (see ACCESSORIES).
+    this.hunger = this.energy = this.affection = 100;
+    this.growthTier = 0;
+    this.currency = 0;
+    this.owned = [];
+    this.equipped = null;
     this.knownSessions = null;
     this.failureCounts = new Map(); // session id -> activity.failures last seen
     this.turnHadFailure = false; // a failure happened since the pet was last idle
@@ -177,6 +355,8 @@ export class Pet {
     this.soundMood = null;
     this.soundOverride = null;
     this.wakeCue = false;
+    this.lastSeenEventId = null; // null = first snapshot: do not replay events already in the capped list
+    this.focus = false; // focus mode: muted sounds, no idle fidgets (see `setFocus`)
     this.trigger("greeting", 1800, now); // says hello when it appears
   }
 
@@ -191,8 +371,15 @@ export class Pet {
     if (!this.soundsOn) this.sounds = [];
   }
 
+  /** Focus mode (see `Fmt.isFocusActive`): mutes sounds and stops idle fidgets while `active`, so
+   *  the pet stays quiet and still without disappearing (the status badge is unaffected: it is
+   *  drawn by the caller, not by the pet itself). */
+  setFocus(active) {
+    this.focus = !!active;
+  }
+
   cue(name) {
-    if (!(this.soundsOn && name)) return;
+    if (!(this.soundsOn && name) || this.focus) return;
     this.sounds.push(name);
     if (this.sounds.length > 12) this.sounds.shift();
   }
@@ -272,6 +459,19 @@ export class Pet {
       // The active session's context window, kept until a new reading comes in (drives the
       // kakigori's melt; stays put while idle rather than snapping back).
       if (active?.context?.percent != null) this.contextPct = active.context.percent;
+      // Gamification accessories: the highest milestone ever earned (see TIER_COLORS); 0 when
+      // the setting is off, so build() simply draws nothing.
+      this.streakBadge = this.cfg.gamification ? tierOf(snap?.stats?.streak_badge || 0, STREAK_TIERS) : 0;
+      this.stepsBadge = this.cfg.gamification ? tierOf(snap?.stats?.steps_badge || 0, STEP_TIERS) : 0;
+      if (snap?.care) {
+        this.hunger = snap.care.hunger ?? this.hunger;
+        this.energy = snap.care.energy ?? this.energy;
+        this.affection = snap.care.affection ?? this.affection;
+        this.growthTier = snap.care.growth_tier || 0;
+        this.currency = snap.care.currency || 0;
+        this.owned = snap.care.owned || [];
+        this.equipped = snap.care.equipped || null;
+      }
 
       let lim = null;
       for (const a of Object.values(snap?.agents || {})) if (a.limits?.data) lim = a.limits.data;
@@ -288,6 +488,17 @@ export class Pet {
       this.prevChatBusy = chatBusy;
       if (chatBusy) this.lastActive = nowMs;
     }
+    // One-shot events from the daemon (budget_alert, milestone, policy_match): react once per id,
+    // never replaying events that were already in the capped list on the very first snapshot.
+    let maxSeenEvent = this.lastSeenEventId;
+    for (const e of snap?.events || []) {
+      const id = e?.id || 0;
+      if (this.lastSeenEventId != null && id > this.lastSeenEventId && EVENT_DURATION[e.kind]) {
+        this.trigger(e.kind, EVENT_DURATION[e.kind], nowMs);
+      }
+      if (maxSeenEvent == null || id > maxSeenEvent) maxSeenEvent = id;
+    }
+    this.lastSeenEventId = maxSeenEvent ?? 0;
     if (working || pending > 0) {
       this.lastActive = nowMs;
       this.forceNap = false;
@@ -310,13 +521,28 @@ export class Pet {
     this.baseMood = mood;
   }
 
-  /** A one-off event from elsewhere (the panel, the tray): love, approve, deny, sad, eat, dance, hello, nap. */
+  /** A one-off event from elsewhere (the panel, the tray): love, approve, deny, sad, eat, dance,
+   *  hello, nap, nap-toggle, snuggle. */
   onEvent(kind, ts, nowMs) {
     if ((ts || 0) <= this.lastEventTs) return;
     this.lastEventTs = ts || 0;
     if (kind === "nap") {
       this.forceNap = true;
       this.override = null;
+      return;
+    }
+    // Double-click: nap right now, or wake up again — regardless of whether it was napping on
+    // its own (idle timeout) or because of a previous "nap". Resets the idle clock on waking, so
+    // it does not immediately re-nap from the timeout on the very next tick.
+    if (kind === "nap-toggle") {
+      const [mood] = this.mood(nowMs);
+      if (mood === "nap") {
+        this.forceNap = false;
+        this.lastActive = nowMs;
+      } else {
+        this.forceNap = true;
+        this.override = null;
+      }
       return;
     }
     this.lastActive = nowMs;
@@ -328,6 +554,8 @@ export class Pet {
     else if (kind === "eat") this.trigger("eat", 2600, nowMs, "happy", 1100);
     else if (kind === "dance") this.trigger("dance", 4200, nowMs);
     else if (kind === "hello") this.trigger("wave", 1600, nowMs);
+    // Holding the "pet it" gesture instead of a quick click: a longer love, then a bashful tail.
+    else if (kind === "snuggle") { this.soundOverride = "love"; this.trigger("love", 2600, nowMs, "blush", 1800); }
   }
 
   /** The user clicked the pet. */
@@ -370,12 +598,27 @@ export class Pet {
     }
     this.prevBase = mood === "nap" ? "nap" : "other";
 
-    // Random idle quirks (the generic ones plus a few that suit the character).
-    if (mood === "idle" && this.cfg.fidgets && nowMs >= this.nextFidget) {
+    // Random idle quirks (the generic ones plus a few that suit the character and its
+    // personality — see PERSONALITIES); none while focused.
+    if (mood === "idle" && this.cfg.fidgets && !this.focus && nowMs >= this.nextFidget) {
+      const personality = PERSONALITIES[this.char.personality] || PERSONALITIES[DEFAULT_PERSONALITY];
       const pool = [...FIDGETS, ...(EXTRA_FIDGETS[this.cfg.character] || [])];
+      // Favorite fidgets are duplicated in the pool so the random pick leans toward them.
+      for (const name of personality.favor) {
+        const entry = FIDGETS.find((fg) => fg[0] === name);
+        if (entry) pool.push(entry, entry);
+      }
+      // A need running low (see src/care.rs's floor — never 0, never a punishment) leans the
+      // idle fidgets droopy: a purely visual "I could use some attention" cue.
+      if (this.hunger < NEED_LOW || this.energy < NEED_LOW || this.affection < NEED_LOW) {
+        for (const name of ["yawn", "think"]) {
+          const entry = FIDGETS.find((fg) => fg[0] === name);
+          if (entry) pool.push(entry, entry, entry);
+        }
+      }
       const f = pool[Math.floor(Math.random() * pool.length)];
       this.trigger(f[0], f[1], nowMs);
-      this.nextFidget = nowMs + rand(10000, 25000);
+      this.nextFidget = nowMs + rand(10000, 25000) * personality.fidgetMult;
       [mood, p] = this.mood(nowMs);
     }
 
@@ -705,26 +948,63 @@ export class Pet {
     return stack(width, height, items);
   }
 
-  /** A small status bubble (like a chat "typing" indicator) for the top-left of the pet. */
-  badge(kind, width, height) {
-    const d = Math.max(10, round(width * 0.95));
-    let inner;
-    if (kind === "alert") {
-      inner = ui.label({ text: "!", fontSize: round(d * 0.7), fontWeight: "bold", color: "#ffffff" });
-    } else {
-      const dot = Math.max(2, round(d * 0.16));
-      const dots = [0, 1, 2].map((i) => {
-        // The dots pulse one after the other.
-        const pulse = 0.4 + 0.6 * Math.max(0, Math.sin(this.t / 260 - i * 0.9));
-        return ui.box({ width: dot, height: dot, radius: round(dot / 2), fill: "#ffffff", opacity: pulse });
-      });
-      inner = ui.row({ gap: Math.max(1, round(dot * 0.5)), align: "center" }, dots);
+  /** A small status bubble (top) and/or gamification pins (below it, when the caller opts in) for
+   *  the top-left slot: "work"/"alert" for the status, plus the highest milestone ever earned on
+   *  each track (see TIER_COLORS/TIER_NAMES) — a flame for the day streak, an award for steps
+   *  watched. Always the same shape of column, with or without any of them. */
+  badge(kind, width, height, streakTier = 0, stepsTier = 0, growthTier = 0, equipped = null) {
+    const children = [];
+    if (kind) {
+      const d = Math.max(10, round(width * 0.95));
+      let inner;
+      if (kind === "alert") {
+        inner = ui.label({ text: "!", fontSize: round(d * 0.7), fontWeight: "bold", color: "#ffffff" });
+      } else {
+        const dot = Math.max(2, round(d * 0.16));
+        const dots = [0, 1, 2].map((i) => {
+          // The dots pulse one after the other.
+          const pulse = 0.4 + 0.6 * Math.max(0, Math.sin(this.t / 260 - i * 0.9));
+          return ui.box({ width: dot, height: dot, radius: round(dot / 2), fill: "#ffffff", opacity: pulse });
+        });
+        inner = ui.row({ gap: Math.max(1, round(dot * 0.5)), align: "center" }, dots);
+      }
+      children.push(
+        ui.column(
+          { width: d, height: d, fill: kind === "alert" ? "#f59e0b" : "#2f6fed", radius: round(d / 2), border: "#0d0f13", borderWidth: 2, align: "center", justify: "center" },
+          [inner],
+        ),
+      );
     }
-    const bubble = ui.column(
-      { width: d, height: d, fill: kind === "alert" ? "#f59e0b" : "#2f6fed", radius: round(d / 2), border: "#0d0f13", borderWidth: 2, align: "center", justify: "center" },
-      [inner],
-    );
-    return ui.column({ width: round(width), height: round(height), align: "start", justify: "start" }, [bubble]);
+    const pinD = Math.max(8, round(width * 0.7));
+    const pin = (glyph, tier, tiers, label) =>
+      tier > 0
+        ? ui.column(
+            {
+              width: pinD, height: pinD, fill: TIER_COLORS[tier - 1] + "cc", radius: round(pinD / 2), border: "#0d0f13", borderWidth: 1,
+              align: "center", justify: "center", title: `${TIER_NAMES[tier - 1]} · ${label(tiers[tier - 1])}`,
+            },
+            [ui.glyph({ name: glyph, size: round(pinD * 0.62), color: "#1b1410" })],
+          )
+        : null;
+    const flame = pin("flame", streakTier, STREAK_TIERS, (n) => `${n}-day streak`);
+    if (flame) children.push(flame);
+    const award = pin("award", stepsTier, STEP_TIERS, (n) => `${n} steps watched`);
+    if (award) children.push(award);
+    const sprout = pin("sparkles", growthTier, GROWTH_TIERS, (n) => `grew at ${n} xp`);
+    if (sprout) children.push(sprout);
+    const accessory = ACCESSORIES[equipped];
+    if (accessory) {
+      children.push(
+        ui.column(
+          {
+            width: pinD, height: pinD, fill: "#ffffffcc", radius: round(pinD / 2), border: "#0d0f13", borderWidth: 1,
+            align: "center", justify: "center", title: accessory.label,
+          },
+          [accessoryArt(equipped, round(pinD * 0.64))],
+        ),
+      );
+    }
+    return ui.column({ width: round(width), height: round(height), align: "start", justify: "start", gap: 3 }, children);
   }
 
   /** Build the UI tree for a character `size` px wide.
@@ -734,6 +1014,8 @@ export class Pet {
    *  opts.maxHeight  total height budget (px): tall characters (dango) shrink to fit
    *  opts.badge      "work" (blue bubble with three dots) or "alert" (orange "!") in the top-left corner
    *  opts.badgeSlot  keep the room for the bubble even when there is none, so the pet does not jump sideways
+   *  opts.accessories  also show the gamification pins (highest streak / steps-watched milestone ever
+   *                  earned) below the badge, in the same reserved slot — needs opts.badge or opts.badgeSlot
    *  opts.detail     force (true) or forbid (false) the stripes, shine and floating decorations */
   build(size, opts = {}) {
     const c = this.char;
@@ -747,10 +1029,13 @@ export class Pet {
     const baseH = round(w * c.ratio);
     const bh = round(baseH * (1 + this.sy));
 
-    const body = BODIES[c.kind](c, {
+    let body = BODIES[c.kind](c, {
       w, bw, bh, detail, face: this.face(w, detail, opts),
       mood: this.cur, lift: this.lift, fullness: (this.contextPct || 0) / 100,
     });
+    // Focus mode: a quieter, dimmer character; the badge (drawn separately below) stays at full
+    // opacity, so the status is never lost even while the pet keeps itself out of the way.
+    if (opts.focusDim) body = ui.column({ width: bw, height: bh, opacity: 0.55 }, [body]);
 
     // Frame: leading spacers place the body (shake = x, lift = y). The right-hand room for
     // decorations is always reserved so the layout never jumps.
@@ -761,16 +1046,22 @@ export class Pet {
     const topGap = fh - bh - round(this.lift * room);
     const rowChildren = [spacerW(left), body];
     if (opts.badge || opts.badgeSlot) {
-      rowChildren.unshift(opts.badge ? this.badge(opts.badge, margin, bh) : spacerW(margin));
+      const streakTier = opts.accessories ? this.streakBadge : 0;
+      const stepsTier = opts.accessories ? this.stepsBadge : 0;
+      const growthTier = opts.accessories ? this.growthTier : 0;
+      const equipped = opts.accessories ? this.equipped : null;
+      rowChildren.unshift(this.badge(opts.badge, margin, bh, streakTier, stepsTier, growthTier, equipped));
       fw += margin;
     }
     if (detail) rowChildren.push(this.decoration(w, baseH, decoW));
     return ui.column({ width: fw, height: fh, justify: "start", align: "start" }, [spacerH(topGap), ui.row({}, rowChildren)]);
   }
 
-  /** One-line caption for the panel. */
+  /** One-line caption for the panel. A few moods are flavored by the character's personality
+   *  (see PERSONALITY_LINES); everything else is shared. */
   caption(nSessions, nWorking, nPending) {
     const mood = this.cur || this.baseMood;
+    const { idle: idleLine, ...moodLines } = PERSONALITY_LINES[this.char.personality] || PERSONALITY_LINES[DEFAULT_PERSONALITY];
     if (mood === "sleep") return "Zzz... the daemon is asleep";
     if (mood === "nap") return "Zzz... taking a nap";
     if (mood === "alert" || nPending > 0) return nPending <= 1 ? "I need you!" : `I need you! (${nPending})`;
@@ -780,6 +1071,9 @@ export class Pet {
       wave: "Hi there!", greeting: "Hello!", eat: "Nom nom nom", dance: "La la la~", wink: ";)", blush: "Stop it, you...",
       sneeze: "Ah... ah... choo!", hum: "Hmm hmm hmm~", think: "Hmmm...", spin: "Wheee!", bounce: "Boing!",
       sip: "*sip*", hiccup: "Hic!", jiggle: "Jiggle jiggle",
+      budget_alert: "Careful, the budget is adding up...", milestone: "New milestone!", policy_match: "That one needs a careful look...",
+      grew_up: "I'm growing!",
+      ...moodLines,
     };
     if (reactions[mood]) return reactions[mood];
     if (nWorking > 0) {
@@ -787,7 +1081,7 @@ export class Pet {
       if (nWorking === 1) return `Your agent is ${what || "working"}...`;
       return `Your agents are working on ${nWorking} sessions...`;
     }
-    return nSessions > 0 ? "All quiet" : "No sessions, hi!";
+    return nSessions > 0 ? idleLine || "All quiet" : "No sessions, hi!";
   }
 }
 
@@ -795,6 +1089,7 @@ export class Pet {
 const DECO = {
   nap: "z", sleep: "z", love: "heart", worried: "sweat", stuffed: "sweat", sad: "tear", happy: "sparkle", hum: "note",
   dance: "note", think: "dots", sneeze: "droplets", hiccup: "hic", wave: "hi", greeting: "hi", eat: "crumbs",
+  budget_alert: "sweat", milestone: "sparkle", grew_up: "sparkle",
 };
 // Decoration while working, by kind of work ("read" has none: the eyes say it).
 const WORK_DECO = { write: "pencil", run: "terminal", search: "search", think: "dots" };

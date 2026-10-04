@@ -32,6 +32,8 @@ mod dock;
 #[path = "dock_windows.rs"]
 mod dock;
 
+mod clipboard_file;
+
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The latest `{ up, snapshot }` sent to the windows, so a window that opens later can catch up.
@@ -96,6 +98,36 @@ async fn chat_clear() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn care_feed() -> Result<(), String> {
+    send(Request::CareFeed)
+}
+
+#[tauri::command]
+async fn care_pet() -> Result<(), String> {
+    send(Request::CarePet)
+}
+
+#[tauri::command]
+async fn care_nap() -> Result<(), String> {
+    send(Request::CareNap)
+}
+
+#[tauri::command]
+async fn care_play(score: u32) -> Result<(), String> {
+    send(Request::CarePlay { score })
+}
+
+#[tauri::command]
+async fn care_buy(id: String) -> Result<(), String> {
+    send(Request::CareBuy { id })
+}
+
+#[tauri::command]
+async fn care_equip(id: String) -> Result<(), String> {
+    send(Request::CareEquip { id })
+}
+
+#[tauri::command]
 fn get_settings() -> Value {
     read_settings()
 }
@@ -111,12 +143,15 @@ fn set_settings(app: AppHandle, settings: Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether this platform/session docks the pet window instead of using the classic two-window
-/// layout: always true on macOS and Windows, probed once on Linux (its compositor may not speak
-/// `wlr-layer-shell`) and cached, since the probe itself may block briefly.
+/// Whether this run docks the pet window instead of using the classic, freely draggable
+/// two-window layout: off if the user turned the "dockedWindow" setting off (checked once at
+/// startup — switching it live would mean tearing down and rebuilding the window from a
+/// completely different model, so it takes a restart instead, like the setting says), otherwise
+/// always true on macOS and Windows, probed on Linux (its compositor may not speak
+/// `wlr-layer-shell`) since the probe itself may block briefly.
 fn docked() -> bool {
     static DOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DOCKED.get_or_init(dock::is_supported)
+    *DOCKED.get_or_init(|| setting_on("dockedWindow") && dock::is_supported())
 }
 
 fn show_panel(app: &AppHandle) {
@@ -321,24 +356,40 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+fn pet_event(app: &AppHandle, kind: &str) {
+    let _ = app.emit("petEvent", json!({ "kind": kind, "ts": now_ms() }));
+}
+
+/// Feed `path` to the pet: it eats it and the panel opens on the chat with the file attached
+/// (see `fedFile` in panel.js). Shared by a real drop and `feed_clipboard` below.
+fn feed_file(app: &AppHandle, path: &std::path::Path) {
+    pet_event(app, "eat");
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let _ = app.emit("fedFile", json!({ "path": path.to_string_lossy(), "name": name }));
+    show_panel(app);
+}
+
 /// A file dragged onto either window is fed to the pet: it waves when the file comes over it, eats
-/// it when dropped, and the panel opens on the chat with the file attached (see `fedFile` in panel.js).
+/// it when dropped, and the panel opens on the chat with the file attached.
 fn on_drag_drop(app: &AppHandle, event: &DragDropEvent) {
-    let pet_event = |kind: &str| {
-        let _ = app.emit("petEvent", json!({ "kind": kind, "ts": now_ms() }));
-    };
     match event {
-        DragDropEvent::Enter { .. } => pet_event("hello"),
+        DragDropEvent::Enter { .. } => pet_event(app, "hello"),
         DragDropEvent::Drop { paths, .. } => match paths.iter().find(|p| p.is_file()) {
-            Some(path) => {
-                pet_event("eat");
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let _ = app.emit("fedFile", json!({ "path": path.to_string_lossy(), "name": name }));
-                show_panel(app);
-            }
-            None => pet_event("sad"), // a folder: nothing it can eat
+            Some(path) => feed_file(app, path),
+            None => pet_event(app, "sad"), // a folder: nothing it can eat
         },
         _ => {}
+    }
+}
+
+/// Middle-click on the pet: feed it whatever file a file manager's "Copy" put on the clipboard,
+/// the fallback for desktops where dragging a file onto the window is awkward (see
+/// `clipboard_file.rs`). A sad shake when there is nothing to eat, same as dropping a folder.
+#[tauri::command]
+fn feed_clipboard(app: AppHandle) {
+    match clipboard_file::path_from_clipboard() {
+        Some(path) if path.is_file() => feed_file(&app, &path),
+        _ => pet_event(&app, "sad"),
     }
 }
 
@@ -362,7 +413,8 @@ fn main() {
         .manage(latest.clone())
         .invoke_handler(tauri::generate_handler![
             get_state, decide, answer, chat_send, chat_stop, chat_clear, get_settings, set_settings, toggle_panel,
-            open_panel, close_panel, fit_pet, quit
+            open_panel, close_panel, fit_pet, quit, feed_clipboard, care_feed, care_pet, care_nap, care_play,
+            care_buy, care_equip
         ])
         .on_window_event(|window, event| match event {
             // Closing the panel only hides it; the pet window is closed from the tray.

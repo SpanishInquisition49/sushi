@@ -26,6 +26,12 @@
 --
 -- While "working" the eyes and a small icon follow the tool Claude is using
 -- (read, write, run, search, think). Hot dishes steam; the sake bottle is tipsy.
+--
+-- Tamagotchi care (see src/care.rs): hunger/energy/affection decay over real time and never drop
+-- below a floor — no punishment, just droopier idle fidgets. Feeding/petting/napping, a mini-game
+-- and a cosmetic shop (Pet.ACCESSORIES) are driven from the panel; the pet only shows the
+-- growth-tier and equipped-accessory pins (Pet:build's opts.accessories) and the one-shot
+-- "grew_up" celebration.
 
 local Pet = {}
 Pet.__index = Pet
@@ -93,37 +99,68 @@ local WASABI_RED = "#d23c3c"
 local MATCHA_GREEN = "#6fae52"
 local MATCHA_FOAM = "#bfe3a8"
 
+-- `personality` picks fidget cadence/favorites and a few flavored lines (see PERSONALITIES
+-- below); it is a vibe call, not a simulation — traditional nigiri stay composed, fried/fizzy
+-- things are energetic, delicate things are shy, imports are fancy, soups and buns are cozy.
 local CHARACTERS = {
-    nigiri_salmon = { kind = "nigiri", ratio = 0.80, top = "#ff8a6b", fat = "#ffc9b5" },
-    nigiri_tuna   = { kind = "nigiri", ratio = 0.80, top = "#d8454f", fat = "#f0868c" },
-    nigiri_tamago = { kind = "nigiri", ratio = 0.80, top = "#ffcf4d", fat = "#ffe79a" },
-    maki          = { kind = "maki",   ratio = 1.00, filling = "#ff8a6b", filling2 = "#8cc76f" },
-    uramaki       = { kind = "uramaki", ratio = 1.00, filling = "#ff8a6b", filling2 = "#8cc76f", filling3 = "#ffd24a" },
-    unagi_nigiri  = { kind = "nigiri", ratio = 0.80, top = "#6a3a22", fat = "#b36b34" },
-    ebi_nigiri    = { kind = "nigiri", ratio = 0.80, top = "#ff9c66", fat = "#fff0e6", bands = "#fff0e6" },
-    ebi_tempura   = { kind = "tempura", ratio = 0.70, steam = true },
-    ikura         = { kind = "ikura",  ratio = 1.00, roe = "#ff7a3d" },
-    inari         = { kind = "inari",  ratio = 0.85 },
-    ravioli       = { kind = "ravioli", ratio = 0.80, steam = true },
-    bao           = { kind = "bao",    ratio = 0.90, steam = true },
-    takoyaki      = { kind = "takoyaki", ratio = 1.00, steam = true },
-    ramen         = { kind = "ramen",  ratio = 0.95, steam = true },
-    miso_soup     = { kind = "miso",   ratio = 0.85, steam = true },
-    edamame       = { kind = "edamame", ratio = 0.80 },
-    onigiri       = { kind = "onigiri", ratio = 0.92 },
-    mochi         = { kind = "mochi",  ratio = 0.88 },
-    bubble_tea    = { kind = "boba",   ratio = 1.35 },
-    sake          = { kind = "sake",   ratio = 1.15, tipsy = true },
-    dorayaki      = { kind = "dorayaki", ratio = 0.86 },
-    dango         = { kind = "dango",  ratio = 1.60, top = "#ff9eb5", mid = "#f6f1ea", bottom = "#a8d58b" },
-    tofu          = { kind = "tofu",   ratio = 1.00 },
-    taiyaki       = { kind = "taiyaki", ratio = 0.72, batter = WAFFLE, batterDark = WAFFLE_DARK },
-    ramune        = { kind = "ramune", ratio = 1.30, glass = GLASS, glassDark = GLASS_DARK },
-    kakigori      = { kind = "kakigori", ratio = 1.05, syrup = BERRY },
-    wasabi        = { kind = "wasabi", ratio = 0.90 },
-    temaki        = { kind = "temaki", ratio = 1.42, filling = "#ff8a6b" },
-    matcha        = { kind = "matcha", ratio = 0.88, steam = true },
-    tamagoyaki    = { kind = "tamagoyaki", ratio = 0.95 },
+    nigiri_salmon = { kind = "nigiri", ratio = 0.80, top = "#ff8a6b", fat = "#ffc9b5", personality = "classic" },
+    nigiri_tuna   = { kind = "nigiri", ratio = 0.80, top = "#d8454f", fat = "#f0868c", personality = "classic" },
+    nigiri_tamago = { kind = "nigiri", ratio = 0.80, top = "#ffcf4d", fat = "#ffe79a", personality = "cozy" },
+    maki          = { kind = "maki",   ratio = 1.00, filling = "#ff8a6b", filling2 = "#8cc76f", personality = "playful" },
+    uramaki       = { kind = "uramaki", ratio = 1.00, filling = "#ff8a6b", filling2 = "#8cc76f", filling3 = "#ffd24a", personality = "fancy" },
+    unagi_nigiri  = { kind = "nigiri", ratio = 0.80, top = "#6a3a22", fat = "#b36b34", personality = "classic" },
+    ebi_nigiri    = { kind = "nigiri", ratio = 0.80, top = "#ff9c66", fat = "#fff0e6", bands = "#fff0e6", personality = "classic" },
+    ebi_tempura   = { kind = "tempura", ratio = 0.70, steam = true, personality = "energetic" },
+    ikura         = { kind = "ikura",  ratio = 1.00, roe = "#ff7a3d", personality = "shy" },
+    inari         = { kind = "inari",  ratio = 0.85, personality = "cozy" },
+    ravioli       = { kind = "ravioli", ratio = 0.80, steam = true, personality = "fancy" },
+    bao           = { kind = "bao",    ratio = 0.90, steam = true, personality = "sleepy" },
+    takoyaki      = { kind = "takoyaki", ratio = 1.00, steam = true, personality = "energetic" },
+    ramen         = { kind = "ramen",  ratio = 0.95, steam = true, personality = "cozy" },
+    miso_soup     = { kind = "miso",   ratio = 0.85, steam = true, personality = "cozy" },
+    edamame       = { kind = "edamame", ratio = 0.80, personality = "playful" },
+    onigiri       = { kind = "onigiri", ratio = 0.92, personality = "classic" },
+    mochi         = { kind = "mochi",  ratio = 0.88, personality = "playful" },
+    bubble_tea    = { kind = "boba",   ratio = 1.35, personality = "energetic" },
+    sake          = { kind = "sake",   ratio = 1.15, tipsy = true, personality = "playful" },
+    dorayaki      = { kind = "dorayaki", ratio = 0.86, personality = "cozy" },
+    dango         = { kind = "dango",  ratio = 1.60, top = "#ff9eb5", mid = "#f6f1ea", bottom = "#a8d58b", personality = "playful" },
+    tofu          = { kind = "tofu",   ratio = 1.00, personality = "calm" },
+    taiyaki       = { kind = "taiyaki", ratio = 0.72, batter = WAFFLE, batterDark = WAFFLE_DARK, personality = "playful" },
+    ramune        = { kind = "ramune", ratio = 1.30, glass = GLASS, glassDark = GLASS_DARK, personality = "energetic" },
+    kakigori      = { kind = "kakigori", ratio = 1.05, syrup = BERRY, personality = "energetic" },
+    wasabi        = { kind = "wasabi", ratio = 0.90, personality = "feisty" },
+    temaki        = { kind = "temaki", ratio = 1.42, filling = "#ff8a6b", personality = "playful" },
+    matcha        = { kind = "matcha", ratio = 0.88, steam = true, personality = "calm" },
+    tamagoyaki    = { kind = "tamagoyaki", ratio = 0.95, personality = "classic" },
+}
+
+-- A personality picks the pace and flavor of idle quirks (fidgetMult: lower = fidgets more often;
+-- favor: fidgets picked more often from the shared pool) and a few flavored lines (see
+-- Pet:caption); everything else (breathing, mood logic, animation) is shared.
+local PERSONALITIES = {
+    classic   = { fidgetMult = 1.0, favor = { "think", "wink" } },
+    energetic = { fidgetMult = 0.6, favor = { "hop", "bounce", "wiggle" } },
+    playful   = { fidgetMult = 0.8, favor = { "wink", "spin", "bounce" } },
+    shy       = { fidgetMult = 1.5, favor = { "blush", "peek" } },
+    fancy     = { fidgetMult = 1.1, favor = { "wink", "think" } },
+    sleepy    = { fidgetMult = 1.6, favor = { "yawn" } },
+    cozy      = { fidgetMult = 1.2, favor = { "hum", "yawn" } },
+    calm      = { fidgetMult = 1.4, favor = { "think", "blush" } },
+    feisty    = { fidgetMult = 0.7, favor = { "sneeze", "squish" } },
+}
+local DEFAULT_PERSONALITY = "classic"
+
+local PERSONALITY_LINES = {
+    classic   = { happy = "Done!", love = "Thank you!", sad = "Aww...", idle = "All quiet" },
+    energetic = { happy = "Woohoo, nailed it!", love = "Yes! More of that!", sad = "Aw, c'mon!", idle = "All quiet... for now!" },
+    playful   = { happy = "Tada! Done~", love = "Hehe, thank you~", sad = "Noooo...", idle = "All quiet, hehe" },
+    shy       = { happy = "Oh! ...it's done.", love = "O-oh, thank you...", sad = "...oh no.", idle = "All quiet (psst, hi)" },
+    fancy     = { happy = "Finished, as expected.", love = "How delightful.", sad = "How unfortunate.", idle = "All quiet, splendidly" },
+    sleepy    = { happy = "Mm, all done...", love = "Mm, thank you...", sad = "Aww, okay...", idle = "All quiet, zzz-ish" },
+    cozy      = { happy = "All done, nice and warm.", love = "So warm, thank you.", sad = "Aww, that's a shame.", idle = "All quiet and cozy" },
+    calm      = { happy = "Finished, calmly.", love = "That was lovely.", sad = "Oh well.", idle = "All quiet" },
+    feisty    = { happy = "Ha! Done!", love = "Hmph... thanks, I guess.", sad = "Ugh, seriously?", idle = "All quiet. Good." },
 }
 
 Pet.CHARACTER_IDS = {
@@ -174,11 +211,16 @@ local MOOD_PARAMS = {
     sip      = { period = 2200, eyeH = 0.50, eyeW = 1.05 },
     hiccup   = { period = 900,  eyeH = 0.80, eyeW = 1.00 },
     jiggle   = { period = 1200, eyeH = 1.00, eyeW = 1.00 },
+    -- One-shot reactions to events from the daemon (see Pet:onSnapshot's event bus handling).
+    budget_alert  = { period = 1100, eyeH = 1.10, eyeW = 0.90 },
+    milestone     = { period = 700,  eyeH = 0.38, eyeW = 1.10 },
+    policy_match  = { period = 900,  eyeH = 1.20, eyeW = 1.15 },
+    grew_up       = { period = 700,  eyeH = 0.38, eyeW = 1.10 },
 }
 
 -- Eyes drawn as thin happy bars (no shine).
 local SQUINT = { sleep = true, nap = true, happy = true, love = true, yawn = true, hum = true,
-    eat = true, dance = true, sip = true, stuffed = true, sneeze = true }
+    eat = true, dance = true, sip = true, stuffed = true, sneeze = true, grew_up = true }
 
 -- Random idle quirks: {mood, duration ms}.
 local FIDGETS = {
@@ -207,7 +249,172 @@ local SOUND_FOR = {
     annoyed = "annoyed", dizzy = "dizzy", hop = "hop", bounce = "bounce", wiggle = "wiggle", squish = "squish",
     jiggle = "squish", yawn = "yawn", sneeze = "sneeze", hiccup = "hiccup", hum = "hum", think = "think",
     wink = "wink", blush = "blush", spin = "spin", eat = "eat", dance = "dance", nap = "nap", alert = "alert",
+    budget_alert = "budget", milestone = "milestone", policy_match = "policy", grew_up = "levelup",
 }
+
+-- How long each one-shot daemon event's reaction lasts (see Pet:onSnapshot's event bus handling).
+local EVENT_DURATION = { budget_alert = 1300, milestone = 1800, policy_match = 1100, grew_up = 1800 }
+
+-- ── Gamification accessories: small permanent pins for the highest milestone ever earned ──────
+-- (see src/stats.rs's highest_unlocked — an earned badge, not a live gauge: it stays even if e.g.
+-- the streak itself later resets to 0). One track for the day streak, one for steps watched.
+local STREAK_TIERS = { 3, 7, 14, 30, 100 }
+local STEP_TIERS = { 100, 500, 1000, 5000, 10000 }
+local TIER_COLORS = { "#b08d57", "#c7c7cf", "#e8b64c", "#8fd3e8", "#c9a6ff" } -- bronze, silver, gold, platinum, diamond
+local TIER_NAMES = { "Bronze", "Silver", "Gold", "Platinum", "Diamond" }
+
+--- Index (1-based) of the highest tier `value` reaches in `tiers`, 0 if none.
+local function tierOf(value, tiers)
+    local n = 0
+    for _, t in ipairs(tiers) do
+        if value >= t then n = n + 1 end
+    end
+    return n
+end
+
+-- ── Tamagotchi care (see src/care.rs, the single source of truth): hunger/energy/affection decay
+-- over real wall-clock time and never drop below a floor (no punishment — just a visibly needy
+-- pet), a monotonic xp track unlocks growth tiers, and a small fixed cosmetic shop. The meters and
+-- shop grid are drawn by the panel; the pet itself only shows the growth aura and the equipped
+-- accessory, both as extra pins in the same reserved slot the streak/steps badges already use
+-- (see Pet:badge) — never as a new body shape.
+local GROWTH_TIERS = { 50, 150, 400, 900, 2000 }
+-- Below this, idle fidgets lean droopy (see Pet:tick's fidget pool) — a visual cue only.
+local NEED_LOW = 35
+-- id -> { cost, label }. Mirrors ACCESSORIES in src/care.rs (the daemon validates cost). The art
+-- itself is Pet.accessoryArt below (no emoji — it rendered differently per platform and often
+-- didn't look like the accessory it was supposed to be).
+Pet.ACCESSORIES = {
+    party_hat = { cost = 20, label = "Party hat" },
+    bow = { cost = 20, label = "Bow" },
+    sunglasses = { cost = 30, label = "Sunglasses" },
+    scarf = { cost = 30, label = "Scarf" },
+    headphones = { cost = 40, label = "Headphones" },
+    monocle = { cost = 45, label = "Monocle" },
+    flower_crown = { cost = 50, label = "Flower crown" },
+    chef_hat = { cost = 50, label = "Chef hat" },
+    wizard_hat = { cost = 60, label = "Wizard hat" },
+    top_hat = { cost = 65, label = "Top hat" },
+    crown = { cost = 70, label = "Crown" },
+}
+
+-- ── Accessory art: small flat pictograms built from the same box/row/column primitives as the
+-- character bodies (see the *Body functions below) — a drawn shop icon for each accessory instead
+-- of an emoji glyph, so it reads the same everywhere and actually looks like the thing it's named
+-- after (see app/ui/js/pet.js's accessoryArt, the port this mirrors).
+local ACC_RED, ACC_PINK, ACC_GOLD, ACC_BLUE = "#e05a52", "#ff9ab0", "#e8b64c", "#2f6fed"
+local ACC_DARK, ACC_GREEN, ACC_PURPLE, ACC_CREAM = "#2b2023", "#6fae52", "#6a4c93", "#fbf6ec"
+
+local function aCircle(d, fill, border)
+    return ui.box({ width = d, height = d, radius = round(d / 2), fill = fill, border = border, borderWidth = border and 1.5 or nil })
+end
+local function aBar(w, h, fill, radius)
+    return ui.box({ width = w, height = h, radius = radius or 2, fill = fill })
+end
+
+local ACCESSORY_ART = {
+    party_hat = function(s)
+        return ui.column({ align = "center", gap = 1 }, {
+            aCircle(round(s * 0.16), ACC_CREAM),
+            aBar(round(s * 0.18), round(s * 0.14), ACC_BLUE),
+            aBar(round(s * 0.40), round(s * 0.14), ACC_RED),
+            aBar(round(s * 0.62), round(s * 0.14), ACC_GOLD),
+            aBar(round(s * 0.84), round(s * 0.14), ACC_BLUE),
+        })
+    end,
+    bow = function(s)
+        return ui.row({ align = "center", gap = round(s * 0.03) }, {
+            aBar(round(s * 0.14), round(s * 0.70), ACC_PINK, round(s * 0.07)),
+            aBar(round(s * 0.14), round(s * 0.42), ACC_PINK, round(s * 0.07)),
+            aCircle(round(s * 0.18), ACC_GOLD),
+            aBar(round(s * 0.14), round(s * 0.42), ACC_PINK, round(s * 0.07)),
+            aBar(round(s * 0.14), round(s * 0.70), ACC_PINK, round(s * 0.07)),
+        })
+    end,
+    sunglasses = function(s)
+        return ui.row({ align = "center", gap = round(s * 0.04) }, {
+            aCircle(round(s * 0.42), ACC_DARK),
+            aBar(round(s * 0.16), round(s * 0.08), ACC_DARK, round(s * 0.04)),
+            aCircle(round(s * 0.42), ACC_DARK),
+        })
+    end,
+    scarf = function(s)
+        return ui.column({ align = "center", gap = round(s * 0.04) }, {
+            aBar(round(s * 0.82), round(s * 0.20), ACC_RED, round(s * 0.10)),
+            aBar(round(s * 0.42), round(s * 0.38), "#8f2a22", round(s * 0.08)),
+            ui.row({ gap = round(s * 0.04) }, {
+                aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1),
+                aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1),
+                aBar(round(s * 0.06), round(s * 0.12), ACC_CREAM, 1),
+            }),
+        })
+    end,
+    headphones = function(s)
+        return ui.column({ align = "center", gap = round(s * 0.08) }, {
+            aBar(round(s * 0.78), round(s * 0.16), ACC_DARK, round(s * 0.08)),
+            ui.row({ width = round(s * 0.84), justify = "space_between", align = "center" }, {
+                aCircle(round(s * 0.32), ACC_DARK), aCircle(round(s * 0.32), ACC_DARK),
+            }),
+        })
+    end,
+    monocle = function(s)
+        return ui.column({ align = "end", gap = round(s * 0.03) }, {
+            ui.box({ width = round(s * 0.5), height = round(s * 0.5), radius = round(s * 0.25), border = ACC_GOLD, borderWidth = 2 }),
+            ui.row({ gap = round(s * 0.04) }, { aCircle(round(s * 0.08), ACC_GOLD), aCircle(round(s * 0.08), ACC_GOLD) }),
+        })
+    end,
+    flower_crown = function(s)
+        return ui.column({ align = "center", gap = round(s * 0.04) }, {
+            ui.row({ gap = round(s * 0.05) }, {
+                aCircle(round(s * 0.24), ACC_PINK), aCircle(round(s * 0.24), ACC_GOLD), aCircle(round(s * 0.24), ACC_PINK),
+            }),
+            aBar(round(s * 0.78), round(s * 0.12), ACC_GREEN, round(s * 0.06)),
+        })
+    end,
+    chef_hat = function(s)
+        return ui.column({ align = "center", gap = 1 }, {
+            ui.box({ width = round(s * 0.7), height = round(s * 0.42), radius = round(s * 0.18), fill = "#ffffff", border = ACC_DARK, borderWidth = 1 }),
+            aBar(round(s * 0.5), round(s * 0.16), ACC_DARK),
+        })
+    end,
+    wizard_hat = function(s)
+        return ui.column({ align = "center", gap = 1 }, {
+            aCircle(round(s * 0.12), ACC_GOLD),
+            aBar(round(s * 0.18), round(s * 0.14), ACC_PURPLE),
+            aBar(round(s * 0.34), round(s * 0.14), ACC_PURPLE),
+            aBar(round(s * 0.5), round(s * 0.14), ACC_PURPLE),
+            aBar(round(s * 0.66), round(s * 0.12), ACC_PURPLE),
+            aBar(round(s * 0.84), round(s * 0.1), "#4a3569"),
+        })
+    end,
+    top_hat = function(s)
+        return ui.column({ align = "center", gap = 1 }, {
+            aBar(round(s * 0.5), round(s * 0.34), ACC_DARK, round(s * 0.05)),
+            aBar(round(s * 0.5), round(s * 0.10), ACC_GOLD, 2),
+            aBar(round(s * 0.82), round(s * 0.10), ACC_DARK, round(s * 0.05)),
+        })
+    end,
+    crown = function(s)
+        return ui.column({ align = "center", gap = round(s * 0.02) }, {
+            ui.row({ align = "end", gap = round(s * 0.02) }, {
+                aBar(round(s * 0.12), round(s * 0.42), ACC_GOLD),
+                aBar(round(s * 0.12), round(s * 0.74), ACC_GOLD),
+                aBar(round(s * 0.12), round(s * 0.50), ACC_GOLD),
+                aBar(round(s * 0.12), round(s * 0.74), ACC_GOLD),
+                aBar(round(s * 0.12), round(s * 0.42), ACC_GOLD),
+            }),
+            ui.row({ width = round(s * 0.74), height = round(s * 0.16), fill = "#c99a3e", radius = 2, align = "center", justify = "space_between" }, {
+                aCircle(round(s * 0.09), ACC_RED), aCircle(round(s * 0.09), ACC_GREEN), aCircle(round(s * 0.09), ACC_BLUE),
+            }),
+        })
+    end,
+}
+
+--- The drawn icon for accessory `id` at roughly `s` px wide, or nil for an unknown id.
+function Pet.accessoryArt(id, s)
+    local build = ACCESSORY_ART[id]
+    return build and build(s) or nil
+end
 
 -- ── Construction & configuration ──────────────────────────────────────────────
 
@@ -217,15 +424,17 @@ function Pet.configFrom(get)
     if type(character) ~= "string" or not CHARACTERS[character] then character = DEFAULT_CHARACTER end
     local fidgets = get("fidgets")
     local nap = tonumber(get("napAfterSec"))
+    local gamification = get("gamificationEnabled")
     return {
         character = character,
         fidgets = (fidgets ~= false and fidgets ~= "false"),
         napAfterSec = nap and clamp(nap, 0, 3600) or 120, -- 0 = never
+        gamification = (gamification ~= false and gamification ~= "false"),
     }
 end
 
 function Pet:configure(cfg)
-    self.cfg = cfg or { character = DEFAULT_CHARACTER, fidgets = true, napAfterSec = 120 }
+    self.cfg = cfg or { character = DEFAULT_CHARACTER, fidgets = true, napAfterSec = 120, gamification = true }
     self.char = CHARACTERS[self.cfg.character] or CHARACTERS[DEFAULT_CHARACTER]
 end
 
@@ -257,6 +466,16 @@ function Pet.new(nowMs, cfg)
     self.cheek = 0               -- 0..1, how flushed the cheeks are
     self.workKind = "read"       -- read / write / run / search / think
     self.contextPct = 0          -- the active session's context window, last seen (0..100)
+    self.streakBadge = 0         -- highest streak milestone tier ever earned (0..5, see TIER_COLORS)
+    self.stepsBadge = 0          -- highest step-count milestone tier ever earned (0..5)
+    -- Tamagotchi care, read from the daemon's snapshot each time (never cached), same as the
+    -- badges above: hunger/energy/affection (0..100), growthTier (0..5), currency, owned
+    -- accessory ids and the one currently equipped (see Pet.ACCESSORIES).
+    self.hunger, self.energy, self.affection = 100, 100, 100
+    self.growthTier = 0
+    self.currency = 0
+    self.owned = {}
+    self.equipped = nil
     self.knownSessions = nil     -- ids seen in the last snapshot
     self.failureCounts = {}      -- session id -> activity.failures last seen
     self.turnHadFailure = false  -- a failure happened since the pet was last idle
@@ -264,6 +483,8 @@ function Pet.new(nowMs, cfg)
     self.hover = nil
     self.prevWorking = false
     self.cur, self.curP = "idle", 0
+    self.lastSeenEventId = nil -- nil = first snapshot: do not replay events already in the capped list
+    self.focus = false         -- focus mode: muted sounds, no idle fidgets (see Pet:setFocus)
     self:trigger("greeting", 1800, now) -- says hello when it appears
     self.sounds, self.soundsOn, self.soundMood, self.soundOverride, self.wakeCue = {}, false, nil, nil, false
     return self
@@ -276,8 +497,15 @@ function Pet:enableSounds(on)
     if not self.soundsOn then self.sounds = {} end
 end
 
+--- Focus mode (see Fmt.isFocusActive): mutes sounds and stops idle fidgets while `active`, so the
+--- pet stays quiet and still without disappearing (the status badge is drawn by the caller, not by
+--- the pet itself, so it is unaffected).
+function Pet:setFocus(active)
+    self.focus = active and true or false
+end
+
 function Pet:cue(name)
-    if not (self.soundsOn and name) then return end
+    if not (self.soundsOn and name) or self.focus then return end
     self.sounds[#self.sounds + 1] = name
     if #self.sounds > 12 then table.remove(self.sounds, 1) end
 end
@@ -363,6 +591,21 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
         -- The active session's context window, kept until a new reading comes in
         -- (drives the kakigori's melt; stays put while idle rather than snapping back).
         if active and active.context and active.context.percent then self.contextPct = active.context.percent end
+        -- Gamification accessories: the highest milestone ever earned (0 when the setting is
+        -- off, so Pet:build simply draws nothing).
+        local st = (snap and snap.stats) or {}
+        self.streakBadge = self.cfg.gamification and tierOf(st.streak_badge or 0, STREAK_TIERS) or 0
+        self.stepsBadge = self.cfg.gamification and tierOf(st.steps_badge or 0, STEP_TIERS) or 0
+        local care = snap and snap.care
+        if care then
+            self.hunger = care.hunger or self.hunger
+            self.energy = care.energy or self.energy
+            self.affection = care.affection or self.affection
+            self.growthTier = care.growth_tier or 0
+            self.currency = care.currency or 0
+            self.owned = care.owned or {}
+            self.equipped = care.equipped
+        end
 
         local lim
         for _, a in pairs((snap and snap.agents) or {}) do
@@ -384,6 +627,17 @@ function Pet:onSnapshot(snap, daemonUp, nowMs)
         self.prevChatBusy = chatBusy
         if chatBusy then self.lastActive = nowMs end
     end
+    -- One-shot events from the daemon (budget_alert, milestone, policy_match): react once per id,
+    -- never replaying events that were already in the capped list on the very first snapshot.
+    local maxSeenEvent = self.lastSeenEventId
+    for _, e in ipairs((snap and snap.events) or {}) do
+        local id = e.id or 0
+        if self.lastSeenEventId ~= nil and id > self.lastSeenEventId and EVENT_DURATION[e.kind] then
+            self:trigger(e.kind, EVENT_DURATION[e.kind], nowMs)
+        end
+        if maxSeenEvent == nil or id > maxSeenEvent then maxSeenEvent = id end
+    end
+    self.lastSeenEventId = maxSeenEvent or 0
     if working or pending > 0 then
         self.lastActive = nowMs
         self.forceNap = false
@@ -460,6 +714,7 @@ local DECO = {
     nap = "z", sleep = "z", love = "heart", worried = "sweat", stuffed = "sweat", sad = "tear",
     happy = "sparkle", hum = "note", dance = "note", think = "dots", sneeze = "droplets",
     hiccup = "hic", wave = "hi", greeting = "hi", eat = "crumbs",
+    budget_alert = "sweat", milestone = "sparkle", grew_up = "sparkle",
 }
 -- Decoration while working, by kind of work ("read" has none: the eyes say it).
 local WORK_DECO = { write = "pencil", run = "terminal", search = "search", think = "dots" }
@@ -481,14 +736,38 @@ function Pet:tick(nowMs)
     end
     self.prevBase = (mood == "nap") and "nap" or "other"
 
-    -- Random idle quirks (the generic ones plus a few that suit the character).
-    if mood == "idle" and self.cfg.fidgets and nowMs >= self.nextFidget then
+    -- Random idle quirks (the generic ones plus a few that suit the character and its
+    -- personality — see PERSONALITIES); none while focused.
+    if mood == "idle" and self.cfg.fidgets and not self.focus and nowMs >= self.nextFidget then
+        local personality = PERSONALITIES[self.char.personality] or PERSONALITIES[DEFAULT_PERSONALITY]
         local pool = {}
         for _, f in ipairs(FIDGETS) do pool[#pool + 1] = f end
         for _, f in ipairs(EXTRA_FIDGETS[self.cfg.character] or {}) do pool[#pool + 1] = f end
+        -- Favorite fidgets are duplicated in the pool so the random pick leans toward them.
+        for _, name in ipairs(personality.favor) do
+            for _, f in ipairs(FIDGETS) do
+                if f[1] == name then
+                    pool[#pool + 1] = f
+                    pool[#pool + 1] = f
+                end
+            end
+        end
+        -- A need running low (see src/care.rs's floor — never 0, never a punishment) leans the
+        -- idle fidgets droopy: a purely visual "I could use some attention" cue.
+        if self.hunger < NEED_LOW or self.energy < NEED_LOW or self.affection < NEED_LOW then
+            for _, name in ipairs({ "yawn", "think" }) do
+                for _, f in ipairs(FIDGETS) do
+                    if f[1] == name then
+                        pool[#pool + 1] = f
+                        pool[#pool + 1] = f
+                        pool[#pool + 1] = f
+                    end
+                end
+            end
+        end
         local f = pool[math.random(#pool)]
         self:trigger(f[1], f[2], nowMs)
-        self.nextFidget = nowMs + rand(10000, 25000)
+        self.nextFidget = nowMs + rand(10000, 25000) * personality.fidgetMult
         mood, p = self:mood(nowMs)
     end
 
@@ -1429,26 +1708,55 @@ function Pet:decoration(w, height, width)
 end
 
 --- A small status bubble (like a chat "typing" indicator) for the top-left of the pet.
-function Pet:badge(kind, width, height)
-    local d = math.max(10, round(width * 0.95))
-    local inner
-    if kind == "alert" then
-        inner = ui.label({ text = "!", fontSize = round(d * 0.7), fontWeight = "bold", color = "#ffffff" })
-    else
-        local dot = math.max(2, round(d * 0.16))
-        local dots = {}
-        for i = 0, 2 do
-            -- The dots pulse one after the other.
-            local pulse = 0.4 + 0.6 * math.max(0, math.sin((self.t / 260) - i * 0.9))
-            dots[#dots + 1] = ui.box({ width = dot, height = dot, radius = round(dot / 2), fill = "#ffffff", opacity = pulse })
+--- A small status bubble (top) and/or gamification pins (below it, when the caller opts in via
+--- Pet:build's opts.accessories) for the left-hand slot: "work"/"alert" for the status, plus the
+--- highest milestone ever earned on each track (see TIER_COLORS/TIER_NAMES) — a flame for the day
+--- streak, an award for steps watched. Always the same keyed column, with or without any of them.
+function Pet:badge(kind, width, height, streakTier, stepsTier, growthTier, equipped)
+    local children = {}
+    if kind then
+        local d = math.max(10, round(width * 0.95))
+        local inner
+        if kind == "alert" then
+            inner = ui.label({ text = "!", fontSize = round(d * 0.7), fontWeight = "bold", color = "#ffffff" })
+        else
+            local dot = math.max(2, round(d * 0.16))
+            local dots = {}
+            for i = 0, 2 do
+                -- The dots pulse one after the other.
+                local pulse = 0.4 + 0.6 * math.max(0, math.sin((self.t / 260) - i * 0.9))
+                dots[#dots + 1] = ui.box({ width = dot, height = dot, radius = round(dot / 2), fill = "#ffffff", opacity = pulse })
+            end
+            inner = ui.row({ gap = math.max(1, round(dot * 0.5)), align = "center" }, dots)
         end
-        inner = ui.row({ gap = math.max(1, round(dot * 0.5)), align = "center" }, dots)
+        children[#children + 1] = ui.column({
+            width = d, height = d, fill = (kind == "alert") and "#f59e0b" or "#2f6fed", radius = round(d / 2),
+            border = "#0d0f13", borderWidth = 2, align = "center", justify = "center",
+        }, { inner })
     end
-    local bubble = ui.column({
-        width = d, height = d, fill = (kind == "alert") and "#f59e0b" or "#2f6fed", radius = round(d / 2),
-        border = "#0d0f13", borderWidth = 2, align = "center", justify = "center",
-    }, { inner })
-    return ui.column({ key = "badge", width = round(width), height = round(height), align = "start", justify = "start" }, { bubble })
+    local pinD = math.max(8, round(width * 0.7))
+    local function pin(glyph, tier, tiers, label)
+        if not tier or tier == 0 then return nil end
+        return ui.column({
+            width = pinD, height = pinD, fill = TIER_COLORS[tier] .. "cc", radius = round(pinD / 2),
+            border = "#0d0f13", borderWidth = 1, align = "center", justify = "center",
+            tooltip = TIER_NAMES[tier] .. " · " .. label(tiers[tier]),
+        }, { ui.glyph({ name = glyph, size = round(pinD * 0.62), color = "#1b1410" }) })
+    end
+    local flame = pin("flame", streakTier, STREAK_TIERS, function(n) return n .. "-day streak" end)
+    if flame then children[#children + 1] = flame end
+    local award = pin("award", stepsTier, STEP_TIERS, function(n) return n .. " steps watched" end)
+    if award then children[#children + 1] = award end
+    local sprout = pin("sparkles", growthTier, GROWTH_TIERS, function(n) return "grew at " .. n .. " xp" end)
+    if sprout then children[#children + 1] = sprout end
+    local accessory = equipped and Pet.ACCESSORIES[equipped]
+    if accessory then
+        children[#children + 1] = ui.column({
+            width = pinD, height = pinD, fill = "#ffffffcc", radius = round(pinD / 2),
+            border = "#0d0f13", borderWidth = 1, align = "center", justify = "center", tooltip = accessory.label,
+        }, { Pet.accessoryArt(equipped, round(pinD * 0.64)) })
+    end
+    return ui.column({ key = "badge", width = round(width), height = round(height), align = "start", justify = "start", gap = 3 }, children)
 end
 
 --- Build the UI tree for a character `size` px wide.
@@ -1461,6 +1769,9 @@ end
 ---              bubble in the top-left corner (needs a margin of ~20 px)
 --- opts.badgeSlot  keep the room for the bubble even when there is none, so the pet does
 ---              not jump sideways when the bubble comes and goes
+--- opts.accessories  also show the gamification pins (highest streak / steps-watched milestone
+---              ever earned) below the badge, in the same reserved slot — needs opts.badge or
+---              opts.badgeSlot
 function Pet:build(size, opts)
     opts = opts or {}
     local c = self.char
@@ -1478,6 +1789,11 @@ function Pet:build(size, opts)
         w = w, bw = bw, bh = bh, detail = detail, color = opts.color, face = self:face(w, detail, opts),
         mood = self.cur, lift = self.lift, fullness = (self.contextPct or 0) / 100,
     })
+    -- Focus mode: a quieter, dimmer character; the badge (drawn separately below) stays at full
+    -- opacity, so the status is never lost even while the pet keeps itself out of the way.
+    if opts.focusDim then
+        body = ui.column({ width = bw, height = bh, opacity = 0.55 }, { body })
+    end
 
     -- Frame: leading spacers place the body (shake = x, lift = y). The right-hand
     -- room for decorations is always reserved so the layout never jumps.
@@ -1488,13 +1804,16 @@ function Pet:build(size, opts)
     local topGap = fh - bh - round(self.lift * room)
     local rowChildren = { spacerW(left), body }
     if opts.badge or opts.badgeSlot then
-        -- A status bubble on the left, level with the top of the body; the room is always
-        -- reserved so the frame keeps the same width with or without it. The empty slot is a
-        -- column under the same key, not a spacer: Noctalia would otherwise hand the bubble's
-        -- nodes to the body when the bubble goes, and the body would keep its fill and opacity.
-        local slot = opts.badge and self:badge(opts.badge, margin, bh)
-            or ui.column({ key = "badge", width = round(margin), height = round(bh) }, {})
-        table.insert(rowChildren, 1, slot)
+        -- A status bubble (and, if opts.accessories, the gamification pins) on the left, level
+        -- with the top of the body; the room is always reserved so the frame keeps the same
+        -- width regardless of what is actually shown. Pet:badge always returns the same keyed
+        -- column (see there): Noctalia would otherwise hand a stale node's fill/opacity to the
+        -- body (a sibling) when the slot's shape changed without that key.
+        local streakTier = opts.accessories and self.streakBadge or 0
+        local stepsTier = opts.accessories and self.stepsBadge or 0
+        local growthTier = opts.accessories and self.growthTier or 0
+        local equipped = opts.accessories and self.equipped or nil
+        table.insert(rowChildren, 1, self:badge(opts.badge, margin, bh, streakTier, stepsTier, growthTier, equipped))
         fw = fw + margin
     end
     if detail then rowChildren[#rowChildren + 1] = self:decoration(w, baseH, decoW) end
@@ -1504,20 +1823,25 @@ function Pet:build(size, opts)
     })
 end
 
---- One-line caption for the panel.
+--- One-line caption for the panel. A few moods are flavored by the character's personality (see
+--- PERSONALITY_LINES); everything else is shared.
 function Pet:caption(nSessions, nWorking, nPending)
     local mood = self.cur or self.baseMood
+    local lines = PERSONALITY_LINES[self.char.personality] or PERSONALITY_LINES[DEFAULT_PERSONALITY]
     if mood == "sleep" then return "Zzz... the daemon is asleep" end
     if mood == "nap" then return "Zzz... taking a nap" end
     if mood == "alert" or nPending > 0 then
         return nPending <= 1 and "I need you!" or ("I need you! (" .. nPending .. ")")
     end
     local reactions = {
-        love = "Thank you!", sad = "Aww...", startled = "Whoa!", dizzy = "Whoa, everything is spinning!",
-        annoyed = "Hey!", happy = "Done!", yawn = "*yawn*", worried = "Usage is getting high...",
+        startled = "Whoa!", dizzy = "Whoa, everything is spinning!",
+        annoyed = "Hey!", yawn = "*yawn*", worried = "Usage is getting high...",
         stuffed = "So full... compact the context?", wave = "Hi there!", greeting = "Hello!", eat = "Nom nom nom", dance = "La la la~",
         wink = ";)", blush = "Stop it, you...", sneeze = "Ah... ah... choo!", hum = "Hmm hmm hmm~",
         think = "Hmmm...", spin = "Wheee!", bounce = "Boing!", sip = "*sip*", hiccup = "Hic!", jiggle = "Jiggle jiggle",
+        budget_alert = "Careful, the budget is adding up...", milestone = "New milestone!",
+        policy_match = "That one needs a careful look...", grew_up = "I'm growing!",
+        love = lines.love, happy = lines.happy, sad = lines.sad,
     }
     if reactions[mood] then return reactions[mood] end
     if nWorking > 0 then
@@ -1525,7 +1849,7 @@ function Pet:caption(nSessions, nWorking, nPending)
         if nWorking == 1 then return "Your agent is " .. (what or "working") .. "..." end
         return "Your agents are working on " .. nWorking .. " sessions..."
     end
-    if nSessions > 0 then return "All quiet" end
+    if nSessions > 0 then return lines.idle or "All quiet" end
     return "No sessions, hi!"
 end
 

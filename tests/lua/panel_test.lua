@@ -379,7 +379,9 @@ do
         local shown = math.min(n, 3)
         assert(railRows(t) == 6 - shown + 1, n .. " sessions: rail rows (Done included) " .. railRows(t))
         assert(byKey(t.out(), "step-done")[1], "Done is still there")
-        assert(sessionScroll(t).p.minHeight == shown * 28, n .. " sessions: the list keeps room for " .. shown .. " rows")
+        -- A fixed-height scroll box (not flexGrow), so it never fights the rail for space or
+        -- renders on top of it, regardless of how many sessions there are.
+        assert(sessionScroll(t).p.height == 5 * 28, n .. " sessions: the list is a fixed-height scroll box")
         assert(#byKey(sessionScroll(t), "session-") == n, "every session is listed")
     end
     local t = open({}, snapshot(sessions(2, "working")))

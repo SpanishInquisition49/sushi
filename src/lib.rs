@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod care;
 pub mod chat;
 pub mod client;
 pub mod activity;
@@ -7,6 +8,8 @@ pub mod install;
 pub mod ipc;
 pub mod limits;
 pub mod paths;
+pub mod policy;
 pub mod protocol;
 pub mod sessions;
+pub mod stats;
 pub mod usage;

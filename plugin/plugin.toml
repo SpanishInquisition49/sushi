@@ -1,17 +1,17 @@
-# Sushi — a pet on the notch that shows your coding agents' sessions (Claude Code, Codex, GitHub Copilot, Antigravity, opencode, pi).
+# Sushi — a pet on the notch that shows your coding agents' sessions (Claude Code, Codex, GitHub Copilot, Antigravity, Gemini CLI, opencode, pi).
 # Clicking the pet opens a window attached to the notch.
 # Middle-clicking it feeds it the file copied in the file manager (the chat then asks about it).
 # Data comes from the `sushi daemon` (see the repo README / src/main.rs).
 
 id           = "scanna/sushi"
 name         = "Sushi"
-version      = "0.11.0"
+version      = "0.12.0"
 plugin_api   = 21
 author       = "scanna"
 license      = "MIT"
-tags         = ["bar", "panel", "service", "claude", "codex", "copilot", "antigravity", "opencode", "pi"]
+tags         = ["bar", "panel", "service", "claude", "codex", "copilot", "antigravity", "gemini", "opencode", "pi"]
 icon         = "robot"
-description  = "A pet on the notch that tracks your coding agents (Claude Code, Codex, GitHub Copilot, Antigravity, opencode, pi)."
+description  = "A pet on the notch that tracks your coding agents (Claude Code, Codex, GitHub Copilot, Antigravity, Gemini CLI, opencode, pi)."
 dependencies = []
 
 # ── Plugin-level settings ─────────────────────────────────────────────────────
@@ -130,6 +130,41 @@ description_key = "settings.nap_after.description"
 default         = 120
 min             = 0
 max             = 3600
+
+[[setting]]
+key             = "focusEnabled"
+type            = "bool"
+label_key       = "settings.focus_enabled.label"
+description_key = "settings.focus_enabled.description"
+default         = false
+
+[[setting]]
+key             = "focusStart"
+type            = "string"
+label_key       = "settings.focus_start.label"
+description_key = "settings.focus_start.description"
+default         = "09:00"
+
+[[setting]]
+key             = "focusEnd"
+type            = "string"
+label_key       = "settings.focus_end.label"
+description_key = "settings.focus_end.description"
+default         = "18:00"
+
+[[setting]]
+key             = "focusDays"
+type            = "string"
+label_key       = "settings.focus_days.label"
+description_key = "settings.focus_days.description"
+default         = "1111100"
+
+[[setting]]
+key             = "gamificationEnabled"
+type            = "bool"
+label_key       = "settings.gamification.label"
+description_key = "settings.gamification.description"
+default         = true
 
 # ── Background service (reads the daemon's state.json) ───────────────────────
 

@@ -86,6 +86,13 @@ export const ui = {
     else if (p.maxLines) s += `display:-webkit-box;-webkit-line-clamp:${p.maxLines};-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;`;
     return `<span${attrs(p)} style="${s}">${esc(p.text)}</span>`;
   },
+  /** A rounded progress bar: `pct` (0..100) of `fill` (a palette token/color) over a faint track. */
+  meter(p) {
+    const h = p.height || 6;
+    const pct = Math.max(0, Math.min(100, p.pct));
+    const outer = { width: p.width, height: h, radius: Math.round(h / 2), fill: "surface_variant" };
+    return `<div${attrs(p)} style="${css(outer)}overflow:hidden;"><div style="width:${pct}%;height:100%;background:${col(p.fill || "primary")};"></div></div>`;
+  },
   glyph(p) {
     const size = p.size || 16;
     let s = `width:${size}px;height:${size}px;flex-shrink:0;`;
@@ -123,9 +130,17 @@ const ICONS = {
   x: path("M18 6l-12 12M6 6l12 12"),
   cookie: path("M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0M8 10v.01M12 8v.01M15 12v.01M10 15v.01M13 16v.01"),
   moon: path("M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"),
+  bed: path("M3 18v-8a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v8M3 14h18M6 8v-3h5a3 3 0 0 1 3 3"),
+  "moon-stars": path("M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z") +
+    path("M19 3v3M17.5 4.5h3M5 4v2M4 5h2"),
   send: path("M10 14l11 -11M21 3l-6.5 18a.55 .55 0 0 1 -1 0l-3.5 -7l-7 -3.5a.55 .55 0 0 1 0 -1l18 -6.5"),
   trash: path("M4 7l16 0M10 11l0 6M14 11l0 6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"),
   "player-stop": path("M5 7a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2z", FILLED),
+  flame: path(
+    "M12 12c2 -2.667 0 -5.333 -1 -6c0 1.333 -.667 2 -2 3c-1.333 1 -2 2.333 -2 4a5 5 0 1 0 10 0c0 -1.333 -.667 -2.667 -2 -4c0 1.333 -1 2 -2 1.667c-.667 -.333 -1 -1 -1 -1z",
+    FILLED,
+  ),
+  award: path("M12 9m-5 0a5 5 0 1 0 10 0a5 5 0 1 0 -10 0M8.2 13.9l-1.2 7.1l5 -3l5 3l-1.2 -7.1"),
   settings: path(
     "M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065zM9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0",
   ),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthesize the pet's 28 sounds into plugin/sounds/*.wav.
+"""Synthesize the pet's 34 sounds into plugin/sounds/*.wav.
 
 Pure standard library (wave, math, struct, random): short, soft, deterministic blips
 in a chiptune / toy style. Run it again to regenerate; the output does not change.
@@ -264,6 +264,38 @@ def s_deny():  # no: low and flat
                tone(note("D3"), 0.24, "square", 0.45, duty=0.5, glide=note("C3"), release=0.14))
 
 
+def s_budget():  # a budget threshold crossed: a soft, cautionary descending chime
+    beep = lambda n, d: tone(note(n), d, "sine", 0.6, release=0.08, decay=4)
+    return seq(beep("A5", 0.14), silence(0.04), beep("F5", 0.18))
+
+
+def s_milestone():  # a streak or step-count milestone: a small fanfare
+    notes = [tone(note(n), 0.1, "square", 0.45, duty=0.35, release=0.04) for n in ("C5", "E5", "G5", "C6")]
+    sparkle = tone(note("C7"), 0.3, "sine", 0.25, release=0.22, decay=7)
+    return layer(seq(*notes), at(0.3, sparkle))
+
+
+def s_policy():  # a policy-flagged step: a short, electronic caution ping
+    return seq(tone(note("D5"), 0.09, "square", 0.5, duty=0.25, release=0.03),
+               tone(note("D5"), 0.09, "square", 0.5, duty=0.25, release=0.05))
+
+
+def s_coin():  # a shop/mini-game currency pickup: a bright two-note ding
+    return seq(tone(note("B5"), 0.06, "square", 0.4, duty=0.3, release=0.02),
+               tone(note("E6"), 0.14, "square", 0.4, duty=0.3, release=0.1))
+
+
+def s_levelup():  # a growth tier crossed: a brighter, longer fanfare than a milestone's
+    notes = [tone(note(n), 0.09, "square", 0.45, duty=0.3, release=0.03) for n in ("C5", "E5", "G5", "C6", "E6")]
+    sparkle = tone(note("G6"), 0.35, "sine", 0.28, release=0.26, decay=6)
+    return layer(seq(*notes), at(0.36, sparkle))
+
+
+def s_purchase():  # a shop purchase confirmed: a soft two-tone chime
+    return seq(tone(note("E5"), 0.1, "sine", 0.5, release=0.05),
+               tone(note("A5"), 0.22, "sine", 0.5, release=0.16))
+
+
 SOUNDS = {
     "greeting": s_greeting, "hello": s_hello, "happy": s_happy, "love": s_love, "sad": s_sad,
     "startled": s_startled, "annoyed": s_annoyed, "dizzy": s_dizzy, "poke": s_poke, "hop": s_hop,
@@ -271,6 +303,8 @@ SOUNDS = {
     "hiccup": s_hiccup, "hum": s_hum, "think": s_think, "wink": s_wink, "blush": s_blush,
     "spin": s_spin, "eat": s_eat, "dance": s_dance, "nap": s_nap, "wake": s_wake,
     "alert": s_alert, "approve": s_approve, "deny": s_deny,
+    "budget": s_budget, "milestone": s_milestone, "policy": s_policy,
+    "coin": s_coin, "levelup": s_levelup, "purchase": s_purchase,
 }
 
 
@@ -300,7 +334,7 @@ def write_wav(path, track):
 
 def main():
     check_only = "--check" in sys.argv
-    assert len(SOUNDS) == 28, f"expected 28 sounds, have {len(SOUNDS)}"
+    assert len(SOUNDS) == 34, f"expected 34 sounds, have {len(SOUNDS)}"
     if not check_only:
         os.makedirs(OUT, exist_ok=True)
     problems, total = [], 0.0

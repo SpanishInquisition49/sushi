@@ -7,6 +7,7 @@
 
 use crate::agent::{Tool, truncate};
 use crate::detail::{self, Detail};
+use crate::policy::PolicyTag;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
@@ -28,6 +29,9 @@ pub struct Event {
     pub ok: Option<bool>,
     /// What the live viewer shows for this step.
     pub detail: Option<Detail>,
+    /// Set when the call matches a configured policy rule (see `policy.rs`): flagged in the
+    /// viewer even though the agent may have auto-approved it.
+    pub policy: Option<PolicyTag>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +70,7 @@ impl Activity {
             removed: 0,
             ok: None,
             detail: detail::for_tool(tool, cwd, show_code),
+            policy: None,
         });
         while self.recent.len() > RECENT_MAX {
             self.recent.pop_front();
@@ -126,6 +131,7 @@ impl Activity {
                 json!({
                     "ts_ms": e.ts_ms, "tool": e.tool, "kind": e.kind, "label": e.label,
                     "added": e.added, "removed": e.removed, "ok": e.ok, "detail": e.detail,
+                    "policy": e.policy,
                 })
             })
             .collect();

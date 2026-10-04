@@ -55,5 +55,15 @@
   "settings.chat_model.label": "Chat model",
   "settings.chat_model.description": "Model for the Chat tab: a model id of the chosen agent (for Claude Code also sonnet, haiku, opus). Leave empty for the agent's default (sonnet for Claude Code).",
   "settings.sounds.label": "Sounds",
-  "settings.sounds.description": "Let the pet make little sounds (28 of them). The volume follows Noctalia's global sound settings."
+  "settings.sounds.description": "Let the pet make little sounds (31 of them). The volume follows Noctalia's global sound settings.",
+  "settings.focus_enabled.label": "Focus mode",
+  "settings.focus_enabled.description": "A quiet, compact pet (no sounds, no idle fidgets) during the hours below. The status badge stays visible.",
+  "settings.focus_start.label": "Focus hours: from",
+  "settings.focus_start.description": "Local time, \"HH:MM\". May cross midnight (e.g. 22:00 to 06:00).",
+  "settings.focus_end.label": "Focus hours: to",
+  "settings.focus_end.description": "Local time, \"HH:MM\".",
+  "settings.focus_days.label": "Focus days",
+  "settings.focus_days.description": "7 characters, Monday first, '1' = quiet that day (default: weekdays).",
+  "settings.gamification.label": "Milestones",
+  "settings.gamification.description": "A little celebration (and a streak / step count in the Usage tab) for long-term use."
 }

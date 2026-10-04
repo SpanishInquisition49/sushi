@@ -186,9 +186,101 @@ impl UsageStore {
     }
 }
 
+/// USD per million tokens, for a rough cost estimate — always labeled "estimated" in the UI, never
+/// a billed amount.
+#[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl ModelPrice {
+    fn cost(&self, t: &Tokens) -> f64 {
+        (t.input as f64 * self.input + t.output as f64 * self.output + t.cache_read as f64 * self.cache_read + t.cache_write as f64 * self.cache_write)
+            / 1_000_000.0
+    }
+}
+
+/// USD / 1M tokens, Anthropic's published list prices at the time of writing. Override a model in
+/// `~/.config/sushi/config.json`'s `model_prices` if these drift.
+fn default_model_prices() -> HashMap<String, ModelPrice> {
+    [
+        ("claude-opus", ModelPrice { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
+        ("claude-sonnet", ModelPrice { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
+        ("claude-haiku", ModelPrice { input: 0.8, output: 4.0, cache_read: 0.08, cache_write: 1.0 }),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+impl UsageSummary {
+    /// Rough, clearly-labeled cost estimate (not a billed amount): each model in `by_model` is
+    /// matched against `prices` by prefix (`"claude-sonnet-5"` matches a `"claude-sonnet"` entry so
+    /// dated/versioned ids still work), 0 for a model with no matching price.
+    pub fn estimated_cost(&self, prices: &HashMap<String, ModelPrice>) -> f64 {
+        self.by_model
+            .iter()
+            .map(|(model, tokens)| prices.iter().find(|(prefix, _)| model.starts_with(prefix.as_str())).map(|(_, p)| p.cost(tokens)).unwrap_or(0.0))
+            .sum()
+    }
+}
+
+/// What a tool call runs, when an external hook fires (see `Hooks` below): `cmd` with `SUSHI_*` env
+/// vars, and/or `url` posted a small JSON body — both fire-and-forget, never blocking the daemon.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct HookAction {
+    pub cmd: String,
+    pub url: String,
+}
+
+/// External hooks run on session/turn transitions (see `main.rs`'s `fire_hook`), e.g. to trigger a
+/// build, a staging deploy, or update an internal dashboard.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Hooks {
+    pub on_session_start: HookAction,
+    pub on_session_end: HookAction,
+    pub on_waiting: HookAction,
+    pub on_turn_end: HookAction,
+}
+
+/// Thresholds (percent) that make the pet raise a one-shot `budget_alert` event. `plan_percent`
+/// applies to Claude's 5-hour and weekly plan windows; `daily_tokens` / `daily_cost_usd` (0 =
+/// disabled) are a budget across every tracked agent's usage today, checked against `daily_percent`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct BudgetAlerts {
+    pub plan_percent: Vec<f64>,
+    pub daily_tokens: u64,
+    pub daily_cost_usd: f64,
+    pub daily_percent: Vec<f64>,
+}
+
+impl Default for BudgetAlerts {
+    fn default() -> Self {
+        BudgetAlerts { plan_percent: vec![80.0, 95.0], daily_tokens: 0, daily_cost_usd: 0.0, daily_percent: vec![80.0, 95.0] }
+    }
+}
+
+/// Patterns merged into Claude Code's own `permissions.ask` / `permissions.deny` (its native
+/// syntax, e.g. `Bash(rm -rf*)`) by `sushi install --agent claude --write` (see
+/// `install::merge_permissions`). This is the only agent Sushi can make genuinely ask or refuse a
+/// tool call the agent would otherwise have auto-approved; see `policy.rs` for why.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ClaudePermissions {
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+}
+
 /// Optional `~/.config/sushi/config.json`:
 /// `{"context_window": 200000, "context_windows": {"<model id>": 1000000}, "show_code": true,
-///   "chat_agent": "claude", "chat_models": {"copilot": "auto"}, "agent_paths": {"pi": "/opt/pi"}}`.
+///   "chat_agent": "claude", "chat_models": {"copilot": "auto"}, "agent_paths": {"pi": "/opt/pi"},
+///   "transcribe_model_path": "/opt/whisper/ggml-base.en.bin", "whisper_path": "whisper-cli"}`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -205,6 +297,19 @@ pub struct Config {
     pub chat_models: HashMap<String, String>,
     /// Executable per agent id when it is not on the `PATH` under its own name.
     pub agent_paths: HashMap<String, String>,
+    /// Path to a whisper.cpp GGML/GGUF model (e.g. `ggml-base.en.bin`). Empty disables
+    /// transcription: a fed audio file is then refused like any other binary file.
+    pub transcribe_model_path: String,
+    /// The `whisper-cli` executable, when it is not on the `PATH` under its own name.
+    pub whisper_path: String,
+    /// USD / 1M tokens per model, for the estimated cost shown in the Usage tab.
+    pub model_prices: HashMap<String, ModelPrice>,
+    pub budget_alerts: BudgetAlerts,
+    pub hooks: Hooks,
+    pub claude_permissions: ClaudePermissions,
+    /// Cross-agent visibility rules (see `policy.rs`): flag a matching tool call in the live
+    /// viewer, independent of whether it can actually be enforced for that agent.
+    pub policies: Vec<crate::policy::PolicyRule>,
 }
 
 impl Default for Config {
@@ -218,6 +323,13 @@ impl Default for Config {
             chat_agent: "claude".into(),
             chat_models: HashMap::new(),
             agent_paths: HashMap::new(),
+            transcribe_model_path: String::new(),
+            whisper_path: "whisper-cli".into(),
+            model_prices: default_model_prices(),
+            budget_alerts: BudgetAlerts::default(),
+            hooks: Hooks::default(),
+            claude_permissions: ClaudePermissions::default(),
+            policies: Vec::new(),
         }
     }
 }
@@ -385,6 +497,16 @@ mod tests {
         assert_eq!((small[0], small[9]), (0, 990));
         assert!(small.windows(2).all(|w| w[0] <= w[1]));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn estimated_cost_matches_models_by_prefix() {
+        let mut s = UsageSummary::default();
+        s.by_model.insert("claude-sonnet-5".into(), Tokens { input: 1_000_000, output: 1_000_000, cache_read: 0, cache_write: 0 });
+        s.by_model.insert("some-other-model".into(), Tokens { input: 1_000_000, ..Default::default() });
+        let prices = default_model_prices();
+        // 1M input @ $3/1M + 1M output @ $15/1M = $18; the unknown model contributes 0.
+        assert!((s.estimated_cost(&prices) - 18.0).abs() < 1e-9);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! `sushi install --agent <id> [--write]`: connect an agent to Sushi without touching anything
 //! else of its setup.
 //!
-//! - Claude Code and Codex: add Sushi's hooks to their hooks file (existing hooks, other keys
-//!   and key order stay as they are).
+//! - Claude Code, Codex and Gemini CLI: add Sushi's hooks to their hooks file (existing hooks,
+//!   other keys and key order stay as they are). Gemini's file is `~/.gemini/settings.json`, not
+//!   to be confused with Antigravity's `~/.gemini/config/hooks.json` below.
 //! - opencode and pi: write the plugin from `integrations/` into the agent's plugin folder.
 //! - Antigravity CLI: add a `sushi` group to its user-wide `~/.gemini/config/hooks.json` (other
 //!   groups stay as they are).
@@ -42,6 +43,9 @@ const PERMISSION_HOOK_TIMEOUT: u32 = 310;
 
 /// The hooks Sushi needs, all running `hook` (the `sushi-hook` binary).
 pub fn hook_snippet(hook: &Path, agent: Agent) -> Value {
+    if agent == Agent::Gemini {
+        return gemini_hooks(hook);
+    }
     let command = hook_command(hook, agent);
     let entry = |timeout: u32| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command, "timeout": timeout }] }]);
     let mut hooks = serde_json::Map::new();
@@ -53,6 +57,22 @@ pub fn hook_snippet(hook: &Path, agent: Agent) -> Value {
     }
     // Long enough for a Claude Code plan (the hook waits up to 300 s for one); a permission waits 30 s.
     hooks.insert("PermissionRequest".into(), entry(PERMISSION_HOOK_TIMEOUT));
+    json!({ "hooks": hooks })
+}
+
+/// Sushi's hooks for Gemini CLI's `~/.gemini/settings.json`: the same group shape as Claude's,
+/// under Gemini's own event names (see `gemini.rs`), and each handler carries a `name` (the
+/// format's own key, read by nothing of Sushi's). There is no separate permission event: `BeforeTool`
+/// fires for every tool call and may turn into a wait (see `gemini::needs_confirmation`), so it
+/// gets the longer timeout every other event here does not need.
+fn gemini_hooks(hook: &Path) -> Value {
+    let command = hook_command(hook, Agent::Gemini);
+    let entry = |timeout: u32| json!([{ "matcher": "*", "hooks": [{ "name": "sushi", "type": "command", "command": command, "timeout": timeout }] }]);
+    let mut hooks = serde_json::Map::new();
+    for ev in ["SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "AfterTool", "Notification"] {
+        hooks.insert(ev.into(), entry(5));
+    }
+    hooks.insert("BeforeTool".into(), entry(40));
     json!({ "hooks": hooks })
 }
 
@@ -99,6 +119,69 @@ pub fn merge_hooks(settings: &mut Value, snippet: &Value) -> Vec<String> {
     added
 }
 
+/// Merge Sushi-managed `permissions.ask` / `permissions.deny` patterns (Claude Code's own syntax,
+/// e.g. `Bash(rm -rf*)`) into `settings`, keeping every existing entry (nothing is ever removed).
+/// Returns which of "permissions.ask" / "permissions.deny" changed. This is the only way Sushi can
+/// make Claude Code genuinely ask or refuse a tool call it would otherwise auto-approve — see
+/// `policy.rs` for why the other agents only get a visibility flag, not real enforcement.
+pub fn merge_permissions(settings: &mut Value, perms: &crate::usage::ClaudePermissions) -> Vec<String> {
+    let mut changed = Vec::new();
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let permissions = settings.as_object_mut().expect("object").entry("permissions").or_insert_with(|| json!({}));
+    let Some(permissions) = permissions.as_object_mut() else { return changed };
+    for (key, patterns) in [("ask", &perms.ask), ("deny", &perms.deny)] {
+        if patterns.is_empty() {
+            continue;
+        }
+        let list = permissions.entry(key).or_insert_with(|| json!([]));
+        let Some(list) = list.as_array_mut() else { continue };
+        for p in patterns {
+            if !list.iter().any(|v| v.as_str() == Some(p.as_str())) {
+                list.push(json!(p));
+                let name = format!("permissions.{key}");
+                if !changed.contains(&name) {
+                    changed.push(name);
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Merge `perms` into the Claude Code settings file at `path` (created if missing). A different
+/// previous file is backed up, same as `install`. A no-op when `perms` is empty.
+pub fn install_permissions(path: &Path, perms: &crate::usage::ClaudePermissions, unix_time: u64) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    if perms.ask.is_empty() && perms.deny.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let existing = std::fs::read_to_string(path).ok();
+    let mut settings: Value = match &existing {
+        Some(text) => serde_json::from_str(text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?,
+        None => json!({}),
+    };
+    let changed = merge_permissions(&mut settings, perms);
+    if changed.is_empty() {
+        return Ok((changed, None));
+    }
+    let backup = match existing {
+        Some(text) => {
+            let b = backup_name(path, unix_time);
+            std::fs::write(&b, text).map_err(|e| format!("cannot write the backup {}: {e}", b.display()))?;
+            Some(b)
+        }
+        None => None,
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok((changed, backup))
+}
+
 pub fn settings_path() -> PathBuf {
     paths::claude_dir().join("settings.json")
 }
@@ -112,6 +195,7 @@ pub fn target_path(agent: Agent) -> PathBuf {
         Agent::Pi => paths::pi_dir().join("extensions").join("sushi.ts"),
         Agent::Copilot => paths::copilot_dir().join("hooks").join("sushi.json"),
         Agent::Antigravity => paths::antigravity_config_dir().join("hooks.json"),
+        Agent::Gemini => paths::gemini_dir().join("settings.json"),
     }
 }
 
@@ -160,7 +244,7 @@ fn plugin_source(agent: Agent, hook: &Path) -> Option<String> {
         Agent::Opencode => OPENCODE_PLUGIN,
         Agent::Pi => PI_EXTENSION,
         Agent::Copilot => return Some(serde_json::to_string_pretty(&copilot_hooks(hook)).unwrap_or_default() + "\n"),
-        Agent::Claude | Agent::Codex | Agent::Antigravity => return None,
+        Agent::Claude | Agent::Codex | Agent::Antigravity | Agent::Gemini => return None,
     };
     Some(template.replace(HOOK_PLACEHOLDER, &hook.to_string_lossy()))
 }
@@ -419,6 +503,30 @@ mod tests {
     }
 
     #[test]
+    fn gemini_gets_its_own_event_names_merged_into_settings_json() {
+        assert!(plugin_source(Agent::Gemini, &hook()).is_none());
+        assert!(target_path(Agent::Gemini).ends_with(".gemini/settings.json"));
+        let snippet = hook_snippet(&hook(), Agent::Gemini);
+        assert_eq!(snippet["hooks"]["BeforeTool"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook --agent gemini");
+        assert_eq!(snippet["hooks"]["BeforeTool"][0]["hooks"][0]["name"], "sushi");
+        assert_eq!(snippet["hooks"]["BeforeTool"][0]["hooks"][0]["timeout"], 40);
+        assert_eq!(snippet["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5);
+        assert!(snippet["hooks"].get("PermissionRequest").is_none(), "no such event for Gemini");
+
+        let dir = std::env::temp_dir().join(format!("sushi-gemini-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"theme": "dark"}"#).unwrap();
+        let (added, backup) = install(&path, &hook(), Agent::Gemini, 1).unwrap();
+        assert_eq!(added.len(), 7);
+        assert!(backup.is_some());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["hooks"]["BeforeTool"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook --agent gemini");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn copilot_gets_a_hook_file_of_its_own() {
         let src = plugin_source(Agent::Copilot, &hook()).unwrap();
         let v: Value = serde_json::from_str(&src).unwrap();
@@ -426,6 +534,44 @@ mod tests {
         assert_eq!(v["hooks"]["PreToolUse"][0]["bash"], "/home/me/.cargo/bin/sushi-hook --agent copilot");
         assert_eq!(v["hooks"]["PermissionRequest"][0]["timeoutSec"], 40);
         assert_eq!(v["hooks"].as_object().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn merges_permission_patterns_without_touching_existing_ones() {
+        use crate::usage::ClaudePermissions;
+        let mut s = json!({ "permissions": { "ask": ["Bash(git push*)"] } });
+        let perms = ClaudePermissions { ask: vec!["Bash(git push*)".into(), "Bash(rm -rf*)".into()], deny: vec!["Bash(sudo*)".into()] };
+        let changed = merge_permissions(&mut s, &perms);
+        assert_eq!(changed, vec!["permissions.ask", "permissions.deny"]);
+        assert_eq!(s["permissions"]["ask"], json!(["Bash(git push*)", "Bash(rm -rf*)"]), "kept the existing pattern, added the new one");
+        assert_eq!(s["permissions"]["deny"], json!(["Bash(sudo*)"]));
+        // Running it again changes nothing.
+        assert!(merge_permissions(&mut s, &perms).is_empty());
+    }
+
+    #[test]
+    fn install_permissions_is_a_noop_when_nothing_is_configured() {
+        use crate::usage::ClaudePermissions;
+        let dir = std::env::temp_dir().join(format!("sushi-perms-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let (changed, backup) = install_permissions(&path, &ClaudePermissions::default(), 1).unwrap();
+        assert!(changed.is_empty() && backup.is_none() && !path.exists());
+    }
+
+    #[test]
+    fn install_permissions_writes_and_backs_up() {
+        use crate::usage::ClaudePermissions;
+        let dir = std::env::temp_dir().join(format!("sushi-perms2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"model": "sonnet"}"#).unwrap();
+        let perms = ClaudePermissions { ask: vec!["Bash(rm -rf*)".into()], deny: vec![] };
+        let (changed, backup) = install_permissions(&path, &perms, 5).unwrap();
+        assert_eq!(changed, vec!["permissions.ask"]);
+        assert!(backup.is_some());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((v["model"].as_str(), &v["permissions"]["ask"]), (Some("sonnet"), &json!(["Bash(rm -rf*)"])));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

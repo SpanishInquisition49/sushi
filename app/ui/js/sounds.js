@@ -1,10 +1,10 @@
-// sounds.js — plays the pet's 28 sounds (ui/sounds/*.wav, made by tools/make_sounds.py) by name.
+// sounds.js — plays the pet's sounds (ui/sounds/*.wav, made by tools/make_sounds.py) by name.
 // Only the pet window plays them (the panel's pet is silent), so nothing is heard twice.
 
 const NAMES = [
   "greeting", "hello", "happy", "love", "sad", "startled", "annoyed", "dizzy", "poke", "hop", "bounce", "wiggle",
   "squish", "yawn", "sneeze", "hiccup", "hum", "think", "wink", "blush", "spin", "eat", "dance", "nap", "wake",
-  "alert", "approve", "deny",
+  "alert", "approve", "deny", "budget", "milestone", "policy", "coin", "levelup", "purchase",
 ];
 
 const audio = new Map();

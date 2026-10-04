@@ -5,7 +5,9 @@
 //   "44%"       plan usage of the 5-hour window (falls back to the context window of the most
 //               recently active session when plan limits are unavailable)
 // The tooltip carries the full progress of the active session.
-// Click → open / close the panel · drag → move the window · right click → pet it.
+// Click → poke it, then open / close the panel · double click → nap or wake up · drag → move the
+// window · right click → pet it (hold it down longer for a bigger cuddle) · middle click → feed it
+// whatever is on the clipboard.
 // Drop a file on it → it eats the file and the chat opens with the file attached (handled on the
 // Rust side, which sends the pet's reactions as petEvent and the file as fedFile).
 
@@ -17,6 +19,7 @@ import * as Fmt from "./fmt.js";
 import * as Sounds from "./sounds.js";
 
 const PET_SIZE = 52; // sushi width in px (it is ~0.8x as tall)
+const PET_SIZE_SHRUNK = 26; // while napping: just the character, no numbers
 const FRAME_MS = 66; // ~15 fps
 const DRAG_PX = 4; // moving the pointer this far turns a click into a drag
 
@@ -91,18 +94,26 @@ function chips(info, a, elapsed) {
   return chips;
 }
 
-/** The pill: the pet, then `pending` ("!N"), the session chips and the headline percentage. */
-function pill(pending, sessionChips, h) {
-  const children = [pet.build(PET_SIZE, { room: 6, margin: 4, mouth: true, maxHeight: 74 })];
+/** The pill: the pet, then `pending` ("!N"), the session chips and the headline percentage —
+ *  or, while napping (nothing pending, nothing working), just the character on its own. */
+function pill(pending, sessionChips, h, shrunk) {
+  const focusDim = Fmt.isFocusActive(store.settings);
+  if (shrunk) return ui.row({ gap: 0, align: "center", cls: "pill" }, [pet.build(PET_SIZE_SHRUNK, { room: 3, margin: 2, maxHeight: 40, focusDim })]);
+  const children = [pet.build(PET_SIZE, { room: 6, margin: 4, mouth: true, maxHeight: 74, focusDim })];
   if (pending > 0) children.push(ui.label({ text: "!" + pending, fontSize: 13, fontWeight: "bold", color: "error" }));
   children.push(...sessionChips);
   if (h) children.push(ui.label({ text: h[0], fontSize: 13, fontWeight: "bold", color: h[1] }));
   return ui.row({ gap: 6, align: "center", cls: "pill" }, children);
 }
 
+const isShrunk = () => pet.cur === "nap";
+
 function render() {
   const info = setting("widgetInfo");
-  const html = store.up ? pill(Fmt.needsYou(snap()), info !== "usage" ? sessionChips(info) : [], headline()) : pill(0, [], null);
+  const shrunk = isShrunk();
+  const html = store.up
+    ? pill(Fmt.needsYou(snap()), !shrunk && info !== "usage" ? sessionChips(info) : [], shrunk ? null : headline(), shrunk)
+    : pill(0, [], null, false);
   const root = rootEl;
   if (html !== lastHtml) {
     lastHtml = html;
@@ -117,15 +128,27 @@ function render() {
 
 /** Size the window for the pill at its widest with the current settings, so it takes no more room
  *  than it can show. Done before the window first shows and when the settings change: tiling
- *  compositors (niri) only take a window's size when it opens, so it cannot follow every chip. */
+ *  compositors (niri) only take a window's size when it opens, so it cannot follow every chip.
+ *
+ *  In the docked window, where resizing live is the whole point (see dock-window.js and
+ *  app/src-tauri/src/dock*.rs), `shrunk` instead fits the minimal napping pill — called again
+ *  whenever that flips, so the window itself shrinks to just the character and back, not only
+ *  its content. The classic window keeps sizing to the widest case always, content shrinks
+ *  inside the same window: resizing it live isn't something tiling compositors handle well. */
 let fitted = "";
-function fitWindow() {
-  const a = { files_changed: 99, lines_added: 9999, lines_removed: 9999, commands: 99, failures: 9 };
-  const info = setting("widgetInfo");
-  const widest = pill(9, info !== "usage" ? chips(info, a, 9 * 3600e3 + 59 * 60e3 + 59e3) : [], ["100%", "error"]);
+function fitWindow(shrunk) {
+  const docked = document.documentElement.dataset.view === "dock";
+  let widget;
+  if (docked && shrunk) {
+    widget = pill(0, [], null, true);
+  } else {
+    const a = { files_changed: 99, lines_added: 9999, lines_removed: 9999, commands: 99, failures: 9 };
+    const info = setting("widgetInfo");
+    widget = pill(9, info !== "usage" ? chips(info, a, 9 * 3600e3 + 59 * 60e3 + 59e3) : [], ["100%", "error"], false);
+  }
   const probe = document.createElement("div");
   probe.style.cssText = "position:absolute;left:0;top:0;visibility:hidden;width:max-content";
-  probe.innerHTML = widest;
+  probe.innerHTML = widget;
   document.body.appendChild(probe);
   const r = probe.firstElementChild.getBoundingClientRect();
   probe.remove();
@@ -136,11 +159,25 @@ function fitWindow() {
   invoke("fit_pet", { width: size[0], height: size[1] });
 }
 
-/** Click, drag and right click on the pet. */
+const SNUGGLE_HOLD_MS = 700; // holding the "pet it" gesture this long makes it more intense
+
+/** Broadcast a one-off pet reaction: react here, and tell the other windows to as well. */
+function broadcast(kind) {
+  const ts = now();
+  pet.onEvent(kind, ts, ts);
+  emit("petEvent", { kind, ts });
+}
+
+/** Click (poke, opens the panel), double click (nap), drag, right click (pet it, held longer for
+ *  a bigger cuddle) and middle click (feed it whatever a file manager's "Copy" put on the
+ *  clipboard — the Tauri side answers via `feed_clipboard`, see `clipboard_file.rs`). */
 function wirePointer(root) {
   let down = null;
+  let rightDownAt = 0;
   root.addEventListener("mousedown", (e) => {
     if (e.button === 0) down = { x: e.screenX, y: e.screenY, dragged: false };
+    else if (e.button === 1) e.preventDefault(); // no autoscroll
+    else if (e.button === 2) rightDownAt = now();
   });
   root.addEventListener("mousemove", (e) => {
     // The eyes follow the pointer while it is over the window.
@@ -153,8 +190,17 @@ function wirePointer(root) {
     }
   });
   root.addEventListener("mouseup", (e) => {
-    if (e.button === 0 && down && !down.dragged) invoke("toggle_panel");
+    if (e.button === 0 && down && !down.dragged) {
+      pet.poke(now());
+      invoke("toggle_panel");
+    } else if (e.button === 1) {
+      invoke("feed_clipboard");
+    }
     down = null;
+  });
+  root.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    broadcast("nap-toggle");
   });
   root.addEventListener("mouseleave", () => {
     down = null;
@@ -162,9 +208,13 @@ function wirePointer(root) {
   });
   root.addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    const ts = now();
-    pet.onEvent("love", ts, ts);
-    emit("petEvent", { kind: "love", ts });
+    // Tamagotchi care (see src/care.rs): petting it here counts the same as the panel's heart
+    // button, including its cooldown (snap().care.next_pet_ms, refreshed every snapshot) — a
+    // right click while it is still cooling down is a no-op, same as a disabled button, instead
+    // of letting a flurry of clicks max affection out in one burst.
+    if ((snap().care?.next_pet_ms || 0) > now()) return;
+    broadcast(now() - rightDownAt > SNUGGLE_HOLD_MS ? "snuggle" : "love");
+    invoke("care_pet").catch(() => {});
   });
 }
 
@@ -182,14 +232,21 @@ export function mount(root) {
     () => {
       pet.configure(configFrom(store.settings));
       pet.enableSounds(setting("sounds"));
-      fitWindow();
+      fitWindow(isShrunk());
     },
   );
 
+  let lastShrunk = isShrunk();
   setInterval(() => {
     const t = now();
+    pet.setFocus(Fmt.isFocusActive(store.settings));
     pet.tick(t);
     for (const name of pet.drainSounds()) Sounds.play(name);
     render();
+    const shrunk = isShrunk();
+    if (shrunk !== lastShrunk) {
+      lastShrunk = shrunk;
+      fitWindow(shrunk);
+    }
   }, FRAME_MS);
 }

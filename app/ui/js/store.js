@@ -11,6 +11,7 @@ export const store = {
 
 export const DEFAULT_SETTINGS = {
   character: "nigiri_salmon",
+  dockedWindow: true,
   sounds: true,
   fidgets: true,
   napAfterSec: 120,
@@ -19,6 +20,14 @@ export const DEFAULT_SETTINGS = {
   closeAfterDecision: true,
   chatAgent: "claude",
   chatModel: "",
+  // Focus mode: a quiet, compact pet during configured hours (see `Fmt.isFocusActive`), or
+  // forced on/off regardless of the schedule. Client-local, no daemon involved.
+  focusEnabled: false,
+  focusStart: "09:00",
+  focusEnd: "18:00",
+  focusDays: "1111100", // Mon..Sun, '1' = quiet that day
+  focusManual: "auto", // "auto" | "on" | "off"
+  gamificationEnabled: true,
 };
 
 export const setting = (key) => store.settings[key] ?? DEFAULT_SETTINGS[key];

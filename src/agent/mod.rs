@@ -10,6 +10,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod gemini;
 pub mod opencode;
 pub mod pi;
 
@@ -27,6 +28,7 @@ pub enum Agent {
     Pi,
     Copilot,
     Antigravity,
+    Gemini,
 }
 
 /// What an agent lets Sushi do beyond showing its sessions.
@@ -47,7 +49,7 @@ pub struct Capabilities {
 }
 
 impl Agent {
-    pub const ALL: [Agent; 6] = [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot, Agent::Antigravity];
+    pub const ALL: [Agent; 7] = [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot, Agent::Antigravity, Agent::Gemini];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -57,6 +59,7 @@ impl Agent {
             Agent::Pi => "pi",
             Agent::Copilot => "copilot",
             Agent::Antigravity => "antigravity",
+            Agent::Gemini => "gemini",
         }
     }
 
@@ -72,6 +75,7 @@ impl Agent {
             Agent::Pi => "pi",
             Agent::Copilot => "GitHub Copilot",
             Agent::Antigravity => "Antigravity",
+            Agent::Gemini => "Gemini CLI",
         }
     }
 
@@ -85,6 +89,10 @@ impl Agent {
             // headless mode has no tool-free option for the chat.
             Agent::Opencode => basic,
             Agent::Antigravity => Capabilities { approve: antigravity::ASK_FROM_NOTCH, ..basic },
+            // Gemini CLI: see `gemini.rs` for why `approve` is a documentation-only reading (no
+            // real install was tested, unlike Antigravity's confirmed bug) and `context`/`chat`
+            // stay off (no confirmed transcript schema, no tool-free headless mode).
+            Agent::Gemini => basic,
         }
     }
 
@@ -102,6 +110,7 @@ impl Agent {
                 Agent::Pi => pi::tool(raw, &input, response),
                 Agent::Copilot => copilot::tool(raw, &input, response),
                 Agent::Antigravity => antigravity::tool(raw, &input, response),
+                Agent::Gemini => gemini::tool(raw, &input, response),
             };
             tool.id = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string();
             ev.tool = Some(tool);
@@ -134,8 +143,9 @@ impl Agent {
                 Decision::Allow => json!({ "behavior": "allow" }),
                 Decision::Deny => json!({ "behavior": "deny", "message": "Denied from Sushi" }),
             },
-            // Antigravity's `PreToolUse` hook answers with a decision and a reason.
-            Agent::Antigravity => match decision {
+            // Antigravity's `PreToolUse` hook and Gemini's `BeforeTool` hook both answer with a
+            // decision and a reason.
+            Agent::Antigravity | Agent::Gemini => match decision {
                 Decision::Allow => json!({ "decision": "allow" }),
                 Decision::Deny => json!({ "decision": "deny", "reason": "Denied from Sushi" }),
             },
@@ -154,6 +164,7 @@ impl Agent {
         match self {
             Agent::Copilot => copilot::canonical(payload),
             Agent::Antigravity => antigravity::canonical(payload),
+            Agent::Gemini => gemini::canonical(payload),
             _ => payload.clone(),
         }
     }
@@ -393,12 +404,12 @@ mod tests {
     fn only_claude_has_the_extras() {
         assert!(Agent::Claude.capabilities().chat && Agent::Claude.capabilities().limits);
         assert!(!Agent::Antigravity.capabilities().approve, "watched only");
-        for a in [Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot] {
+        for a in [Agent::Codex, Agent::Opencode, Agent::Pi, Agent::Copilot, Agent::Gemini] {
             let c = a.capabilities();
             assert!(c.approve && !c.limits && !c.context && !c.questions && !c.plans);
         }
         assert!(!Agent::Opencode.capabilities().chat && Agent::Copilot.capabilities().chat);
-        assert!(!Agent::Antigravity.capabilities().chat);
+        assert!(!Agent::Antigravity.capabilities().chat && !Agent::Gemini.capabilities().chat);
     }
 
     #[test]

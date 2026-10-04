@@ -149,19 +149,63 @@ impl Chat {
     }
 }
 
-/// Read a file fed to the chat: its name and its text, cut to `MAX_FILE_CHARS`. Only text files
-/// are taken (the chat has no tools, so the content goes into the prompt).
-pub fn read_attachment(path: &Path) -> Result<(String, String), String> {
+/// Extensions `read_attachment` sends to `transcribe` instead of reading as text.
+const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus", "wma"];
+
+fn is_audio(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Transcribe `path` with `whisper-cli` (whisper.cpp) and `model` (a GGML/GGUF file, `-m`), the
+/// paths configured as `whisper_path` and `transcribe_model_path` in `~/.config/sushi/config.json`.
+/// Writes `<path without its extension>.txt` next to the audio file (`-of`, `-otxt`) and reads
+/// that back, so the transcript is kept where the user can find it again, not just in the prompt.
+/// whisper.cpp's own CLI decodes wav, mp3, flac and ogg directly; anything else is its error to
+/// report, not something this reconverts first.
+pub fn transcribe(path: &Path, model: &str, whisper: &str) -> Result<String, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    if model.trim().is_empty() {
+        return Err(format!(
+            "{name} is an audio file: set \"transcribe_model_path\" (a whisper.cpp GGML/GGUF model) in ~/.config/sushi/config.json to transcribe it"
+        ));
+    }
+    let out_prefix = path.with_extension("");
+    let out = Command::new(whisper)
+        .args(["-m", model, "-f", &path.to_string_lossy(), "-l", "auto", "-nt", "-otxt", "-of", &out_prefix.to_string_lossy(), "--no-prints"])
+        .output()
+        .map_err(|e| format!("cannot run {whisper}: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() { format!("{whisper} failed on {name}") } else { format!("{whisper}: {err}") });
+    }
+    let text = std::fs::read_to_string(out_prefix.with_extension("txt"))
+        .map_err(|e| format!("{whisper} ran but its output is unreadable: {e}"))?
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err(format!("{name}: no speech recognized"));
+    }
+    Ok(text)
+}
+
+/// Read a file fed to the chat: its name and its text, cut to `MAX_FILE_CHARS`. Text files are
+/// read as is; an audio file (by extension) is transcribed instead (see `transcribe`) — either
+/// way the chat has no tools, so the content goes straight into the prompt.
+pub fn read_attachment(path: &Path, transcribe_model: &str, whisper: &str) -> Result<(String, String), String> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{name} is not a file"));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
-    if bytes.contains(&0) {
-        return Err(format!("{name} is not a text file"));
-    }
-    let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
+    let text = if is_audio(path) {
+        transcribe(path, transcribe_model, whisper)?
+    } else {
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+        if bytes.contains(&0) {
+            return Err(format!("{name} is not a text file"));
+        }
+        String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?
+    };
     if text.chars().count() <= MAX_FILE_CHARS {
         return Ok((name, text));
     }
@@ -236,7 +280,7 @@ pub fn build_args(agent: Agent, session_id: &str, started: bool, model: Option<&
             }
             a.extend(strings(&["--", &first_prompt()]));
         }
-        Agent::Opencode | Agent::Antigravity => a = Vec::new(), // not offered (no tool-free mode)
+        Agent::Opencode | Agent::Antigravity | Agent::Gemini => a = Vec::new(), // not offered (no tool-free mode)
     }
     a
 }
@@ -259,7 +303,7 @@ pub fn parse_line(agent: Agent, turn: &mut Turn, line: &str) -> bool {
         Agent::Copilot => copilot_line(turn, &v),
         Agent::Pi => pi_line(turn, &v),
         Agent::Codex => codex_line(turn, &v),
-        Agent::Opencode | Agent::Antigravity => false,
+        Agent::Opencode | Agent::Antigravity | Agent::Gemini => false,
     }
 }
 
@@ -750,21 +794,48 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let text = dir.join("notes.md");
         std::fs::write(&text, "hello\n").unwrap();
-        assert_eq!(read_attachment(&text).unwrap(), ("notes.md".to_string(), "hello\n".to_string()));
+        assert_eq!(read_attachment(&text, "", "whisper-cli").unwrap(), ("notes.md".to_string(), "hello\n".to_string()));
 
         let binary = dir.join("a.bin");
         std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0, 1]).unwrap();
-        assert!(read_attachment(&binary).unwrap_err().contains("not a text file"));
+        assert!(read_attachment(&binary, "", "whisper-cli").unwrap_err().contains("not a text file"));
         std::fs::write(&binary, [0xff, 0xfe, 0x41]).unwrap();
-        assert!(read_attachment(&binary).unwrap_err().contains("not a text file"));
+        assert!(read_attachment(&binary, "", "whisper-cli").unwrap_err().contains("not a text file"));
 
         let big = dir.join("big.txt");
         std::fs::write(&big, "é".repeat(MAX_FILE_CHARS + 10)).unwrap();
-        let (_, cut) = read_attachment(&big).unwrap();
+        let (_, cut) = read_attachment(&big, "", "whisper-cli").unwrap();
         assert!(cut.ends_with("[… truncated]") && cut.chars().count() < MAX_FILE_CHARS + 20);
 
-        assert!(read_attachment(&dir.join("missing")).unwrap_err().contains("cannot open missing"));
-        assert!(read_attachment(&dir).unwrap_err().contains("is not a file"));
+        assert!(read_attachment(&dir.join("missing"), "", "whisper-cli").unwrap_err().contains("cannot open missing"));
+        assert!(read_attachment(&dir, "", "whisper-cli").unwrap_err().contains("is not a file"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_audio_file_with_no_model_configured_is_a_clear_error() {
+        let dir = std::env::temp_dir().join(format!("sushi-feed-audio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("memo.wav");
+        std::fs::write(&wav, [0u8; 8]).unwrap();
+        let err = read_attachment(&wav, "", "whisper-cli").unwrap_err();
+        assert!(err.contains("transcribe_model_path") && err.contains("memo.wav"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcribe_reads_back_the_text_file_whisper_cli_writes() {
+        let dir = std::env::temp_dir().join(format!("sushi-whisper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("memo.wav");
+        std::fs::write(&audio, [0u8; 8]).unwrap();
+        // A stand-in for `whisper-cli`: writes `<-of arg>.txt`, ignoring every other flag.
+        let fake = dir.join("fake-whisper.sh");
+        std::fs::write(&fake, "#!/bin/sh\nwhile [ \"$1\" != \"-of\" ]; do shift; done\necho 'hello from the tape' > \"$2.txt\"\n").unwrap();
+        std::fs::set_permissions(&fake, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755)).unwrap();
+        let text = transcribe(&audio, "model.bin", &fake.to_string_lossy()).unwrap();
+        assert_eq!(text, "hello from the tape");
         std::fs::remove_dir_all(&dir).ok();
     }
 

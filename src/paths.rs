@@ -123,6 +123,11 @@ pub fn antigravity_config_dir() -> PathBuf {
     home_join(".gemini/config")
 }
 
+/// Gemini CLI's home (`~/.gemini`) — its own `settings.json`, not Antigravity's `config/hooks.json`.
+pub fn gemini_dir() -> PathBuf {
+    home_join(".gemini")
+}
+
 /// pi's agent folder (`~/.pi/agent`).
 pub fn pi_dir() -> PathBuf {
     home_join(".pi/agent")

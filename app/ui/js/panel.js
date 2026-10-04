@@ -12,8 +12,8 @@
 
 import { invoke, listen, emit } from "./api.js";
 import { store, setting, start, saveSettings, DEFAULT_SETTINGS } from "./store.js";
-import { ui, esc } from "./ui.js";
-import { Pet, configFrom, CHARACTER_IDS } from "./pet.js";
+import { ui, esc, col } from "./ui.js";
+import { Pet, configFrom, CHARACTER_IDS, ACCESSORIES, accessoryArt } from "./pet.js";
 import * as Fmt from "./fmt.js";
 import * as Viewer from "./viewer.js";
 
@@ -21,8 +21,9 @@ const HERO_SIZE = 92;
 const FRAME_MS = 33; // ~30 fps
 const TYPE_WINDOW_MS = 20000; // only steps this recent get the typewriter effect (they may be shown a little late)
 const MAX_RAIL = 6; // rows of the step rail ("Done" included) with a single session
-const SESSION_ROWS_MIN = 3; // session rows that always stay visible below the rail
+const SESSION_ROWS_MIN = 3; // session rows the rail always leaves room for below it
 const SESSION_ROW_H = 28; // height of a session row in px
+const SESSIONS_MAX_ROWS = 5; // sessions is capped (not flex-grow): it must never fight the rail for space or overlap it
 const SPINNER_STEP_MS = 40;
 
 const $ = (id) => document.getElementById(id);
@@ -59,6 +60,7 @@ const seenAt = new Map(); // first time a step was drawn (drives the typewriter)
 let optimistic = null; // {text, file, base}: a message just sent, shown until the daemon confirms it
 let fedFile = null; // {path, name}: a file fed to the pet, sent with the next chat message
 let lastChatRev = "";
+let lastRailRev = ""; // see renderLeft: keeps the rail (now a short scroll box) pinned to the newest step
 const choices = new Map(); // pending id → question index → Set(labels)
 
 /** Make the pet react here and in the pet window (events travel through Tauri). */
@@ -66,6 +68,318 @@ function sendEvent(kind) {
   const ts = now();
   pet.onEvent(kind, ts, ts);
   emit("petEvent", { kind, ts });
+}
+
+// Tamagotchi care (see src/care.rs): the 3 emote buttons that double as care actions (love/eat/nap
+// each gated by its own cooldown server-side — see `next_*_ms` below); dance stays purely cosmetic.
+// The cosmetic reaction only plays once the daemon actually accepts the action, so a refused click
+// (still cooling down) does not mislead with an animation that did nothing.
+const CARE_ACTION = { love: "care_pet", eat: "care_feed", nap: "care_nap" };
+const CARE_NEXT_KEY = { love: "next_pet_ms", eat: "next_feed_ms", nap: "next_nap_ms" };
+const EMOTES = [["heart", "Pet it", "love"], ["cookie", "Feed it", "eat"], ["music", "Dance!", "dance"], ["bed", "Nap time", "nap"]];
+
+/** Seconds left before `kind`'s care action is available again (0 once its cooldown has elapsed).
+ *  See `care::CARE_COOLDOWN_MS`: each of love/eat/nap has its own independent clock. */
+function careCooldown(kind) {
+  const key = CARE_NEXT_KEY[kind];
+  if (!key) return 0;
+  const next = snap().care?.[key] || 0;
+  return Math.max(0, Math.ceil((next - now()) / 1000));
+}
+
+/** The 4 emote buttons: greyed out with a countdown while their care action is still cooling
+ *  down, so repeated clicking can no longer max a need out in one burst (see careCooldown). */
+function emotesContent() {
+  return EMOTES.map(([g, tip, kind]) => {
+    const cooldown = careCooldown(kind);
+    return btn("", { act: "emote", data: { kind }, glyph: g, tip: cooldown > 0 ? `${tip} · ready in ${cooldown}s` : tip, small: true, off: cooldown > 0 });
+  }).join("");
+}
+
+// Three interchangeable rounds, any of which can report a score to the same `care_play` (see
+// src/care.rs's `Care::play`): it is game-agnostic by design, so adding a game here never needs a
+// daemon change. `playGame` picks which; `playState` (idle | running | done) is shared.
+const PLAY_GAMES = ["tap", "catch", "memory"];
+let playGame = PLAY_GAMES.includes(mem.get("playGame", "tap")) ? mem.get("playGame", "tap") : "tap";
+let playState = "idle";
+let playResult = null; // { line, rewarded, newBest } for the "done" view, set by whichever game finished
+let playBest = {
+  tap: Number(mem.get("playBest", 0)) || 0, // kept under its original key for existing high scores
+  catch: Number(mem.get("playBest_catch", 0)) || 0,
+  memory: Number(mem.get("playBest_memory", 0)) || 0,
+};
+
+// tap: tap the pet as many times as possible in 8s; score = taps, capped at 100.
+let playTaps = 0;
+let playEndsAt = 0;
+// catch: the lit side jumps between left/right on its own; tap the lit one, not the dark one.
+let catchHits = 0;
+let catchEndsAt = 0;
+let catchLeftIsTarget = true;
+let catchNextRerollAt = 0;
+const CATCH_DURATION_MS = 8000, CATCH_REROLL_MS = 850, CATCH_SCORE_SCALE = 9;
+// memory: Simon-style growing pattern; no time limit, since getting it wrong is its own end.
+let memLevel = 1;
+let memSeq = [];
+let memPhase = "flash"; // flash | gap | input
+let memActivePad = null;
+let memShowIdx = 0;
+let memInputIdx = 0;
+let memNextAt = 0;
+const MEMORY_FLASH_MS = 420, MEMORY_GAP_MS = 180, MEMORY_SCORE_PER_LEVEL = 14;
+const randomPad = () => Math.floor(Math.random() * 4);
+
+/** Seconds left before a mini-game round can earn a reward again (0 once ready); see
+ *  `care::PLAY_COOLDOWN_MS`. Playing while this is positive still works, it just won't pay out.
+ *  Shared by all three games — the cooldown is on the reward, not any one of them. */
+function playCooldown() {
+  return Math.max(0, Math.ceil(((snap().care?.next_play_ms || 0) - now()) / 1000));
+}
+
+/** Records the result of a finished round: updates that game's best (kept per-game, since "best"
+ *  means a different thing for each one), then reports the score once (`Care::play` itself
+ *  rate-limits the actual reward — this just makes sure it is asked once). */
+function finishPlay(score, metric, line) {
+  const best = playBest[playGame];
+  const newBest = metric > best;
+  if (newBest) {
+    playBest[playGame] = metric;
+    mem.set(playGame === "tap" ? "playBest" : `playBest_${playGame}`, String(metric));
+  }
+  playState = "done";
+  playResult = { line: line(newBest), rewarded: playCooldown() === 0, newBest };
+  invoke("care_play", { score: Math.min(100, score) }).catch(() => {});
+}
+
+function tickTap() {
+  if (playGame === "tap" && playState === "running" && now() >= playEndsAt) {
+    finishPlay(playTaps, playTaps, (nb) => (nb ? `${playTaps} taps — new best!` : `${playTaps} taps!`));
+  }
+}
+
+function tickCatch() {
+  if (playGame !== "catch" || playState !== "running") return;
+  const t = now();
+  if (t >= catchNextRerollAt) {
+    catchLeftIsTarget = Math.random() < 0.5;
+    catchNextRerollAt = t + CATCH_REROLL_MS;
+  }
+  if (t >= catchEndsAt) {
+    finishPlay(catchHits * CATCH_SCORE_SCALE, catchHits, (nb) => (nb ? `${catchHits} catches — new best!` : `${catchHits} catches!`));
+  }
+}
+
+/** A hit on `side` ("left" | "right"); only the currently-lit side scores — the wrong one is just
+ *  a miss, never a penalty (this project never punishes a care action, see src/care.rs). */
+function catchTap(side) {
+  if (playGame !== "catch" || playState !== "running") return;
+  if ((side === "left") === catchLeftIsTarget) {
+    catchHits++;
+    catchLeftIsTarget = Math.random() < 0.5;
+    catchNextRerollAt = now() + CATCH_REROLL_MS;
+  }
+}
+
+function tickMemory() {
+  if (playGame !== "memory" || playState !== "running" || memPhase === "input") return;
+  const t = now();
+  if (t < memNextAt) return;
+  if (memPhase === "flash") {
+    memPhase = "gap";
+    memActivePad = null;
+    memNextAt = t + MEMORY_GAP_MS;
+  } else {
+    memShowIdx++;
+    if (memShowIdx >= memSeq.length) {
+      memPhase = "input";
+      memInputIdx = 0;
+      memActivePad = null;
+    } else {
+      memPhase = "flash";
+      memActivePad = memSeq[memShowIdx];
+      memNextAt = t + MEMORY_FLASH_MS;
+    }
+  }
+}
+
+/** A tap on pad 0..3 during the input phase: right pad advances (and, on a completed sequence,
+ *  grows it and replays); a wrong one ends the round — there's no time limit, so this is the only
+ *  way it ends. */
+function memoryTap(pad) {
+  if (playGame !== "memory" || playState !== "running" || memPhase !== "input") return;
+  if (pad === memSeq[memInputIdx]) {
+    memInputIdx++;
+    if (memInputIdx >= memSeq.length) {
+      memLevel++;
+      memSeq.push(randomPad());
+      memShowIdx = 0;
+      memPhase = "flash";
+      memActivePad = memSeq[0];
+      memNextAt = now() + MEMORY_FLASH_MS;
+    }
+    return;
+  }
+  const completed = memLevel - 1;
+  memPhase = "idle";
+  finishPlay(completed * MEMORY_SCORE_PER_LEVEL, completed, (nb) =>
+    nb ? `${completed} rounds remembered — new best!` : `${completed} rounds remembered!`,
+  );
+}
+
+function tickPlay() {
+  tickTap();
+  tickCatch();
+  tickMemory();
+}
+
+const NEED_COLOR = (pct) => (pct < 35 ? "error" : pct < 60 ? "tertiary" : "primary");
+
+/** The hunger / energy / affection meters (see src/care.rs), compact: one row, three mini-bars
+ *  each with a one-letter label — hover (or long-press on touch) for the full name and percent.
+ *  (Was 3 full-width labeled bars; that crowded out the sessions list below it.) */
+function careMeters() {
+  const c = snap().care || {};
+  const meter = (letter, label, pct) => {
+    const p = Math.max(0, Math.min(100, pct ?? 100));
+    return ui.column({ flexGrow: 1, gap: 2, title: `${label} ${Math.round(p)}%` }, [
+      ui.label({ text: letter, fontSize: 9, color: "on_surface_variant" }),
+      `<div style="height:5px;border-radius:3px;overflow:hidden;background:${col("surface_variant")};">` +
+        `<div style="width:${p}%;height:100%;background:${col(NEED_COLOR(p))};"></div></div>`,
+    ]);
+  };
+  return ui.row({ gap: 10 }, [meter("H", "Hunger", c.hunger), meter("E", "Energy", c.energy), meter("A", "Affection", c.affection)]);
+}
+
+/** The shop grid: buy with currency earned from real agent usage, equip at most one at a time
+ *  (see ACCESSORIES in pet.js, mirrored server-side in src/care.rs so a tampered client can't
+ *  grant itself a free item). */
+function shopContent() {
+  const c = snap().care || {};
+  const owned = new Set(c.owned || []);
+  const currency = c.currency || 0;
+  const cards = Object.entries(ACCESSORIES).map(([id, a]) => {
+    const isEquipped = c.equipped === id;
+    const action = isEquipped
+      ? btn("Unequip", { act: "accessory-equip", data: { id: "" }, small: true })
+      : owned.has(id)
+        ? btn("Equip", { act: "accessory-equip", data: { id }, small: true, variant: "primary" })
+        : btn(`Buy · ${a.cost}`, { act: "accessory-buy", data: { id }, small: true, variant: "primary", off: currency < a.cost });
+    return ui.row({ align: "center", justify: "space_between" }, [
+      ui.row({ align: "center", gap: 8 }, [
+        ui.column({ width: 22, height: 22, align: "center", justify: "center" }, [accessoryArt(id, 20)]),
+        ui.label({ text: a.label, fontSize: 12, color: "on_surface" }),
+      ]),
+      action,
+    ]);
+  });
+  return ui.column({ gap: 10 }, [
+    ui.row({ align: "center", justify: "space_between" }, [
+      ui.label({ text: "Shop", fontSize: 12, fontWeight: "semibold", color: "on_surface" }),
+      ui.label({ text: `🪙 ${Fmt.coins(currency)}`, fontSize: 12, color: "on_surface_variant" }),
+    ]),
+    ui.column({ gap: 8 }, cards),
+  ]);
+}
+
+const GAME_META = {
+  tap: {
+    label: "Tap the pet!", switcherLabel: "Tap",
+    hint: (cd) => cd > 0
+      ? `Tap as many times as you can in 8 seconds. You can still practice, but the next reward is ${cd}s away.`
+      : "Tap as many times as you can in 8 seconds. A round can only earn a reward once every 5 minutes.",
+    bestLine: (n) => `Best: ${n}`,
+  },
+  catch: {
+    label: "Catch it!", switcherLabel: "Catch",
+    hint: (cd) => cd > 0
+      ? `The lit side jumps around on its own — tap it, not the dark one, for 8 seconds. Practice freely; the next reward is ${cd}s away.`
+      : "The lit side jumps around on its own — tap it, not the dark one, for 8 seconds. A round can only earn a reward once every 5 minutes.",
+    bestLine: (n) => `Best: ${n}`,
+  },
+  memory: {
+    label: "Memory", switcherLabel: "Memory",
+    hint: (cd) => cd > 0
+      ? `Watch the pads light up, then repeat the pattern — it only gets longer, no time limit. Practice freely; the next reward is ${cd}s away.`
+      : "Watch the pads light up, then repeat the pattern — it only gets longer, no time limit. A round can only earn a reward once every 5 minutes.",
+    bestLine: (n) => `Best: ${n} rounds`,
+  },
+};
+
+function gameSwitcher() {
+  return ui.row({ gap: 6 }, PLAY_GAMES.map((g) =>
+    btn(GAME_META[g].switcherLabel, { act: "play-game", data: { id: g }, small: true, variant: playGame === g ? "primary" : "ghost" }),
+  ));
+}
+
+/** The running view for whichever game is active (see tickTap/tickCatch/tickMemory for the rules). */
+function runningContent() {
+  if (playGame === "tap") {
+    const remaining = Math.max(0, playEndsAt - now());
+    return ui.column({ gap: 10 }, [
+      ui.row({ align: "center", justify: "space_between" }, [
+        ui.label({ text: `${(remaining / 1000).toFixed(1)}s`, fontSize: 16, fontWeight: "bold", color: "on_surface" }),
+        ui.label({ text: `${playTaps} taps`, fontSize: 16, fontWeight: "bold", color: "primary" }),
+      ]),
+      `<button class="btn primary" data-act="play-tap" style="height:72px;font-size:20px;">Tap!</button>`,
+    ]);
+  }
+  if (playGame === "catch") {
+    const remaining = Math.max(0, catchEndsAt - now());
+    const side = (isLeft) => {
+      const on = isLeft === catchLeftIsTarget;
+      return `<button class="btn ${on ? "primary" : "ghost"}" data-act="catch-tap" data-side="${isLeft ? "left" : "right"}" style="height:72px;flex:1;font-size:22px;">${on ? "●" : "○"}</button>`;
+    };
+    return ui.column({ gap: 10 }, [
+      ui.row({ align: "center", justify: "space_between" }, [
+        ui.label({ text: `${(remaining / 1000).toFixed(1)}s`, fontSize: 16, fontWeight: "bold", color: "on_surface" }),
+        ui.label({ text: `${catchHits} hits`, fontSize: 16, fontWeight: "bold", color: "primary" }),
+      ]),
+      `<div style="display:flex;gap:8px;">${side(true)}${side(false)}</div>`,
+    ]);
+  }
+  const pads = [0, 1, 2, 3].map((p) => {
+    const on = memActivePad === p;
+    return `<button class="btn ${on ? "primary" : "ghost"}" data-act="memory-tap" data-pad="${p}" style="height:56px;flex:1;font-size:14px;"${memPhase !== "input" ? " disabled" : ""}>${p + 1}</button>`;
+  });
+  return ui.column({ gap: 10 }, [
+    ui.row({ align: "center", justify: "space_between" }, [
+      ui.label({ text: `Level ${memLevel}`, fontSize: 16, fontWeight: "bold", color: "on_surface" }),
+      ui.label({ text: memPhase === "input" ? "Your turn" : "Watch...", fontSize: 12, color: "on_surface_variant" }),
+    ]),
+    `<div style="display:flex;gap:8px;">${pads.join("")}</div>`,
+  ]);
+}
+
+/** The mini-games: a switcher at top picks which, each reports a 0..100 score to the same
+ *  `care_play` (see src/care.rs's `Care::play` for how that becomes a reward, and its 5-minute
+ *  cooldown — shared across all three, so switching games does not reset it). */
+function playContent() {
+  const meta = GAME_META[playGame];
+  const switcher = gameSwitcher();
+  if (playState === "idle") {
+    const best = playBest[playGame];
+    return ui.column({ gap: 10 }, [
+      switcher,
+      ui.row({ align: "center", justify: "space_between" }, [
+        ui.label({ text: meta.label, fontSize: 12, fontWeight: "semibold", color: "on_surface" }),
+        best > 0 ? ui.label({ text: meta.bestLine(best), fontSize: 11, color: "on_surface_variant" }) : "",
+      ]),
+      ui.label({ text: meta.hint(playCooldown()), fontSize: 11, color: "on_surface_variant", maxLines: 3 }),
+      btn("Start", { act: "play-start", variant: "primary", small: true }),
+    ]);
+  }
+  if (playState === "running") return ui.column({ gap: 10 }, [switcher, runningContent()]);
+  return ui.column({ gap: 10 }, [
+    switcher,
+    ui.label({
+      text: playResult.line, fontSize: 14, fontWeight: "semibold", color: playResult.newBest ? "primary" : "on_surface",
+    }),
+    ui.label({
+      text: playResult.rewarded ? "Sent to your pet — check its currency and affection." : "That one was just for fun — the next reward was still cooling down.",
+      fontSize: 11, color: "on_surface_variant",
+    }),
+    btn("Play again", { act: "play-again", small: true }),
+  ]);
 }
 
 // ── Small HTML helpers ─────────────────────────────────────────────────────────
@@ -161,6 +475,11 @@ function settle(id, send, eventKind) {
 
 const decide = (action, id) => settle(id, () => invoke("decide", { action, id }), action === "deny" ? "deny" : "approve");
 
+/** Toggle `focusManual` between forced on and the configured schedule ("auto"). */
+function toggleFocus() {
+  saveSettings({ focusManual: (setting("focusManual") || "auto") === "on" ? "auto" : "on" });
+}
+
 const picked = (id, qi) => choices.get(id)?.get(qi) || new Set();
 
 function questionsAnswers(p) {
@@ -210,8 +529,9 @@ function petBlock(nWorking, nPending) {
   // The bubble follows what the sessions are doing, not the pet's passing emote, so clicking an
   // animation does not make it vanish and reappear.
   const badge = nPending > 0 ? "alert" : nWorking > 0 ? "work" : undefined;
-  return ui.row({ cls: "poke", data: { act: "poke" }, title: "Poke it" }, [
-    pet.build(HERO_SIZE, { room: 20, maxHeight: 124, margin: 20, badge, badgeSlot: true }),
+  const focusDim = Fmt.isFocusActive(store.settings);
+  return ui.row({ cls: "poke", data: { act: "poke" }, title: focusDim ? "Poke it (focus mode)" : "Poke it" }, [
+    pet.build(HERO_SIZE, { room: 20, maxHeight: 124, margin: 20, badge, badgeSlot: true, focusDim, accessories: true }),
   ]);
 }
 
@@ -234,27 +554,34 @@ function railRow(s, e, t) {
   if (e.ok === true) icon = ui.glyph({ name: "circle-check-filled", size: 18, color: Viewer.COLORS.ok });
   else if (e.ok === false) icon = ui.glyph({ name: "circle-x-filled", size: 18, color: Viewer.COLORS.fail });
   else icon = ui.glyph({ name: "loader", size: 18, color: "on_surface", rotate: SPINNER_ANGLE(t) });
+  // Flagged by a configured policy rule (see policy.rs): shown for every agent, even though real
+  // enforcement only exists for Claude Code's own permissions (see the README).
+  const policyBadge = e.policy ? ui.glyph({ name: "alert-triangle", size: 14, color: e.policy.level === "deny" ? "error" : "#f59e0b" }) : null;
+  const title = e.policy ? `${e.tool} ${e.label || ""} — policy: ${e.policy.label}` : `${e.tool} ${e.label || ""}`;
   return ui.row(
     {
       cls: "item" + (pinnedStep === e.ts_ms ? " selected" : pinnedStep == null && follow.key === `${s.id}:${e.ts_ms}` ? " shown" : ""),
       data: { act: "pin-step", ts: e.ts_ms },
-      align: "center", gap: 10, paddingH: 8, paddingV: 5, radius: 8, title: `${e.tool} ${e.label || ""}`,
+      align: "center", gap: 10, paddingH: 8, paddingV: 5, radius: 8, title,
     },
     [
       icon,
       ui.label({ text: e.tool, fontSize: 15, fontWeight: running ? "bold" : "semibold", color: running ? "on_surface" : "on_surface_variant" }),
       ui.label({ text: e.label || "", fontSize: 11, color: "on_surface_variant", maxLines: 1, flexGrow: 1 }),
+      policyBadge,
     ],
   );
 }
 
-/** Session rows kept visible below the rail. */
+/** How many session rows the rail's own row budget assumes (see `rail`) — sessions itself is now
+ *  capped independently (see SESSIONS_MAX_ROWS), this is just about leaving the rail reasonably
+ *  short rather than a long list of steps. */
 const sessionRowsShown = () => Math.max(1, Math.min(snap().sessions.length, SESSION_ROWS_MIN));
 
 function rail(s, t) {
   const rows = [];
   if (s) {
-    // Fewer steps when there are sessions to list, so a long turn cannot push the list away.
+    // Fewer steps when there are several sessions, so a long turn's step list doesn't dominate.
     const done = s.status === "idle" && !!s.activity?.finished_ms;
     const room = MAX_RAIL - sessionRowsShown() + 1 - (done ? 1 : 0);
     for (const e of stepsOf(s).slice(-room)) rows.push(railRow(s, e, t));
@@ -577,9 +904,20 @@ function contextTrend(s) {
   ]);
 }
 
+/** One agent's row in the comparative usage table: today's tokens and an estimated cost, or
+ *  "not tracked yet" when nothing reads that agent's token usage (see `usage::Capabilities::context`
+ *  — only Claude Code today; never fabricated for the others). */
+function usageRow(label, data) {
+  const right = !data?.available
+    ? ui.label({ text: "not tracked yet", fontSize: 11, color: "on_surface_variant" })
+    : ui.label({
+        text: `${Fmt.tokens(Fmt.tokenSum(data.today))} today · ${Fmt.cost(data.estimated_cost_usd)} total (est.)`,
+        fontSize: 11, color: "on_surface_variant",
+      });
+  return ui.row({ align: "center", justify: "space_between" }, [ui.label({ text: label, fontSize: 12, color: "on_surface" }), right]);
+}
+
 function usageContent(s, t) {
-  const u = snap().usage?.claude || {};
-  const today = u.today || {}, total = u.total || {};
   const a = s?.activity || {};
   const nodes = [ui.label({ text: "Plan usage", fontSize: 12, fontWeight: "semibold", color: "on_surface" }), limitsSection(t)];
   if (s) {
@@ -597,15 +935,45 @@ function usageContent(s, t) {
   }
   nodes.push(
     ui.separator({ spacing: 4 }),
-    ui.label({ text: `Today: ${Fmt.tokens(today.output)} out · ${Fmt.tokens(today.input)} in · ${Fmt.tokens(today.cache_read)} cache`, fontSize: 12, color: "on_surface" }),
-    ui.label({ text: `Total (recent transcripts): ${Fmt.tokens(total.output)} out · ${Fmt.tokens(total.input)} in`, fontSize: 11, color: "on_surface_variant" }),
+    ui.label({ text: "Usage by agent", fontSize: 12, fontWeight: "semibold", color: "on_surface" }),
+    ui.column(
+      { gap: 4 },
+      Object.entries(snap().usage || {}).map(([id, data]) => usageRow(Fmt.agentLabel(snap(), id), data)),
+    ),
   );
+  if (setting("gamificationEnabled")) {
+    const stats = snap().stats || {};
+    nodes.push(
+      ui.separator({ spacing: 4 }),
+      ui.label({ text: "Stats", fontSize: 12, fontWeight: "semibold", color: "on_surface" }),
+      ui.row({ gap: 20 }, [
+        stat("Streak", stats.streak_days > 0 ? `🔥 ${stats.streak_days}d` : "—"),
+        stat("Sessions", String(stats.total_sessions || 0)),
+        stat("Steps watched", String(stats.total_tool_calls || 0)),
+      ]),
+    );
+  }
   return ui.column({ gap: 10 }, nodes);
 }
 
 // ── Right column: Settings ─────────────────────────────────────────────────────
 
 const prettify = (id) => id.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+
+/** 7 day checkboxes for `focusDays` (Mon..Sun, '1' = quiet that day): not a plain `data-setting`
+ *  control (one checkbox cannot hold a 7-character string), handled in `onSettingChange` instead. */
+function focusDaysControl() {
+  const days = String(setting("focusDays") || "1111100").padEnd(7, "0");
+  const names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const items = names
+    .map(
+      (n, i) =>
+        `<label style="display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px;color:var(--on-surface-variant)">` +
+        `<input type="checkbox" data-focusday="${i}"${days[i] === "1" ? " checked" : ""}>${n[0]}</label>`,
+    )
+    .join("");
+  return `<div style="display:flex;gap:6px;">${items}</div>`;
+}
 
 function settingsView() {
   const row = (label, hint, control) =>
@@ -614,9 +982,15 @@ function settingsView() {
     `<select data-setting="${key}">${options.map(([v, l]) => `<option value="${esc(v)}"${String(setting(key)) === String(v) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
   const check = (key) => `<input type="checkbox" data-setting="${key}"${setting(key) ? " checked" : ""}>`;
   const text = (key, ph = "") => `<input type="text" data-setting="${key}" value="${esc(setting(key))}" placeholder="${esc(ph)}">`;
+  const time = (key) => `<input type="time" data-setting="${key}" value="${esc(setting(key))}">`;
   const num = (key, min, max) => `<input type="number" data-setting="${key}" min="${min}" max="${max}" value="${esc(setting(key))}">`;
   return [
     row("Character", "Who lives in your pet window.", select("character", CHARACTER_IDS.map((id) => [id, prettify(id)]))),
+    row(
+      "Dock to the screen edge",
+      "Pins the pet above everything else (macOS, Windows, and Linux compositors that support it) instead of a window you drag anywhere. Off = a classic, freely movable window. Takes effect after restarting the app.",
+      check("dockedWindow"),
+    ),
     row("Sounds", "Play the pet's little sounds.", check("sounds")),
     row("Random fidgets", "Hop, yawn, wink… while idle.", check("fidgets")),
     row("Nap after (seconds)", "Idle time before it falls asleep. 0 = never.", num("napAfterSec", 0, 3600)),
@@ -625,6 +999,10 @@ function settingsView() {
     row("Close after Allow / Deny", "One click, back to work.", check("closeAfterDecision")),
     row("Chat agent", "Which agent answers in the Chat tab.", select("chatAgent", [["claude", "Claude Code"], ["copilot", "GitHub Copilot"], ["pi", "pi"], ["codex", "Codex"]])),
     row("Chat model", "Empty = the agent's own default.", text("chatModel", "default")),
+    row("Focus mode", "A quiet, compact pet during these hours (the moon button next to the emotes forces it on/off).", check("focusEnabled")),
+    row("Focus hours", "Quiet from / to (local time); crosses midnight if \"to\" is earlier than \"from\".", `${time("focusStart")} – ${time("focusEnd")}`),
+    row("Focus days", "Which days the schedule above applies.", focusDaysControl()),
+    row("Milestones", "A little celebration (and a streak / step count in Usage) for long-term use.", check("gamificationEnabled")),
   ].join("");
 }
 
@@ -633,7 +1011,7 @@ function settingsView() {
 function tabs() {
   const t = (id, label) => btn(label, { variant: tab === id ? "primary" : "ghost", act: "tab", data: { id }, small: true });
   return (
-    `<div class="tabs">${t("live", "Live")}${Fmt.canChat(snap()) ? t("chat", "Chat") : ""}${t("usage", "Usage")}` +
+    `<div class="tabs">${t("live", "Live")}${Fmt.canChat(snap()) ? t("chat", "Chat") : ""}${t("usage", "Usage")}${t("shop", "Shop")}${t("play", "Play")}` +
     `<span class="grow"></span>${btn("", { act: "tab", data: { id: "settings" }, glyph: "settings", tip: "Settings", small: true, variant: tab === "settings" ? "primary" : "ghost" })}` +
     `${btn("", { act: "close", glyph: "x", tip: "Close" })}</div>`
   );
@@ -643,9 +1021,21 @@ function renderLeft(t) {
   const s = currentSession();
   const [nWorking, nPending] = counts();
   setHtml($("title"), titleBlock(s, nWorking, nPending, t));
-  setHtml($("rail"), rail(s, t));
+  setHtml($("careMeters"), careMeters());
+  setHtml($("emotes"), emotesContent());
+  const railEl = $("rail");
+  setHtml(railEl, rail(s, t));
+  // The rail is a short scroll box (see SESSIONS_MAX_ROWS' sibling note): without this, the
+  // newest command could scroll out of view behind older ones instead of always being the one
+  // you see (same "pin to the bottom on new content" idiom as the chat log above).
+  const steps = stepsOf(s);
+  const railRev = `${s?.id || ""}:${steps.length}:${steps.at(-1)?.ts_ms || 0}`;
+  if (railRev !== lastRailRev) {
+    lastRailRev = railRev;
+    railEl.scrollTop = railEl.scrollHeight;
+  }
   setHtml($("sessions"), sessionList(s));
-  $("sessions").style.minHeight = `${sessionRowsShown() * SESSION_ROW_H}px`;
+  $("sessions").style.maxHeight = `${SESSIONS_MAX_ROWS * SESSION_ROW_H}px`;
 }
 
 function renderRight() {
@@ -662,6 +1052,8 @@ function renderRight() {
   show("content", tab === "live" || tab === "usage" || down);
   show("chat", tab === "chat" && !down);
   show("settings", tab === "settings" && !down);
+  show("shop", tab === "shop" && !down);
+  show("play", tab === "play" && !down);
   if (down) {
     setHtml(
       $("content"),
@@ -677,6 +1069,8 @@ function renderRight() {
     if (typing) $("content").querySelector(".caret")?.scrollIntoView({ block: "nearest" });
   }
   else if (tab === "chat") renderChat();
+  else if (tab === "shop") setHtml($("shop"), shopContent());
+  else if (tab === "play") setHtml($("play"), playContent());
   else if (tab === "settings" && !$("settings")._built) {
     $("settings").innerHTML = settingsView();
     $("settings")._built = true;
@@ -698,8 +1092,54 @@ function onClick(e) {
   switch (d.act) {
     case "tab": return setTab(d.id);
     case "close": return invoke("close_panel");
-    case "emote": return sendEvent(d.kind);
+    case "emote":
+      sendEvent(d.kind);
+      if (CARE_ACTION[d.kind]) void invoke(CARE_ACTION[d.kind]).catch(() => {});
+      return;
     case "poke": return pet.poke(now());
+    case "accessory-buy": return void invoke("care_buy", { id: d.id }).catch(() => {});
+    case "accessory-equip": return void invoke("care_equip", { id: d.id }).catch(() => {});
+    case "play-game":
+      playGame = d.id;
+      mem.set("playGame", d.id);
+      playState = "idle";
+      playResult = null;
+      return renderRight();
+    case "play-start":
+      playState = "running";
+      playResult = null;
+      if (playGame === "tap") {
+        playTaps = 0;
+        playEndsAt = now() + 8000;
+      } else if (playGame === "catch") {
+        catchHits = 0;
+        catchEndsAt = now() + CATCH_DURATION_MS;
+        catchLeftIsTarget = Math.random() < 0.5;
+        catchNextRerollAt = now() + CATCH_REROLL_MS;
+      } else {
+        memLevel = 1;
+        memSeq = [randomPad()];
+        memShowIdx = 0;
+        memInputIdx = 0;
+        memPhase = "flash";
+        memActivePad = memSeq[0];
+        memNextAt = now() + MEMORY_FLASH_MS;
+      }
+      return renderRight();
+    case "play-tap":
+      if (playGame === "tap" && playState === "running") playTaps++;
+      return renderRight();
+    case "catch-tap":
+      catchTap(d.side);
+      return renderRight();
+    case "memory-tap":
+      memoryTap(Number(d.pad));
+      return renderRight();
+    case "play-again":
+      playState = "idle";
+      playResult = null;
+      return renderRight();
+    case "focus-toggle": return toggleFocus();
     case "allow": return decide("approve", id);
     case "deny": return decide("deny", id);
     case "plan-approve": return decide("approve", id);
@@ -731,6 +1171,13 @@ function onClick(e) {
 }
 
 function onSettingChange(e) {
+  const dayEl = e.target.closest("[data-focusday]");
+  if (dayEl) {
+    const days = String(setting("focusDays") || "1111100").padEnd(7, "0").split("");
+    days[Number(dayEl.dataset.focusday)] = dayEl.checked ? "1" : "0";
+    saveSettings({ focusDays: days.join("") });
+    return;
+  }
   const el = e.target.closest("[data-setting]");
   if (!el) return;
   const key = el.dataset.setting;
@@ -746,21 +1193,28 @@ function onMouseMove(e) {
   pet.lookAt(Math.max(-1, Math.min(1, (e.clientX - cx) / 360)), Math.max(-1, Math.min(1, (e.clientY - cy) / 240)));
 }
 
+// petBlock, title, then care (the meters + its action buttons) — care is about the pet rather
+// than any one session, but still reads after the title/status line it sits just below. The
+// session list is capped at SESSIONS_MAX_ROWS (own scrollbar) rather than flex-grow, so it can
+// never fight the rail for space or render on top of it — the rail is the one that flex-grows/
+// scrolls into whatever is left at the bottom, since sessions is the thing you most need to
+// always reach.
 const SKELETON = `
 <div class="panel">
   <aside class="left">
     <div id="petBlock"></div>
     <div id="title"></div>
+    ${ui.separator({ spacing: 2 })}
+    <div id="careMeters"></div>
     <div class="emotes">
-      ${[["heart", "Pet it", "love"], ["cookie", "Feed it", "eat"], ["music", "Dance!", "dance"], ["moon", "Nap time", "nap"]]
-        .map(([g, tip, kind]) => btn("", { act: "emote", data: { kind }, glyph: g, tip, small: true }))
-        .join("")}
+      <span id="emotes" style="display:contents"></span>
+      ${btn("", { act: "focus-toggle", glyph: "moon-stars", tip: "Toggle focus mode (quiet, compact pet)", small: true })}
     </div>
     ${ui.separator({ spacing: 2 })}
-    <div id="rail"></div>
-    ${ui.separator({ spacing: 2 })}
     <div class="muted small">Sessions</div>
-    <div id="sessions" class="scroll grow"></div>
+    <div id="sessions" class="scroll"></div>
+    ${ui.separator({ spacing: 2 })}
+    <div id="rail" class="scroll grow"></div>
   </aside>
   <div class="vsep"></div>
   <main class="right">
@@ -773,6 +1227,8 @@ const SKELETON = `
       <div class="chat-input"><input id="chatInput" type="text" autocomplete="off" spellcheck="true"><span id="chatBtns" class="btn-row"></span></div>
     </div>
     <div id="settings" class="scroll grow hidden"></div>
+    <div id="shop" class="scroll grow hidden"></div>
+    <div id="play" class="scroll grow hidden"></div>
   </main>
 </div>`;
 
@@ -818,13 +1274,15 @@ export function mount(root) {
     const t = now();
     if (t - last >= FRAME_MS) {
       last = t;
+      pet.setFocus(Fmt.isFocusActive(store.settings));
       pet.tick(t);
       const [nWorking, nPending] = counts();
       setHtml($("petBlock"), petBlock(nWorking, nPending));
       if (t - slow >= 120) {
         slow = t;
         renderLeft(t);
-        if (tab === "live" || tab === "usage") renderRight();
+        tickPlay();
+        if (tab === "live" || tab === "usage" || tab === "play") renderRight();
       } else if (tab === "live" && typing) renderRight(); // the typewriter runs at the full frame rate
     }
     requestAnimationFrame(frame);
