@@ -16,6 +16,7 @@ import { ui, esc, col } from "./ui.js";
 import { Pet, configFrom, CHARACTER_IDS, ACCESSORIES, accessoryArt } from "./pet.js";
 import * as Fmt from "./fmt.js";
 import * as Viewer from "./viewer.js";
+import * as Requests from "./requests.js";
 
 const HERO_SIZE = 92;
 const FRAME_MS = 33; // ~30 fps
@@ -61,7 +62,6 @@ let optimistic = null; // {text, file, base}: a message just sent, shown until t
 let fedFile = null; // {path, name}: a file fed to the pet, sent with the next chat message
 let lastChatRev = "";
 let lastRailRev = ""; // see renderLeft: keeps the rail (now a short scroll box) pinned to the newest step
-const choices = new Map(); // pending id → question index → Set(labels)
 
 // Search over a session's full stored history (see src/history.rs), beyond the live rail's last
 // few steps. Empty query = the normal live rail; a non-empty one fetches from the daemon.
@@ -527,59 +527,9 @@ function pinStep(s, e) {
 
 // ── Decisions ──────────────────────────────────────────────────────────────────
 
-/** Settle a pending request: take its card away at once (the daemon's next snapshot confirms it, and
- *  brings it back if the answer was refused), let the pet react, send the request, and close the
- *  panel if nothing is left to answer. */
-function settle(id, send, eventKind) {
-  const kept = snap().pending.filter((p) => p.id !== id);
-  store.snapshot = { ...snap(), pending: kept };
-  sendEvent(eventKind); // love / sad, with their own sounds
-  Promise.resolve(send()).catch((e) => console.warn("sushi: request failed:", e));
-  if (!kept.length && setting("closeAfterDecision")) invoke("close_panel");
-  else renderAll();
-}
-
-const decide = (action, id) => settle(id, () => invoke("decide", { action, id }), action === "deny" ? "deny" : "approve");
-
 /** Toggle `focusManual` between forced on and the configured schedule ("auto"). */
 function toggleFocus() {
   saveSettings({ focusManual: (setting("focusManual") || "auto") === "on" ? "auto" : "on" });
-}
-
-const picked = (id, qi) => choices.get(id)?.get(qi) || new Set();
-
-function questionsAnswers(p) {
-  const answers = {};
-  const list = p.detail?.questions || [];
-  for (const [qi, q] of list.entries()) {
-    const chosen = picked(p.id, qi);
-    const labels = (q.options || []).filter((o) => chosen.has(o.label)).map((o) => o.label);
-    if (!labels.length) return null; // not answered yet
-    answers[q.question] = labels.join(", ");
-  }
-  return answers;
-}
-
-function sendAnswers(p) {
-  const answers = questionsAnswers(p);
-  if (!answers) return;
-  choices.delete(p.id);
-  settle(p.id, () => invoke("answer", { id: p.id, answers }), "approve");
-}
-
-function choose(p, qi, label) {
-  const q = (p.detail?.questions || [])[qi];
-  if (!q) return;
-  if (!choices.has(p.id)) choices.set(p.id, new Map());
-  const c = choices.get(p.id);
-  if (q.multi) {
-    const set = new Set(c.get(qi) || []);
-    set.has(label) ? set.delete(label) : set.add(label);
-    c.set(qi, set);
-  } else c.set(qi, new Set([label]));
-  const list = p.detail?.questions || [];
-  if (list.length === 1 && !q.multi) sendAnswers(p); // one question, one choice: nothing more to ask
-  else renderRight();
 }
 
 // ── Left column ────────────────────────────────────────────────────────────────
@@ -712,80 +662,6 @@ function sessionList(current) {
 }
 
 // ── Right column: permissions ──────────────────────────────────────────────────
-
-function questionCard(p, who) {
-  const list = p.detail?.questions || [];
-  const children = [
-    ui.row({ align: "center", gap: 8 }, [
-      ui.glyph({ name: "help-circle", size: 18, color: "primary" }),
-      ui.label({ text: `${who} is asking you`, fontSize: 14, fontWeight: "semibold", color: "on_surface", maxLines: 1, flexGrow: 1 }),
-    ]),
-  ];
-  for (const [qi, q] of list.entries()) {
-    const chosen = picked(p.id, qi);
-    const block = [];
-    if (q.header) block.push(ui.label({ text: q.header, fontSize: 10, fontWeight: "bold", color: "primary" }));
-    block.push(ui.label({ text: q.question, fontSize: 14, fontWeight: "semibold", color: "on_surface", maxLines: 4, maxWidth: 520 }));
-    if (q.multi) block.push(ui.label({ text: "Choose one or more", fontSize: 11, color: "on_surface_variant" }));
-    for (const o of q.options || []) {
-      const on = chosen.has(o.label);
-      block.push(
-        `<div class="option">${btn(on && q.multi ? "✓ " + o.label : o.label, {
-          variant: on ? "primary" : "outline", act: "choose", data: { id: p.id, qi, label: o.label }, tip: o.description || undefined,
-        })}${ui.label({ text: o.description || "", fontSize: 11, color: "on_surface_variant", maxLines: 2, maxWidth: 360, flexGrow: 1 })}</div>`,
-      );
-    }
-    children.push(ui.column({ gap: 6 }, block));
-  }
-  // Several questions (or a multiple choice) need an explicit send.
-  if (!(list.length === 1 && !list[0].multi)) {
-    children.push(btn("Send answers", { variant: "primary", act: "send-answers", data: { id: p.id }, off: questionsAnswers(p) == null }));
-  }
-  children.push(ui.label({ text: "You can also answer it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
-  return ui.column({ gap: 10, padding: 10, fill: "primary/0.10", radius: 12 }, children);
-}
-
-/** A plan the agent wants approved (Claude Code's "Ready to code?"). While its hook waits it can be
- *  approved here; after that it stays for reading until it has been dealt with in the terminal. */
-function planCard(p, who) {
-  const children = [
-    ui.row({ align: "center", gap: 8 }, [
-      ui.glyph({ name: "list-check", size: 18, color: "primary" }),
-      ui.label({ text: `${who} has a plan ready`, fontSize: 14, fontWeight: "semibold", color: "on_surface", maxLines: 1, flexGrow: 1 }),
-    ]),
-  ];
-  if (p.detail && typeof p.detail === "object") children.push(Viewer.render(p.detail, { bodyLines: 14 }));
-  if (p.answerable === false) {
-    children.push(ui.label({ text: "Review and approve it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
-  } else {
-    const data = { id: p.id };
-    children.push(
-      `<div class="btn-row">${btn("Approve", { variant: "primary", act: "plan-approve", data, tip: "Claude asks before each edit" })}${btn("Approve, auto-accept edits", { variant: "outline", act: "plan-approve-edits", data })}${btn("Keep planning", { variant: "outline", act: "deny", data, tip: "Then tell Claude what to change in the terminal" })}</div>`,
-    );
-    children.push(ui.label({ text: "You can also answer it in the terminal.", fontSize: 11, color: "on_surface_variant" }));
-  }
-  return ui.column({ gap: 8, padding: 10, fill: "primary/0.10", radius: 12 }, children);
-}
-
-function permissionCard(p) {
-  let who = p.session_name || p.session_id;
-  if (p.agent && Fmt.multiAgent(snap())) who = Fmt.agentLabel(snap(), p.agent) + " · " + who;
-  if (p.kind === "question" && p.detail?.type === "questions") return questionCard(p, who);
-  if (p.kind === "plan") return planCard(p, who);
-  const what = p.tool_name || p.tool || "a tool";
-  const children = [
-    ui.row({ align: "center", gap: 8 }, [
-      ui.glyph({ name: "alert-triangle", size: 18, color: "#f59e0b" }),
-      ui.label({ text: `${who} wants to use ${what}`, fontSize: 14, fontWeight: "semibold", color: "on_surface", maxLines: 1, flexGrow: 1 }),
-    ]),
-  ];
-  if (p.detail && typeof p.detail === "object") children.push(Viewer.render(p.detail, { maxRows: 9 }));
-  else if (p.tool) children.push(ui.label({ text: p.tool, fontSize: 12, color: "on_surface_variant", maxLines: 3 }));
-  children.push(
-    `<div class="btn-row">${btn("Allow", { variant: "primary", act: "allow", data: { id: p.id } })}${btn("Deny", { variant: "outline", act: "deny", data: { id: p.id } })}</div>`,
-  );
-  return ui.column({ gap: 8, padding: 10, fill: "#f59e0b/0.10", radius: 12 }, children);
-}
 
 // ── Right column: Live ─────────────────────────────────────────────────────────
 
@@ -1167,7 +1043,7 @@ function settingsView() {
     row("Random fidgets", "Hop, yawn, wink… while idle.", check("fidgets")),
     row("Nap after (seconds)", "Idle time before it falls asleep. 0 = never.", num("napAfterSec", 0, 3600)),
     row("Pet window shows", "What goes next to the pet.", select("widgetInfo", [["usage", "Usage only"], ["session", "Session"], ["detailed", "Detailed"]])),
-    row("Open on permission request", "Bring the panel up when an agent asks.", check("autoOpen")),
+    row("Open on permission request", "Bring the panel up when an agent asks or waits for you.", check("autoOpen")),
     row("Close after Allow / Deny", "One click, back to work.", check("closeAfterDecision")),
     row("Chat agent", "Which agent answers in the Chat tab.", select("chatAgent", [["claude", "Claude Code"], ["copilot", "GitHub Copilot"], ["pi", "pi"], ["codex", "Codex"]])),
     row("Chat model", "Empty = the agent's own default.", text("chatModel", "default")),
@@ -1219,7 +1095,7 @@ function renderRight() {
   const down = !store.up;
   setHtml(
     $("perms"),
-    down ? "" : snap().pending.map((p) => permissionCard(p)).join(""),
+    down ? "" : snap().pending.map((p) => Requests.permissionCard(p)).join(""),
   );
   const show = (id, on) => $(id).classList.toggle("hidden", !on);
   show("content", tab === "live" || tab === "usage" || down);
@@ -1261,6 +1137,7 @@ function onClick(e) {
   const el = e.target.closest("[data-act]");
   if (!el || el.disabled) return;
   const d = el.dataset;
+  if (Requests.handleAction(d)) return;
   const id = d.id !== undefined && /^\d+$/.test(d.id) ? Number(d.id) : d.id;
   switch (d.act) {
     case "tab": return setTab(d.id);
@@ -1313,18 +1190,6 @@ function onClick(e) {
       playResult = null;
       return renderRight();
     case "focus-toggle": return toggleFocus();
-    case "allow": return decide("approve", id);
-    case "deny": return decide("deny", id);
-    case "plan-approve": return decide("approve", id);
-    case "plan-approve-edits": return decide("approve-edits", id);
-    case "choose": {
-      const p = snap().pending.find((x) => x.id === id);
-      return p && choose(p, Number(d.qi), d.label);
-    }
-    case "send-answers": {
-      const p = snap().pending.find((x) => x.id === id);
-      return p && sendAnswers(p);
-    }
     case "pin-session": return pinSession(d.id);
     case "pin-step": {
       const s = currentSession();
@@ -1425,6 +1290,11 @@ const SKELETON = `
 export function mount(root) {
   root.innerHTML = SKELETON;
   root.addEventListener("click", onClick);
+  Requests.subscribe((result) => {
+    renderRight();
+    const full = document.documentElement.dataset.view !== "dock" || document.documentElement.dataset.dockMode === "full";
+    if (result?.settled != null && !snap().pending.length && full && setting("closeAfterDecision")) invoke("close_panel");
+  });
   root.addEventListener("change", onSettingChange);
   document.addEventListener("mousemove", onMouseMove);
   document.addEventListener("mouseleave", () => pet.lookAt(null));

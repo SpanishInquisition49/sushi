@@ -28,8 +28,26 @@ const pet = new Pet(now(), configFrom(store.settings));
 let lastHtml = "";
 let lastTip = "";
 // Set by `mount()`: normally `#root` itself, but the macOS notch window mounts this into a
-// sub-container (see notch-window.js), so `render()` must not re-look it up by a fixed id.
+// sub-container (see dock-window.js), so `render()` must not re-look it up by a fixed id.
 let rootEl = null;
+// Standard keeps other platforms unchanged; macOS camera displays use one left wing.
+let presentation = "standard";
+let notchLayout = null;
+let presentationKey = "standard";
+
+export function setPresentation(mode, { layout = null } = {}) {
+  const key = mode === "lateral"
+    ? [mode, layout?.lateralAvailable, layout?.notchWidth, layout?.topInset, layout?.leftWingWidth, layout?.rightWingWidth].join(":")
+    : mode;
+  if (presentationKey === key) return;
+  presentationKey = key;
+  presentation = mode;
+  notchLayout = layout;
+  if (rootEl) {
+    render();
+    fitWindow(isShrunk());
+  }
+}
 
 const snap = () => store.snapshot;
 
@@ -102,12 +120,41 @@ function chips(info, a, elapsed) {
  *  or, while napping (nothing pending, nothing working), just the character on its own. */
 function pill(pending, sessionChips, h, shrunk) {
   const focusDim = Fmt.isFocusActive(store.settings);
-  if (shrunk) return ui.row({ gap: 0, align: "center", cls: "pill" }, [pet.build(PET_SIZE_SHRUNK, { room: 3, margin: 2, maxHeight: 40, focusDim })]);
-  const children = [pet.build(PET_SIZE, { room: 6, margin: 4, mouth: true, maxHeight: 74, focusDim })];
+  const character = pet.build(shrunk ? PET_SIZE_SHRUNK : PET_SIZE, shrunk
+    ? { room: 3, margin: 2, maxHeight: 40, focusDim }
+    : { room: 6, margin: 4, mouth: true, maxHeight: 74, focusDim });
+  if (shrunk) return ui.row({ gap: 0, align: "center", cls: "pill" }, [character]);
+  const children = [character];
   if (pending > 0) children.push(ui.label({ text: "!" + pending, fontSize: 13, fontWeight: "bold", color: "error" }));
   children.push(...sessionChips);
   if (h) children.push(ui.label({ text: h[0], fontSize: 13, fontWeight: "bold", color: h[1] }));
   return ui.row({ gap: 6, align: "center", cls: "pill" }, children);
+}
+
+/** One priority indicator; shape and text both distinguish disconnected / working / idle. */
+function lateralIndicator() {
+  if (!store.up) return ["×", "on_surface_variant", "daemon disconnected"];
+  const pending = Fmt.needsYou(snap());
+  if (pending > 0) return [pending > 99 ? "!99+" : "!" + pending, "error", `${pending} requests need you`];
+  const usage = headline();
+  if (usage) return [...usage, "usage " + usage[0]];
+  return snap().sessions.some((s) => s.status === "working")
+    ? ["•••", "primary", "working"]
+    : ["—", "on_surface_variant", "idle"];
+}
+
+function lateralPill() {
+  if (!notchLayout?.lateralAvailable) return "";
+  const height = Math.max(1, Math.min(24, notchLayout.topInset - 4));
+  const character = pet.build(20, {
+    room: Math.min(2, height / 4), margin: 2, maxHeight: height,
+    detail: false, focusDim: Fmt.isFocusActive(store.settings),
+  });
+  const [text, color] = lateralIndicator();
+  return '<div class="notch-pill"><div class="notch-wing"><div class="notch-pet">' + character
+    + '</div><div class="notch-indicator">'
+    + ui.label({ text, fontSize: 13, fontWeight: "bold", color })
+    + '</div></div><div class="notch-camera" aria-hidden="true"></div></div>';
 }
 
 const isShrunk = () => pet.cur === "nap";
@@ -115,7 +162,7 @@ const isShrunk = () => pet.cur === "nap";
 function render() {
   const info = setting("widgetInfo");
   const shrunk = isShrunk();
-  const html = store.up
+  const html = presentation === "lateral" ? lateralPill() : store.up
     ? pill(Fmt.needsYou(snap()), !shrunk && info !== "usage" ? sessionChips(info) : [], shrunk ? null : headline(), shrunk)
     : pill(0, [], null, false);
   const root = rootEl;
@@ -123,41 +170,42 @@ function render() {
     lastHtml = html;
     root.innerHTML = html;
   }
-  const tip = tooltipRows().map(([k, v]) => `${k}: ${v}`).join("\n");
+  const tip = (presentation === "lateral" ? [["Sushi", lateralIndicator()[2]], ...tooltipRows()] : tooltipRows())
+    .map(([k, v]) => `${k}: ${v}`).join("\n");
   if (tip !== lastTip) {
     lastTip = tip;
     root.title = tip;
   }
 }
 
-/** Size the window for the pill at its widest with the current settings, so it takes no more room
- *  than it can show. Done before the window first shows and when the settings change: tiling
- *  compositors (niri) only take a window's size when it opens, so it cannot follow every chip.
- *
- *  In the docked window, where resizing live is the whole point (see dock-window.js and
- *  app/src-tauri/src/dock*.rs), `shrunk` instead fits the minimal napping pill — called again
- *  whenever that flips, so the window itself shrinks to just the character and back, not only
- *  its content. The classic window keeps sizing to the widest case always, content shrinks
- *  inside the same window: resizing it live isn't something tiling compositors handle well. */
+/** Lateral bounds are fixed by display geometry. Other platforms retain their usual fitting. */
 let fitted = "";
 function fitWindow(shrunk) {
-  const docked = document.documentElement.dataset.view === "dock";
-  let widget;
-  if (docked && shrunk) {
-    widget = pill(0, [], null, true);
-  } else {
-    const a = { files_changed: 99, lines_added: 9999, lines_removed: 9999, commands: 99, failures: 9 };
-    const info = setting("widgetInfo");
-    widget = pill(9, info !== "usage" ? chips(info, a, 9 * 3600e3 + 59 * 60e3 + 59e3) : [], ["100%", "error"], false);
+  if (presentation === "lateral") {
+    const width = Math.max(1, (notchLayout?.leftWingWidth || 0) + (notchLayout?.notchWidth || 0) + (notchLayout?.rightWingWidth || 0));
+    const height = Math.max(1, notchLayout?.topInset || 0);
+    const key = `lateral:${width}x${height}:${notchLayout?.lateralAvailable}`;
+    if (fitted !== key) {
+      fitted = key;
+      invoke("fit_pet", { width, height, animate: false });
+    }
+    return;
   }
-  const probe = document.createElement("div");
-  probe.style.cssText = "position:absolute;left:0;top:0;visibility:hidden;width:max-content";
-  probe.innerHTML = widget;
-  document.body.appendChild(probe);
-  const r = probe.firstElementChild.getBoundingClientRect();
-  probe.remove();
-  const pad = 12 + 4; // #root's padding on both sides, and a little room for the font
-  const size = [Math.ceil(r.width) + pad, Math.ceil(r.height) + pad];
+  const docked = document.documentElement.dataset.view === "dock";
+  const a = { files_changed: 99, lines_added: 9999, lines_removed: 9999, commands: 99, failures: 9 };
+  const info = setting("widgetInfo");
+  const widest = pill(9, info !== "usage" ? chips(info, a, 9 * 3600e3 + 59 * 60e3 + 59e3) : [], ["100%", "error"], false);
+  function measure(widget) {
+    const probe = document.createElement("div");
+    probe.style.cssText = "position:absolute;left:0;top:0;visibility:hidden;width:max-content";
+    probe.innerHTML = widget;
+    document.body.appendChild(probe);
+    const r = probe.firstElementChild.getBoundingClientRect();
+    probe.remove();
+    const pad = 16; // normal pill/container padding and font allowance
+    return [Math.ceil(r.width) + pad, Math.ceil(r.height) + pad];
+  }
+  const size = measure(docked && shrunk ? pill(0, [], null, true) : widest);
   if (size.join("x") === fitted) return;
   fitted = size.join("x");
   invoke("fit_pet", { width: size[0], height: size[1] });
@@ -178,15 +226,18 @@ function broadcast(kind) {
 function wirePointer(root) {
   let down = null;
   let rightDownAt = 0;
+  const inWing = (e) => presentation !== "lateral" || !!e.target.closest(".notch-wing");
   root.addEventListener("mousedown", (e) => {
+    if (!inWing(e)) return;
     if (e.button === 0) down = { x: e.screenX, y: e.screenY, dragged: false };
     else if (e.button === 1) e.preventDefault(); // no autoscroll
     else if (e.button === 2) rightDownAt = now();
   });
   root.addEventListener("mousemove", (e) => {
     // The eyes follow the pointer while it is over the window.
-    const r = root.getBoundingClientRect();
-    pet.lookAt(Math.max(-1, Math.min(1, (e.clientX - (r.left + 40)) / 120)), Math.max(-1, Math.min(1, (e.clientY - (r.top + r.height / 2)) / 60)));
+    const r = (presentation === "lateral" ? root.querySelector(".notch-pet") : null)?.getBoundingClientRect() || root.getBoundingClientRect();
+    const eyeX = r.left + (presentation === "lateral" ? r.width / 2 : 40);
+    pet.lookAt(Math.max(-1, Math.min(1, (e.clientX - eyeX) / 120)), Math.max(-1, Math.min(1, (e.clientY - (r.top + r.height / 2)) / 60)));
     if (down && !down.dragged && Math.hypot(e.screenX - down.x, e.screenY - down.y) > DRAG_PX) {
       down.dragged = true;
       // In the docked window the position is pinned by the Rust side, not dragged by hand.
@@ -194,6 +245,7 @@ function wirePointer(root) {
     }
   });
   root.addEventListener("mouseup", (e) => {
+    if (!inWing(e)) { down = null; return; }
     if (e.button === 0 && down && !down.dragged) {
       pet.poke(now());
       invoke("toggle_panel");
@@ -204,6 +256,7 @@ function wirePointer(root) {
   });
   root.addEventListener("dblclick", (e) => {
     e.preventDefault();
+    if (!inWing(e)) return;
     broadcast("nap-toggle");
   });
   root.addEventListener("mouseleave", () => {
@@ -212,6 +265,7 @@ function wirePointer(root) {
   });
   root.addEventListener("contextmenu", (e) => {
     e.preventDefault();
+    if (!inWing(e)) return;
     // Tamagotchi care (see src/care.rs): petting it here counts the same as the panel's heart
     // button, including its cooldown (snap().care.next_pet_ms, refreshed every snapshot) — a
     // right click while it is still cooling down is a no-op, same as a disabled button, instead

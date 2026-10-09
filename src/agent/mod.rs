@@ -167,6 +167,7 @@ impl Agent {
     /// The payload with the keys the neutral envelope reads (Copilot mixes naming styles, Antigravity has its own event names).
     fn canonical(self, payload: &Value) -> Value {
         match self {
+            Agent::Codex => codex::canonical(payload),
             Agent::Copilot => copilot::canonical(payload),
             Agent::Antigravity => antigravity::canonical(payload),
             Agent::Gemini => gemini::canonical(payload),

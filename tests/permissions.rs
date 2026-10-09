@@ -9,6 +9,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "../app/src-tauri/src/dock_state.rs"]
+#[allow(dead_code)]
+mod dock_state;
+
 struct Daemon {
     child: Child,
     dir: PathBuf,
@@ -395,10 +399,58 @@ fn codex_speaks_the_same_hook_language_and_gets_a_codex_session() {
     assert_eq!((s["agent"].as_str(), s["id"].as_str()), (Some("codex"), Some("codex:s1")));
     assert!(s.get("context").is_none(), "no transcript parsing for Codex");
 
+    let mut dock = dock_state::DockState::new();
+    dock.display_changed(false, true);
+    dock.update(dock_state::attention_keys(&d.state()), true);
+    dock.display_changed(true, true);
+    assert_eq!(dock.mode, dock_state::Mode::Attention, "the published permission opens the dock once geometry is ready");
+    dock.close();
+    dock.update(dock_state::attention_keys(&d.state()), true);
+    assert_eq!(dock.mode, dock_state::Mode::Collapsed);
+
     assert!(d.cli(&["approve", &p["id"].to_string()]).0);
     let (out, _) = hook.finish();
     let v: Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    dock.update(dock_state::attention_keys(&d.state()), true);
+    assert!(!dock.has_waits());
+}
+
+#[test]
+fn codex_question_hook_publishes_attention_without_blocking_or_creating_permissions() {
+    let d = Daemon::start("codex-question");
+    let mut payload = event("PreToolUse");
+    payload["tool_name"] = json!("functions.request_user_input_async");
+    payload["tool_input"] = json!({"questions":[{"title":"Continue <now>?", "options":["Yes", "No"]}]});
+    let (out, _) = d.hook_for("codex", payload.clone()).finish();
+    assert!(out.is_empty(), "observing a question must not answer or block Codex");
+    let started = Instant::now();
+    let snapshot = loop {
+        let snapshot = d.state();
+        if snapshot["sessions"][0]["status"] == "waiting" { break snapshot; }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(snapshot["pending"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["sessions"][0]["attention"]["detail"]["questions"][0]["question"], "Continue <now>?");
+    let mut dock = dock_state::DockState::new();
+    dock.display_changed(true, true);
+    dock.update(dock_state::attention_keys(&snapshot), true);
+    assert_eq!(dock.mode, dock_state::Mode::Attention);
+    payload["hook_event_name"] = json!("Interrupt");
+    d.hook_for("codex", payload).finish();
+    let started = Instant::now();
+    loop {
+        let snapshot = d.state();
+        if snapshot["sessions"][0]["status"] == "idle" {
+            assert!(snapshot["sessions"][0].get("attention").is_none());
+            dock.update(dock_state::attention_keys(&snapshot), true);
+            assert_eq!(dock.mode, dock_state::Mode::Collapsed);
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]

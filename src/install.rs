@@ -57,6 +57,9 @@ pub fn hook_snippet(hook: &Path, agent: Agent) -> Value {
     }
     // Long enough for a Claude Code plan (the hook waits up to 300 s for one); a permission waits 30 s.
     hooks.insert("PermissionRequest".into(), entry(PERMISSION_HOOK_TIMEOUT));
+    if agent == Agent::Codex {
+        hooks.insert("Interrupt".into(), entry(3));
+    }
     json!({ "hooks": hooks })
 }
 
@@ -464,8 +467,10 @@ mod tests {
     #[test]
     fn other_agents_run_the_hook_with_their_id() {
         let snippet = hook_snippet(&hook(), Agent::Codex);
+        assert_eq!(snippet["hooks"]["Interrupt"][0]["hooks"][0]["timeout"], 3);
         assert_eq!(snippet["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook --agent codex");
         let claude = hook_snippet(&hook(), Agent::Claude);
+        assert!(claude["hooks"].get("Interrupt").is_none());
         assert_eq!(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/home/me/.cargo/bin/sushi-hook");
         let spaced = hook_snippet(Path::new("/my bin/sushi-hook"), Agent::Codex);
         let expected = if cfg!(windows) {

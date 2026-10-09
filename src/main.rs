@@ -667,6 +667,7 @@ fn resolve(shared: &Shared, id: u64, decide: impl FnOnce(&Pending) -> Result<Ver
     }
     if let Some(s) = st.sessions.map.get_mut(&p.session_id) {
         s.status = Status::Working;
+        s.attention = None;
     }
     st.publish();
     Reply::ok()

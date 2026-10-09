@@ -2,8 +2,44 @@
 //! output), so only the tools differ. Shell commands are `Bash`; file changes arrive as an
 //! `apply_patch` call carrying the patch text.
 
-use super::{Tool, edits_lines, response_text, str_of};
+use super::{Role, Tool, edits_lines, response_text, str_of};
 use serde_json::Value;
+
+pub fn canonical(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    // Codex reports interruption separately from a completed turn.
+    if payload["hook_event_name"] == "Interrupt" {
+        payload["hook_event_name"] = "Stop".into();
+    } else if payload["hook_event_name"] == "PostToolUse" && payload["is_error"] == true {
+        payload["hook_event_name"] = "PostToolUseFailure".into();
+    }
+    payload
+}
+
+pub fn is_question(name: &str) -> bool {
+    matches!(name.rsplit('.').next(), Some("request_user_input" | "request_user_input_async"))
+}
+
+fn question_input(input: &Value) -> Value {
+    let mut input = input.clone();
+    if let Some(questions) = input.get_mut("questions").and_then(Value::as_array_mut) {
+        for question in questions {
+            if question.get("question").is_none()
+                && let Some(title) = question.get("title").cloned()
+            {
+                question["question"] = title;
+            }
+            if let Some(options) = question.get_mut("options").and_then(Value::as_array_mut) {
+                for option in options {
+                    if let Some(label) = option.as_str() {
+                        *option = serde_json::json!({"label": label});
+                    }
+                }
+            }
+        }
+    }
+    input
+}
 
 /// The command of a shell tool: a string, or an argv array (`["bash", "-lc", "ls"]`).
 fn command_of(input: &Value) -> Option<String> {
@@ -94,6 +130,11 @@ pub fn patch_tool(name: &str, input: &Value, text: &str) -> Tool {
 }
 
 pub fn tool(name: &str, input: &Value, response: Option<&Value>) -> Tool {
+    if is_question(name) {
+        let mut tool = Tool::new(name, "other", &question_input(input));
+        tool.role = Role::Question;
+        return tool;
+    }
     let s = |k: &str| str_of(input, k).map(str::to_string);
     if let Some(text) = patch_text(input) {
         return patch_tool(name, input, text);
@@ -135,6 +176,30 @@ mod tests {
     use serde_json::json;
 
     const PATCH: &str = "*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main\n ctx\n-old one\n-old two\n+new one\n*** Add File: b.txt\n+hello\n+world\n*** End Patch";
+
+    #[test]
+    fn questions_normalize_sync_async_and_qualified_names() {
+        for name in ["request_user_input", "functions.request_user_input", "functions.request_user_input_async"] {
+            let input = if name.ends_with("async") {
+                json!({"questions":[{"title":"Proceed?", "options":["Yes", "No"]}, {"title":"Explain"}]})
+            } else {
+                json!({"questions":[{"id":"proceed", "header":"Choice", "question":"Proceed?", "options":[{"label":"Yes", "description":"Continue"}]}]})
+            };
+            let t = tool(name, &input, None);
+            assert_eq!(t.role, Role::Question);
+            let detail = crate::detail::for_tool(&t, "/", true).unwrap();
+            let crate::detail::Detail::Questions { questions } = detail else { panic!("question details") };
+            assert_eq!(questions[0].question, "Proceed?");
+            assert_eq!(questions[0].options[0].label, "Yes");
+            if name.ends_with("async") {
+                assert_eq!(questions[1].question, "Explain");
+                assert!(questions[1].options.is_empty());
+            }
+            let hidden = serde_json::to_string(&crate::detail::for_tool(&t, "/", false)).unwrap();
+            assert!(!hidden.contains("Proceed?"));
+        }
+        assert!(!is_question("request_user_input_extra"));
+    }
 
     #[test]
     fn patches_become_files_and_hunks() {

@@ -2,7 +2,8 @@
 //! reconciled with `~/.claude/sessions/<pid>.json`.
 
 use crate::activity::Activity;
-use crate::agent::{Agent, AgentEvent, EventKind, Tool, antigravity};
+use crate::agent::{Agent, AgentEvent, EventKind, Role, Tool, antigravity};
+use crate::detail::{self, Detail};
 use crate::policy::{self, PolicyRule};
 use serde::Serialize;
 use serde_json::Value;
@@ -38,6 +39,12 @@ impl LastTool {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Attention {
+    pub created_ms: u64,
+    pub detail: Option<Detail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Session {
     /// Unique across agents: `<agent>:<the agent's own session id>`.
     pub id: String,
@@ -46,6 +53,8 @@ pub struct Session {
     pub cwd: String,
     pub status: Status,
     pub last_tool: Option<LastTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
     pub pid: Option<u32>,
     pub last_event_ms: u64,
     #[serde(skip)]
@@ -95,6 +104,7 @@ impl Session {
             cwd: cwd.to_string(),
             status: Status::Idle,
             last_tool: None,
+            attention: None,
             pid: None,
             last_event_ms: now_ms,
             native_id: native_id.to_string(),
@@ -152,6 +162,13 @@ impl Sessions {
             (EventKind::ToolEnd { .. }, None) => s.status = Status::Working,
             (EventKind::ToolStart, tool) => {
                 s.status = Status::Working;
+                if ev.agent == Agent::Codex && tool.as_ref().is_some_and(|t| t.role == Role::Question) {
+                    s.status = Status::Waiting;
+                    s.attention = Some(Attention {
+                        created_ms: now_ms,
+                        detail: tool.as_ref().and_then(|t| detail::for_tool(t, &cwd, show_code)),
+                    });
+                }
                 // Antigravity cannot be answered from here, but the pet can call you to its terminal.
                 if ev.agent == Agent::Antigravity && tool.as_ref().is_some_and(|t| antigravity::needs_confirmation(&t.name)) {
                     s.status = Status::Waiting;
@@ -164,6 +181,10 @@ impl Sessions {
             }
             (EventKind::PermissionRequest, tool) => {
                 s.status = Status::Waiting;
+                s.attention = Some(Attention {
+                    created_ms: now_ms,
+                    detail: tool.as_ref().and_then(|t| detail::for_tool(t, &cwd, show_code)),
+                });
                 if let Some(tool) = tool {
                     s.last_tool = Some(LastTool::of(tool));
                     // Antigravity and Gemini have no separate "tool starts" event for the tools
@@ -177,6 +198,9 @@ impl Sessions {
             (EventKind::Waiting, _) => s.status = Status::Waiting,
             (EventKind::Idle, _) => s.status = Status::Idle,
             (EventKind::SessionEnd, _) => {}
+        }
+        if s.status != Status::Waiting {
+            s.attention = None;
         }
         s.id.clone()
     }
@@ -246,6 +270,35 @@ impl Sessions {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_questions_wait_publish_details_and_clear_on_resume() {
+        let mut sessions = Sessions::default();
+        let mut event = json!({"session_id":"a", "cwd":"/p", "hook_event_name":"PreToolUse",
+            "tool_name":"functions.request_user_input_async", "tool_input":{"questions":[{"title":"Proceed?", "options":["Yes", "No"]}]}});
+        for end in ["PostToolUse", "Interrupt", "Stop", "UserPromptSubmit", "SessionEnd"] {
+            event["hook_event_name"] = json!("PreToolUse");
+            feed(&mut sessions, Agent::Codex, &event, 1);
+            let session = &sessions.map["codex:a"];
+            assert_eq!(session.status, Status::Waiting);
+            let published = serde_json::to_value(session).unwrap();
+            assert_eq!(published["attention"]["detail"]["questions"][0]["question"], "Proceed?");
+            event["hook_event_name"] = json!(end);
+            feed(&mut sessions, Agent::Codex, &event, 2);
+            if let Some(session) = sessions.map.get("codex:a") {
+                assert_ne!(session.status, Status::Waiting);
+                assert!(session.attention.is_none());
+            } else {
+                assert_eq!(end, "SessionEnd");
+            }
+        }
+        sessions.hide_code = true;
+        event["hook_event_name"] = json!("PreToolUse");
+        feed(&mut sessions, Agent::Codex, &event, 3);
+        let published = serde_json::to_string(&sessions.map["codex:a"]).unwrap();
+        assert!(!published.contains("Proceed?"));
+        assert!(!published.contains("Yes"));
+    }
 
     /// Feed a Claude-style payload, as the hook would.
     fn feed(s: &mut Sessions, agent: Agent, v: &Value, now: u64) -> Option<String> {

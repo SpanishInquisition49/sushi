@@ -33,6 +33,28 @@ mod dock;
 mod dock;
 
 mod clipboard_file;
+mod dock_state;
+use dock_state::{DockState, Mode};
+static DOCK_STATE: Mutex<DockState> = Mutex::new(DockState::new());
+
+fn dock_mode() -> Mode {
+    DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner()).mode
+}
+
+fn present_dock(app: &AppHandle, focus: bool) {
+    if let Some(w) = app.get_webview_window("pet") {
+        #[cfg(not(target_os = "macos"))]
+        let mode = dock_mode();
+        #[cfg(target_os = "macos")]
+        dock::set_mode(&w, focus);
+        #[cfg(not(target_os = "macos"))]
+        dock::set_expanded(&w, mode != Mode::Collapsed);
+        #[cfg(not(target_os = "macos"))]
+        if focus { let _ = w.set_focus(); }
+        #[cfg(not(target_os = "macos"))]
+        let _ = app.emit("dockMode", json!({ "mode": mode.name(), "expanded": mode != Mode::Collapsed }));
+    }
+}
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -66,6 +88,38 @@ fn send(req: Request) -> Result<(), String> {
 fn send_value(req: Request) -> Result<Value, String> {
     let reply = request(&req, TIMEOUT)?;
     if reply.ok { Ok(reply.state.unwrap_or(Value::Null)) } else { Err(reply.error.unwrap_or_else(|| "the daemon refused the request".into())) }
+}
+
+#[tauri::command]
+async fn get_dock_layout(window: tauri::WebviewWindow) -> Result<Value, String> {
+    #[cfg(target_os = "macos")]
+    if docked() && window.label() == "pet" {
+        return dock::get_layout(window).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+    Ok(json!({ "hasNotch": false, "notchWidth": 0.0, "topInset": 0.0 }))
+}
+
+#[tauri::command]
+fn fit_attention(window: tauri::WebviewWindow, height: f64) {
+    #[cfg(target_os = "macos")]
+    if docked() && window.label() == "pet" {
+        dock::fit_attention(&window, height);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, height);
+}
+
+#[tauri::command]
+async fn get_dock_pointer(window: tauri::WebviewWindow) -> Result<Value, String> {
+    #[cfg(target_os = "macos")]
+    if docked() && window.label() == "pet" {
+        return dock::get_pointer(window).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+    Ok(Value::Null)
 }
 
 #[tauri::command]
@@ -186,11 +240,9 @@ fn docked() -> bool {
 
 fn show_panel(app: &AppHandle) {
     if docked() {
-        if let Some(w) = app.get_webview_window("pet") {
-            DOCK_EXPANDED.store(true, Ordering::SeqCst);
-            dock::set_expanded(&w, true);
-            let _ = w.set_focus();
-            let _ = app.emit("dockMode", json!({ "expanded": true }));
+        if app.get_webview_window("pet").is_some() {
+            DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner()).mode = Mode::Full;
+            present_dock(app, true);
         }
         return;
     }
@@ -204,7 +256,12 @@ fn show_panel(app: &AppHandle) {
 #[tauri::command]
 fn toggle_panel(app: AppHandle) {
     if docked() {
-        if DOCK_EXPANDED.load(Ordering::SeqCst) { close_panel(app) } else { show_panel(&app) }
+        let attention = { let state = DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner()); state.enabled && state.has_waits() };
+        if dock_mode() == Mode::Full { close_panel(app) }
+        else if attention {
+            DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner()).mode = Mode::Attention;
+            present_dock(&app, true);
+        } else { show_panel(&app) }
         return;
     }
     match app.get_webview_window("panel") {
@@ -221,12 +278,39 @@ fn open_panel(app: AppHandle) {
 }
 
 #[tauri::command]
+fn set_dock_hover(window: tauri::WebviewWindow, hovered: bool) {
+    if window.label() != "pet" || !docked() { return; }
+    let changed = {
+        let mut state = DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let old = state.mode;
+        state.hover(hovered);
+        state.mode != old
+    };
+    if changed { present_dock(window.app_handle(), false); }
+}
+
+#[tauri::command]
+fn finish_dock_transition(window: tauri::WebviewWindow, id: u64) {
+    #[cfg(target_os = "macos")]
+    if window.label() == "pet" && docked() { dock::finish_transition(&window, id); }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, id);
+}
+
+#[tauri::command]
+fn ack_dock_render(window: tauri::WebviewWindow, id: u64, revision: u64) {
+    #[cfg(target_os = "macos")]
+    if window.label() == "pet" && docked() { dock::ack_render(&window, id, revision); }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, id, revision);
+}
+
+#[tauri::command]
 fn close_panel(app: AppHandle) {
     if docked() {
-        if let Some(w) = app.get_webview_window("pet") {
-            DOCK_EXPANDED.store(false, Ordering::SeqCst);
-            dock::set_expanded(&w, false);
-            let _ = app.emit("dockMode", json!({ "expanded": false }));
+        if app.get_webview_window("pet").is_some() {
+            DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner()).close();
+            present_dock(&app, false);
         }
         return;
     }
@@ -238,24 +322,25 @@ fn close_panel(app: AppHandle) {
 /// Set once the pet window has been sized by its page (or given up on): it is shown from then on.
 static PET_SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Whether the docked window is currently showing the panel rather than the pill (see
-/// `docked()`). There is no second window in that mode whose visibility could answer this.
-static DOCK_EXPANDED: AtomicBool = AtomicBool::new(false);
-
 /// The pet window takes the size of what it can show. Its minimum and maximum are that size too: a
 /// fixed-size window is one tiling compositors (niri) open floating instead of giving it a column,
 /// and they take its size only when it opens, so it stays hidden until it is sized.
 #[tauri::command]
-fn fit_pet(window: tauri::WebviewWindow, width: f64, height: f64) {
-    if window.label() != "pet" || !(width >= 1.0 && height >= 1.0) {
+fn fit_pet(window: tauri::WebviewWindow, width: f64, height: f64, animate: Option<bool>) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = animate;
+    if window.label() != "pet" || !(width.is_finite() && height.is_finite() && width >= 1.0 && height >= 1.0) {
         return;
     }
     if docked() {
         // While expanded this only remembers the size for when it collapses back: resizing the
         // window now would fight with it currently showing the panel.
-        if DOCK_EXPANDED.load(Ordering::SeqCst) {
+        if dock_mode() != Mode::Collapsed {
             dock::remember_pill_size(width.ceil(), height.ceil());
         } else {
+            #[cfg(target_os = "macos")]
+            dock::place_pill(&window, width.ceil(), height.ceil(), animate.unwrap_or(false));
+            #[cfg(not(target_os = "macos"))]
             dock::place_pill(&window, width.ceil(), height.ceil());
         }
     } else {
@@ -265,6 +350,11 @@ fn fit_pet(window: tauri::WebviewWindow, width: f64, height: f64) {
         let _ = window.set_size(size);
     }
     if !PET_SHOWN.swap(true, Ordering::SeqCst) {
+        #[cfg(target_os = "macos")]
+        if docked() {
+            dock::show_fallback(&window);
+            return;
+        }
         let _ = window.show();
     }
 }
@@ -274,6 +364,11 @@ fn show_pet_anyway(app: &AppHandle) {
     if !PET_SHOWN.swap(true, Ordering::SeqCst)
         && let Some(w) = app.get_webview_window("pet")
     {
+        #[cfg(target_os = "macos")]
+        if docked() {
+            dock::show_fallback(&w);
+            return;
+        }
         let _ = w.show();
     }
 }
@@ -328,13 +423,6 @@ fn ensure_daemon() {
     let _ = cmd.spawn();
 }
 
-fn pending_keys(snapshot: &Value) -> Vec<String> {
-    snapshot["pending"]
-        .as_array()
-        .map(|a| a.iter().map(|p| format!("{}@{}", p["id"], p["created_ms"])).collect())
-        .unwrap_or_default()
-}
-
 /// What the windows were last told, and the requests already seen (a new one opens the panel).
 #[derive(Default)]
 struct Feed {
@@ -345,7 +433,7 @@ struct Feed {
 
 impl Feed {
     fn update(&mut self, app: &AppHandle, latest: &Latest, up: bool, snapshot: Value) {
-        let keys = pending_keys(&snapshot);
+        let keys = dock_state::attention_keys(&snapshot);
         let payload = json!({ "up": up, "snapshot": snapshot });
         let body = payload.to_string();
         if body != self.last_sent {
@@ -353,9 +441,19 @@ impl Feed {
             if let Ok(mut l) = latest.0.lock() {
                 *l = payload.clone();
             }
-            let _ = app.emit("state", payload);
+            let _ = app.emit("state", &payload);
         }
-        if !self.first && keys.iter().any(|k| !self.known.contains(k)) && setting_on("autoOpen") {
+        let auto_open = setting_on("autoOpen");
+        let (compact, changed) = {
+            let mut state = DOCK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let old = state.mode;
+            let compact = docked() && (state.enabled || state.awaiting_geometry() || state.mode == Mode::Attention);
+            state.update(dock_state::attention_keys(&payload["snapshot"]), auto_open);
+            (compact, old != state.mode)
+        };
+        if compact {
+            if changed { present_dock(app, false); }
+        } else if !self.first && keys.iter().any(|k| !self.known.contains(k)) && auto_open {
             show_panel(app);
         }
         self.known = keys;
@@ -442,8 +540,8 @@ fn main() {
     tauri::Builder::default()
         .manage(latest.clone())
         .invoke_handler(tauri::generate_handler![
-            get_state, decide, answer, chat_send, chat_stop, chat_clear, get_settings, set_settings, toggle_panel,
-            open_panel, close_panel, fit_pet, quit, feed_clipboard, care_feed, care_pet, care_nap, care_play,
+            get_state, get_dock_layout, decide, answer, chat_send, chat_stop, chat_clear, get_settings, set_settings, toggle_panel,
+            open_panel, close_panel, fit_pet, fit_attention, get_dock_pointer, set_dock_hover, finish_dock_transition, ack_dock_render, quit, feed_clipboard, care_feed, care_pet, care_nap, care_play,
             care_buy, care_equip, get_history, flag_step, export_session
         ])
         .on_window_event(|window, event| match event {
@@ -453,9 +551,16 @@ fn main() {
                 let _ = window.hide();
             }
             // Docked: clicking outside the window collapses it, like a Control Center drop-down.
-            WindowEvent::Focused(false) if window.label() == "pet" && docked() && DOCK_EXPANDED.load(Ordering::SeqCst) => {
+            WindowEvent::Focused(false) if window.label() == "pet" && docked() && dock_mode() == Mode::Full => {
                 close_panel(window.app_handle().clone());
             }
+            #[cfg(target_os = "macos")]
+            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_)
+                if window.label() == "pet" && docked() => {
+                    if let Some(pet) = window.app_handle().get_webview_window("pet") {
+                        dock::refresh(&pet);
+                    }
+                }
             WindowEvent::DragDrop(drop) => on_drag_drop(window.app_handle(), drop),
             _ => {}
         })
@@ -475,6 +580,11 @@ fn main() {
                     "panel" => show_panel(app),
                     "pet" => {
                         if let Some(w) = app.get_webview_window("pet") {
+                            #[cfg(target_os = "macos")]
+                            if docked() {
+                                dock::toggle_visibility(&w);
+                                return;
+                            }
                             if w.is_visible().unwrap_or(true) { let _ = w.hide(); } else { let _ = w.show(); }
                         }
                     }
@@ -484,6 +594,17 @@ fn main() {
                 .build(app)?;
 
             create_windows(app)?;
+            // Display configuration can change without a window event or a new pill size.
+            // Poll only geometry; unchanged geometry never resizes or emits to the page.
+            #[cfg(target_os = "macos")]
+            if docked() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Some(window) = handle.get_webview_window("pet") else { break };
+                    dock::refresh(&window);
+                });
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(3));

@@ -78,10 +78,45 @@ body {
    to see through to the desktop, like the pet window above); the expanded panel is opaque like
    it is everywhere else. */
 :root[data-view="dock"] #root { position: relative; height: 100%; }
-:root[data-view="dock"] #pillRoot, :root[data-view="dock"] #panelRoot { position: absolute; inset: 0; }
+:root[data-view="dock"] #pillRoot, :root[data-view="dock"] #compactRoot, :root[data-view="dock"] #panelRoot { position: absolute; inset: 0; }
 :root[data-view="dock"] #pillRoot { display: flex; align-items: center; padding: 6px; cursor: pointer; }
 :root[data-view="dock"] #pillRoot > .pill { flex: none; }
 :root[data-view="dock"]:not(.expanded) body { background: transparent; }
+
+/* Camera displays keep a fixed left wing at rest and put expanded content below the camera. */
+:root[data-view="dock"].has-notch #root { overflow: hidden; }
+:root[data-view="dock"].has-notch #pillRoot { padding: 0; display: block; }
+.notch-pill {
+  display: grid;
+  grid-template-columns: var(--left-wing-width) var(--notch-width);
+  width: 100%;
+  height: 100%;
+}
+.notch-wing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #000;
+  align-self: start;
+  height: var(--notch-inset);
+  border-radius: 0 0 0 8px;
+}
+.notch-pet { display: flex; align-items: center; justify-content: center; flex: 0 0 36px; height: var(--notch-inset); }
+.notch-pet > div { max-width: 100%; max-height: 24px; overflow: hidden; }
+.notch-indicator { display: flex; align-items: center; justify-content: center; flex: 0 0 52px; white-space: nowrap; height: var(--notch-inset); }
+.notch-wing:hover { background: #202024; }
+/* Fill the camera band too: its curved physical edges expose more than a narrow seam. */
+.notch-camera { height: var(--notch-inset); background: #000; pointer-events: none; }
+:root[data-view="dock"].has-notch #panelRoot, :root[data-view="dock"].has-notch #compactRoot {
+  top: var(--notch-inset, 0px);
+  background: var(--bg);
+}
+:root[data-view="dock"].has-notch.expanded:not(.compositor-dock) #root {
+  border-radius: 0 0 20px 20px;
+}
+:root[data-view="dock"].has-notch.expanded:not(.compositor-dock) #root { background: transparent; }
+:root[data-view="dock"].has-notch body { background: transparent; }
 
 /* ── Panel layout ───────────────────────────────────────────────────────────── */
 .panel { display: flex; height: 100%; }
@@ -151,3 +186,29 @@ input:disabled { opacity: 0.6; }
 
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--outline) 35%, transparent); border-radius: 4px; }
+
+/* Intermediate notch panels share the normal panel theme and stable scroll containers. */
+.compact-panel { height: 100%; display: flex; flex-direction: column; padding: 12px; gap: 8px; min-height: 0; background: var(--bg); }
+.compact-panel header { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.compact-pet { width: 36px; height: 40px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.compact-title { flex: 1; min-width: 0; font-size: 12px; }
+.compact-content { display: flex; flex-direction: column; gap: 8px; }
+.compact-content > * { flex-shrink: 0; }
+.compact-measure { position: absolute; left: 0; top: 0; width: 560px; height: auto; visibility: hidden; pointer-events: none; }
+.dock-hover-zone { position: absolute; pointer-events: none; }
+.compact-detail { display: grid; grid-template-columns: 80px minmax(0,1fr); gap: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.compact-limit { font-size: 11px; }
+.compact-limit > div:first-child { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.compact-content .btn-row { flex-wrap: wrap; }
+.compact-content .option { flex-wrap: wrap; }
+.terminal-wait { padding: 10px; background: var(--surface); border-radius: 10px; font-size: 12px; }
+.request-error { padding: 8px; color: var(--error); overflow-wrap: anywhere; }
+
+/* The native envelope stays fixed while this surface contracts in WebKit. */
+.dock-surface { position: absolute; inset: 0; pointer-events: none; }
+:root.compositor-dock #pillRoot { z-index: 1; }
+.dock-backdrop { position: absolute; inset: 0; background: #000; opacity: 0; visibility: hidden; pointer-events: none; }
+:root.compositor-dock body { background: transparent; }
+/* Keep the menu-bar band clear while the panel background animates below it. */
+:root.compositor-dock .dock-backdrop { top: var(--notch-inset, 0px); }
+:root.compositor-dock #compactRoot, :root.compositor-dock #panelRoot { opacity: 0; }

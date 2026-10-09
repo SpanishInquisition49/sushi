@@ -81,6 +81,8 @@ It watches **Claude Code**, **Codex CLI**, **GitHub Copilot CLI**, **Antigravity
 | Built-in chat | ✓ | ✓ (read-only sandbox, not tool-free) | ✓ | – | – | – | ✓ |
 | Connected through | hooks in `~/.claude/settings.json` | hooks in `~/.codex/hooks.json` | hook file `~/.copilot/hooks/sushi.json` | group in `~/.gemini/config/hooks.json` | hooks in `~/.gemini/settings.json` | plugin in `~/.config/opencode/plugins/` | extension in `~/.pi/agent/extensions/` |
 
+Codex user-input questions are shown in the compact notch panel; answer them in the Codex app or CLI running the session. After updating Sushi, reconnect Codex (`sushi install --agent codex --write`) to add interruption tracking, then review and trust the new hook in Codex. Restart the Sushi daemon and desktop app to load the updated binaries.
+
 What has been checked against the real thing:
 
 - **Claude Code**: the reference.

@@ -3021,12 +3021,14 @@ name = "sushi-app"
 version = "0.1.0"
 dependencies = [
  "Sushi",
+ "block2",
  "glib",
  "gtk",
  "gtk-layer-shell-sys",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-web-kit",
  "serde_json",
  "tauri",
  "tauri-build",

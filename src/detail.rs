@@ -296,26 +296,29 @@ pub use crate::agent::short_path;
 
 /// The questions of an `AskUserQuestion` call (a few of them, a few options each).
 pub fn questions(input: &Value) -> Option<Detail> {
+    parse_questions(input, false)
+}
+
+fn parse_questions(input: &Value, allow_free_text: bool) -> Option<Detail> {
     let list = input.get("questions")?.as_array()?;
     let questions: Vec<Question> = list
         .iter()
         .take(4)
         .filter_map(|q| {
             let options: Vec<QuestionOption> = q
-                .get("options")?
-                .as_array()?
-                .iter()
+                .get("options").and_then(Value::as_array)
+                .into_iter().flatten()
                 .take(6)
                 .filter_map(|o| {
                     Some(QuestionOption { label: clip(s(o, "label")?), description: clip(s(o, "description").unwrap_or("")) })
                 })
                 .collect();
-            if options.is_empty() {
+            if options.is_empty() && !allow_free_text {
                 return None;
             }
             Some(Question {
                 header: clip(s(q, "header").unwrap_or("")),
-                question: s(q, "question")?.to_string(),
+                question: s(q, "question")?.lines().take(24).map(clip).collect::<Vec<_>>().join("\n"),
                 multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
                 options,
             })
@@ -330,7 +333,7 @@ pub fn for_tool(tool: &Tool, cwd: &str, show_code: bool) -> Option<Detail> {
         return Some(Detail::Text { title: tool.name.clone(), body: String::new() });
     }
     match tool.role {
-        Role::Question => return questions(&tool.input),
+        Role::Question => return parse_questions(&tool.input, crate::agent::codex::is_question(&tool.name)),
         Role::Plan => {
             let plan: String = tool.plan.as_deref().unwrap_or("").lines().take(24).map(clip).collect::<Vec<_>>().join("\n");
             return Some(Detail::Text { title: "Plan".into(), body: plan });
